@@ -26,6 +26,15 @@ pub enum Command {
         #[arg(short, long, default_value = "config.toml")]
         config: PathBuf,
     },
+    /// Query the running daemon over its admin socket and print slot status.
+    Status {
+        /// Path to the TOML config file (read for `admin_socket`).
+        #[arg(short, long, default_value = "config.toml")]
+        config: PathBuf,
+        /// Admin socket path override. When set, the config file is not read.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Admin enrollment client (behaviour lands in #4b).
     Pair {
         #[command(subcommand)]
@@ -59,9 +68,8 @@ pub struct Config {
     /// Telegram bot token. The `TELOXIDE_TOKEN` env var overrides this.
     #[serde(default)]
     pub bot_token: String,
-    /// Local admin control socket. Parsed now, consumed by the admin CLI ↔
-    /// daemon channel in #4b; unread until then.
-    #[allow(dead_code)]
+    /// Local admin control socket — the CLI ↔ daemon channel (#38). Bound by
+    /// `serve` and dialed by `proxy status`; kept local-only, perms 0600.
     pub admin_socket: PathBuf,
     /// User seats. `telegram_id` is bound at pairing time (#4b), not here.
     pub slots: Vec<Slot>,
