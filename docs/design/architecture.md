@@ -280,9 +280,65 @@ opencode_url = "http://127.0.0.1:4097"
 workdir = "/Users/you/work/wife"
 
 [model]
-provider_id = "local"           # opencode provider pointing at the M3 Ultra model
-model_id = "…"
+# SELECTOR ONLY — the endpoint URL + wire spec live in opencode.json (see §12).
+provider_id = "lmstudio"              # must match a provider key in opencode.json
+model_id    = "google/gemma-3n-e4b"  # must match a models key under that provider
 
 [permissions]
 ask = ["git commit*", "git push*"]   # PATCHed onto each session at creation
 ```
+
+---
+
+## 12. opencode model provider (external prerequisite)
+
+The model endpoint URL and wire spec are **opencode's** config, **not** the
+proxy's. The proxy only selects `{providerID, modelID}` (§11); opencode holds the
+URL, the spec, and the key. You set this up once, outside the proxy.
+
+Your local model (LM Studio / Ollama / MLX on the M3 Ultra) is registered as a
+**custom OpenAI-compatible provider** in `opencode.json`, via the Vercel AI SDK
+`@ai-sdk/openai-compatible` adapter (the `/v1/chat/completions` spec):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "lmstudio": {                          // ← this key IS the providerID
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "LM Studio (local)",
+      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "models": {
+        "google/gemma-3n-e4b": {}          // ← this key IS the modelID
+      }
+    }
+  }
+}
+```
+
+- **`npm`** — `@ai-sdk/openai-compatible` for `/v1/chat/completions` endpoints
+  (LM Studio, Ollama at `http://localhost:11434/v1`, vLLM, llama.cpp, and any MLX
+  server exposing an OpenAI-compatible API). Use `@ai-sdk/openai` only for
+  `/v1/responses`-style endpoints. **No MLX-native adapter exists** — treat MLX as
+  "just another OpenAI-compatible endpoint."
+- **`options.apiKey`** — optional for local servers; supports `{env:VAR}`.
+- **Models must be hand-listed** — there is no `/v1/models` auto-discovery yet
+  (upstream issue #6231). Each `modelID` you want must appear under `models`.
+- **`providerID` = the `provider` object key; `modelID` = the `models` object key.**
+  Both are free-form strings you choose. The proxy's `[model]` (§11) must match
+  them exactly.
+
+**Where to put it (matters for the two-instance setup):** opencode merges config,
+walking up from each server's working directory and layering it on the global
+`~/.config/opencode/opencode.json`. Because the proxy launches the two
+`opencode serve` instances in *different* workdirs, put the provider block in the
+**global** `~/.config/opencode/opencode.json` so both instances resolve the same
+provider regardless of workdir. A per-project `opencode.json` would apply to only
+that one workdir. → This is a **launch prerequisite**: `opencode/supervisor.rs`
+must not start an instance until its provider config resolves, or the proxy's
+`{providerID, modelID}` won't bind.
+
+> **API-shape note (don't get this wrong in `client.rs`):** the HTTP session API
+> takes `model` as a **split object** `{ "providerID": "…", "modelID": "…" }` — not
+> a combined `"provider/model"` string. (The combined-string form is used only by
+> the `opencode.json` top-level `model` key and the `-m` CLI flag, not the API.)
