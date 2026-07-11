@@ -56,10 +56,27 @@ pub enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Admin enrollment client (behaviour lands in #4b).
+    /// Per-slot inventory over the admin socket (#4b): name, opencode URL,
+    /// workdir, bound Telegram ids, reachability, and config-vs-db source. Use it
+    /// to pick a `--slot` for `pair approve`.
+    Slots {
+        /// Path to the TOML config file (read for `admin_socket`).
+        #[arg(short, long, default_value = "config.toml")]
+        config: PathBuf,
+        /// Admin socket path override. When set, the config file is not read.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Admin enrollment client (#4b): list / approve / deny pending pairings.
     Pair {
         #[command(subcommand)]
         action: PairAction,
+        /// Path to the TOML config file (read for `admin_socket`).
+        #[arg(short, long, default_value = "config.toml")]
+        config: PathBuf,
+        /// Admin socket path override. When set, the config file is not read.
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
 }
 
@@ -99,6 +116,10 @@ pub struct Config {
     /// Session permission rules (see #13).
     #[serde(default)]
     pub permissions: Permissions,
+    /// Pairing / enrolment tuning (#4b). Optional — a missing `[pairing]` block
+    /// uses the defaults.
+    #[serde(default)]
+    pub pairing: Pairing,
     /// Path to the proxy's SQLite store (routing + whitelist + pending
     /// pairings/approvals; #3). Relative paths resolve against the process
     /// working directory. Defaults to `proxy.db`. WAL creates sidecar
@@ -139,6 +160,29 @@ pub struct Permissions {
     /// Bash patterns PATCHed onto each session (`deny` until #13 flips to `ask`).
     #[serde(default)]
     pub ask: Vec<String>,
+}
+
+/// Pairing / enrolment tuning (#4b). Governs the confirmation-nonce lifecycle.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Pairing {
+    /// How long an issued pairing code stays valid, in seconds. Defaults to
+    /// 600 (10 minutes); past this the code is purgeable and `pair approve`
+    /// rejects it.
+    #[serde(default = "default_code_ttl_secs")]
+    pub code_ttl_secs: i64,
+}
+
+impl Default for Pairing {
+    fn default() -> Self {
+        Self {
+            code_ttl_secs: default_code_ttl_secs(),
+        }
+    }
+}
+
+/// Default pairing-code TTL (10 minutes) when `[pairing]` omits it.
+fn default_code_ttl_secs() -> i64 {
+    600
 }
 
 impl Config {

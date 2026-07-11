@@ -264,6 +264,43 @@ impl Db {
         })
     }
 
+    /// Every pending pairing, ordered by expiry (soonest first) then code.
+    pub fn list_pairings(&self) -> Result<Vec<PendingPairing>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT code, chat_id, username, expires_at
+                 FROM pending_pairings ORDER BY expires_at, code",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(PendingPairing {
+                    code: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    username: row.get(2)?,
+                    expires_at: row.get(3)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Delete every pending pairing issued to `chat_id`. Returns the number of
+    /// rows removed. Used to enforce **one active code per chat** (#4b): a fresh
+    /// request drops the sender's prior code before minting a new one, so a user
+    /// spamming the bot never accumulates rows.
+    pub fn delete_pairings_for_chat(&self, chat_id: i64) -> Result<usize> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "DELETE FROM pending_pairings WHERE chat_id = ?1",
+                params![chat_id],
+            )?;
+            Ok(n)
+        })
+    }
+
     /// Delete every pairing whose `expires_at` is at or before `now` (epoch
     /// seconds). Returns the number of rows purged.
     pub fn purge_expired_pairings(&self, now: i64) -> Result<usize> {
@@ -561,6 +598,32 @@ mod tests {
 
         db.delete_pairing("123456").unwrap();
         assert_eq!(db.pairing_by_code("123456").unwrap(), None);
+    }
+
+    #[test]
+    fn pairing_list_and_delete_for_chat() {
+        let db = db();
+        assert!(db.list_pairings().unwrap().is_empty());
+
+        for (code, chat_id) in [("111111", 1), ("222222", 1), ("333333", 2)] {
+            db.insert_pairing(&PendingPairing {
+                code: code.to_string(),
+                chat_id,
+                username: None,
+                expires_at: 1_000,
+            })
+            .unwrap();
+        }
+        assert_eq!(db.list_pairings().unwrap().len(), 3);
+
+        // Deleting one chat's codes leaves the other chat's untouched.
+        let removed = db.delete_pairings_for_chat(1).unwrap();
+        assert_eq!(removed, 2);
+        let rest = db.list_pairings().unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].chat_id, 2);
+        // Deleting a chat with no codes is a no-op.
+        assert_eq!(db.delete_pairings_for_chat(9).unwrap(), 0);
     }
 
     #[test]

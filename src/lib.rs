@@ -55,7 +55,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // can both serve on it and clean it up on shutdown.
     let admin_socket = cfg.admin_socket.clone();
     let bot = teloxide::Bot::new(cfg.bot_token.clone());
-    let state = telegram::bot::AppState::new(cfg, registry, db);
+    let state = telegram::bot::AppState::new(cfg, registry, db, bot.clone());
     // The admin server shares the same `Arc<AppState>` — read-only is enough for
     // #38 (runtime-mutable slots are #39).
     let admin_state: Arc<dyn admin::AdminState> = state.clone();

@@ -44,3 +44,10 @@ model_id = "Qwen3.6-35B-A3B-bf16"
 # (#13) exists to answer prompts, then flipped to `ask`.
 [permissions]
 ask = ["git commit*", "git push*"]
+
+# Enrolment / pairing (A4b). When an unknown sender messages the bot it is issued
+# a single-use 6-digit confirmation code, valid for `code_ttl_secs`. The user
+# reads the code back to the admin, who binds it with
+# `proxy pair approve <code> --slot <name>`. Optional — defaults to 600 (10 min).
+[pairing]
+code_ttl_secs = 600

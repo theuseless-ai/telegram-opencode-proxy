@@ -29,7 +29,7 @@ use telegram_opencode_proxy::admin::{
     self, AdminRequest, AdminResponse, AdminState, BoxFuture, ConnectOutcome, ConnectParams,
     SlotInfo,
 };
-use telegram_opencode_proxy::config::{Config, Model, Permissions, Slot};
+use telegram_opencode_proxy::config::{Config, Model, Pairing, Permissions, Slot};
 use telegram_opencode_proxy::opencode::client::OpencodeClient;
 use telegram_opencode_proxy::persistence::Db;
 use telegram_opencode_proxy::state::SlotConn;
@@ -79,8 +79,15 @@ fn cfg_with_model() -> Config {
             model_id: "Qwen3.6-35B-A3B-bf16".to_string(),
         },
         permissions: Permissions { ask: Vec::new() },
+        pairing: Pairing::default(),
         db_path: "unused.db".into(),
     }
+}
+
+/// A bare bot handle for `AppState` construction; the transport tests here do
+/// not drive the pairing notify path.
+fn test_bot() -> teloxide::Bot {
+    teloxide::Bot::new("12345:test-token")
 }
 
 /// A live [`SlotConn`] pointing at `url` (client built directly, no bring-up).
@@ -134,7 +141,7 @@ async fn connect_adds_and_persists_a_new_slot() {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("admin.sock");
     let db = Db::open_in_memory().expect("in-memory db");
-    let state = AppState::new(cfg_with_model(), HashMap::new(), db.clone());
+    let state = AppState::new(cfg_with_model(), HashMap::new(), db.clone(), test_bot());
     let server = tokio::spawn(admin::serve_admin(state.clone(), socket.clone()));
 
     let req = AdminRequest::Connect {
@@ -162,6 +169,13 @@ async fn connect_adds_and_persists_a_new_slot() {
     assert_eq!(persisted[0].name, "new");
     assert_eq!(persisted[0].opencode_url, oc.url);
     assert_eq!(persisted[0].telegram_id, Some(555));
+    // ...and the --telegram-id is whitelisted immediately (auth reads
+    // allowed_users, not the slot's telegram_id column).
+    assert_eq!(
+        db.allowed_slot(555).unwrap(),
+        Some("new".to_string()),
+        "connect --telegram-id must write allowed_users so auth authorizes the user"
+    );
 
     server.abort();
 }
@@ -174,7 +188,12 @@ async fn connect_reports_existing_reachable_slot_as_connected() {
     let socket = dir.path().join("admin.sock");
     let mut registry = HashMap::new();
     registry.insert("you".to_string(), slot_conn("you", &oc.url, Some(111)));
-    let state = AppState::new(cfg_with_model(), registry, Db::open_in_memory().unwrap());
+    let state = AppState::new(
+        cfg_with_model(),
+        registry,
+        Db::open_in_memory().unwrap(),
+        test_bot(),
+    );
     let server = tokio::spawn(admin::serve_admin(state.clone(), socket.clone()));
 
     let req = AdminRequest::Connect {
@@ -204,7 +223,12 @@ async fn connect_reconnects_a_down_slot_when_it_returns() {
     let socket = dir.path().join("admin.sock");
     let mut registry = HashMap::new();
     registry.insert("you".to_string(), slot_conn("you", &oc.url, Some(111)));
-    let state = AppState::new(cfg_with_model(), registry, Db::open_in_memory().unwrap());
+    let state = AppState::new(
+        cfg_with_model(),
+        registry,
+        Db::open_in_memory().unwrap(),
+        test_bot(),
+    );
     let server = tokio::spawn(admin::serve_admin(state.clone(), socket.clone()));
 
     let req = AdminRequest::Connect {
@@ -231,7 +255,12 @@ async fn connect_errors_when_a_down_slot_stays_unreachable() {
     let dead = "http://127.0.0.1:1"; // port 1 is not listening
     let mut registry = HashMap::new();
     registry.insert("you".to_string(), slot_conn("you", dead, Some(111)));
-    let state = AppState::new(cfg_with_model(), registry, Db::open_in_memory().unwrap());
+    let state = AppState::new(
+        cfg_with_model(),
+        registry,
+        Db::open_in_memory().unwrap(),
+        test_bot(),
+    );
     let server = tokio::spawn(admin::serve_admin(state.clone(), socket.clone()));
 
     let req = AdminRequest::Connect {
