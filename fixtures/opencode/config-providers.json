@@ -1,0 +1,22 @@
+{
+  "providers": [
+    {
+      "id": "llm-lan",
+      "name": "Local LLM (llm.lan)",
+      "source": "config",
+      "env": [],
+      "options": {
+        "baseURL": "http://llm.lan:8080/v1"
+      },
+      "models": {
+        "Qwen3.6-35B-A3B-bf16": {
+          "id": "Qwen3.6-35B-A3B-bf16",
+          "name": "Qwen3.6 35B A3B bf16"
+        }
+      }
+    }
+  ],
+  "default": {
+    "llm-lan": "Qwen3.6-35B-A3B-bf16"
+  }
+}

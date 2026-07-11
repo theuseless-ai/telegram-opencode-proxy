@@ -59,7 +59,9 @@ pub struct Config {
     /// Telegram bot token. The `TELOXIDE_TOKEN` env var overrides this.
     #[serde(default)]
     pub bot_token: String,
-    /// Local admin control socket (wired in #4b).
+    /// Local admin control socket. Parsed now, consumed by the admin CLI ↔
+    /// daemon channel in #4b; unread until then.
+    #[allow(dead_code)]
     pub admin_socket: PathBuf,
     /// User seats. `telegram_id` is bound at pairing time (#4b), not here.
     pub slots: Vec<Slot>,
@@ -76,6 +78,12 @@ pub struct Slot {
     pub name: String,
     pub opencode_url: String,
     pub workdir: PathBuf,
+    /// TEMPORARY minimal auth gate (A4a): the numeric Telegram id bound to this
+    /// slot. This is a bootstrap stand-in and is **superseded by A4b** pairing,
+    /// which binds ids in the SQLite `allowed_users` table (#4b) rather than in
+    /// config. Optional so an unpaired slot simply matches nobody.
+    #[serde(default)]
+    pub telegram_id: Option<i64>,
 }
 
 /// Model selector passed to opencode as `{ providerID, modelID }`.

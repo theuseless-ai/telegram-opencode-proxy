@@ -8,17 +8,23 @@ bot_token = ""
 # Local-only admin control socket (CLI ↔ daemon). Wired in #4b.
 admin_socket = "/run/topx/admin.sock"
 
-# One "seat" per user. telegram_id is bound at pairing time (proxy pair approve),
-# NOT listed here. opencode_url must be distinct per slot; workdir must exist.
+# One "seat" per user. opencode_url must be distinct per slot; workdir must exist.
+#
+# telegram_id is the TEMPORARY minimal auth gate (A4a): set it to your numeric
+# Telegram id to whitelist yourself for this slot. Find your id by texting the
+# running bot `/whoami`. This is a bootstrap stand-in — A4b pairing (proxy pair
+# approve) will bind ids in the database instead, and this line goes away.
 [[slots]]
 name = "you"
 opencode_url = "http://127.0.0.1:4096"
 workdir = "/home/you/work/you"
+# telegram_id = 123456789
 
 [[slots]]
 name = "wife"
 opencode_url = "http://127.0.0.1:4097"
 workdir = "/home/you/work/wife"
+# telegram_id = 987654321
 
 # Model SELECTOR only — the endpoint URL + key live in opencode.json (§12).
 # These must match a provider/model configured there.
