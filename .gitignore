@@ -6,6 +6,10 @@
 .env.*
 !.env.example
 
+# local runtime config (holds the bot token / chat ids) — commit config.example.toml only
+config.toml
+config.local.toml
+
 # rust build
 /target
 
