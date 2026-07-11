@@ -19,3 +19,22 @@ tokio = { version = "1.52.3", features = ["full"] }
 toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+# In-process mock HTTP servers for the hermetic test harness (issue #24). axum
+# is a TEST-ONLY dependency (mock_opencode / mock_telegram under tests/support,
+# plus the Layer-2 `examples/mock_model.rs`); the production binary never links
+# it. axum's SSE support backs the mock opencode `/global/event` stub.
+#
+# NOTE: the Layer-2 mock model lives in `examples/` (not `src/bin/`) precisely
+# because only examples/tests/benches may use dev-dependencies — a `src/bin/`
+# target is part of the shipped package and could not reach axum.
+axum = "0.8"
+# The integration test crate is a *separate* crate: it can name the library and
+# its dev-dependencies, but NOT the library's normal deps. teloxide (to build a
+# `Bot`/`Message` for the handlers) and serde_json (mock bodies + fixtures) are
+# therefore repeated here. Same versions as `[dependencies]`, so Cargo unifies
+# them and nothing is compiled twice.
+teloxide = { version = "0.17.0", features = ["macros"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["full"] }

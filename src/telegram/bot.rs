@@ -87,7 +87,10 @@ async fn handle_command(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<
 /// Handle a plain text message: whitelist gate → route to the slot's opencode
 /// → blocking prompt → chunked reply. Never panics; failures become a friendly
 /// reply plus a `tracing::error!`.
-async fn handle_text(bot: Bot, msg: Message, state: Arc<AppState>) -> ResponseResult<()> {
+///
+/// `pub` so the integration harness (issue #24) can drive the real turn path
+/// against the in-process mocks without spinning up the long-poll dispatcher.
+pub async fn handle_text(bot: Bot, msg: Message, state: Arc<AppState>) -> ResponseResult<()> {
     let Some(text) = msg.text() else {
         return Ok(()); // non-text (photo/doc/etc.) — inbound files are #8.
     };

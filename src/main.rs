@@ -1,28 +1,15 @@
-//! telegram-opencode-proxy — bridge a Telegram bot to `opencode serve`.
+//! telegram-opencode-proxy — thin CLI shell around the library crate.
 //!
-//! Module layout follows `docs/design/architecture.md` §4. This is the v0.0.1
-//! scaffold (#1): modules are stubs, wired together in later issues.
+//! All behaviour lives in `lib.rs` so the integration harness (issue #24) can
+//! drive the real modules against in-process mocks. This binary only parses the
+//! CLI and dispatches to [`telegram_opencode_proxy::serve`].
 
-mod auth;
-mod config;
-mod opencode;
-mod outbox;
-mod pairing;
-mod permission;
-mod persistence;
-mod session;
-mod state;
-mod telegram;
-
-use std::collections::HashMap;
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use config::{Cli, Command, Config, PairAction};
-use opencode::client::{self, OpencodeClient};
-use opencode::health;
+use telegram_opencode_proxy::config::{Cli, Command, Config, PairAction};
+use telegram_opencode_proxy::serve;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -44,60 +31,6 @@ async fn main() -> Result<()> {
             }
         },
     }
-    Ok(())
-}
-
-/// Bring up the daemon: for each slot, connect to its (externally-managed)
-/// opencode instance, wait until it's reachable, validate the configured
-/// provider/model against its live catalogue, build a client — then run the
-/// Telegram dispatcher until Ctrl-C. The proxy is **connect-only**: it does not
-/// spawn opencode (start it via `./dev.sh` / systemd / compose).
-async fn serve(cfg: Config) -> Result<()> {
-    tracing::info!(
-        slots = cfg.slots.len(),
-        provider = %cfg.model.provider_id,
-        model = %cfg.model.model_id,
-        gated = cfg.permissions.ask.len(),
-        "starting proxy (connect-only)"
-    );
-
-    let http = reqwest::Client::builder()
-        .build()
-        .context("building readiness http client")?;
-
-    let mut clients: HashMap<String, OpencodeClient> = HashMap::with_capacity(cfg.slots.len());
-
-    for slot in &cfg.slots {
-        tracing::info!(slot = %slot.name, url = %slot.opencode_url, "connecting to opencode");
-        health::wait_ready(
-            &http,
-            &slot.opencode_url,
-            health::READY_ATTEMPTS,
-            health::READY_INTERVAL,
-        )
-        .await
-        .with_context(|| format!("opencode for slot '{}' not reachable", slot.name))?;
-
-        let ocl = OpencodeClient::for_slot(slot)?;
-        let providers = ocl
-            .config_providers()
-            .await
-            .with_context(|| format!("fetching provider catalogue for slot '{}'", slot.name))?;
-        client::validate_model(&providers, &cfg.model.provider_id, &cfg.model.model_id)
-            .with_context(|| format!("validating model for slot '{}'", slot.name))?;
-
-        tracing::info!(slot = %slot.name, "connected — provider/model validated");
-        clients.insert(slot.name.clone(), ocl);
-    }
-
-    let bot = teloxide::Bot::new(cfg.bot_token.clone());
-    let state = telegram::bot::AppState::new(cfg, clients);
-
-    tracing::info!("starting Telegram long-poll dispatcher (Ctrl-C to stop)");
-    telegram::bot::run(bot, state).await;
-
-    // TODO(#N2): clean shutdown — drain in-flight turns, close SSE/HTTP, flush
-    // SQLite. No opencode children to reap (connect-only).
     Ok(())
 }
 
