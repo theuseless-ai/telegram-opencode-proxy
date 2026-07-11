@@ -56,8 +56,12 @@ Documented as conscious deferrals, not oversights:
 - **Invite-code (bearer-token) enrollment** — rejected in favor of the
   confirmation-nonce pairing in §5: a leaked invite code would grant access,
   whereas a pairing code cannot (approval requires shell/CLI access).
-- **Per-request directory routing on one shared opencode** — upstream rough
-  edges; we use one process per workdir instead.
+- **Shared opencode with per-request `?directory=` routing** — per-directory
+  config (MCP, model) *does* resolve correctly on a shared server (verified
+  1.17.18), so this isn't a config-resolution problem. We still run one process
+  per workdir to sidestep its **lifecycle** liabilities: no stale-instance
+  eviction (#33720), MCP-subprocess cleanup bugs on dispose (#21557, #30123),
+  and per-directory model-catalog staleness (#36284). See §12.
 - **opencode server Basic Auth** — localhost only; proxy whitelist is the gate.
 
 ---
@@ -342,3 +346,39 @@ must not start an instance until its provider config resolves, or the proxy's
 > takes `model` as a **split object** `{ "providerID": "…", "modelID": "…" }` — not
 > a combined `"provider/model"` string. (The combined-string form is used only by
 > the `opencode.json` top-level `model` key and the `-m` CLI flag, not the API.)
+
+### Per-directory MCP & model config
+
+Everything in `opencode.json` — the `mcp` key **and** `provider`/`model` overrides
+— is resolved **per directory**: opencode walks up from the working directory for
+a project `opencode.json` / `.opencode`, merged over global
+`~/.config/opencode/opencode.json`. This holds in server mode (verified at
+opencode 1.17.18): each directory gets its own independently-resolved, cached
+config.
+
+Because we run **one `opencode serve` per workdir**, each user's instance picks up
+its own workdir's config automatically:
+
+- **Shared defaults** (providers, common MCP servers) → global
+  `~/.config/opencode/opencode.json`.
+- **Per-user overrides** (different MCP toolset, different model) → a project
+  `opencode.json` in that user's workdir (`~/work/you` vs `~/work/wife`).
+
+So per-user MCP + model differences need **zero proxy involvement** — same
+boundary as above: the proxy selects `{providerID, modelID}`; opencode's
+per-workdir config defines providers *and* MCP servers.
+
+MCP config shape (`opencode.json`):
+
+```json
+{ "mcp": {
+    "my-local":  { "type": "local",  "command": ["npx", "-y", "…"],
+                   "environment": { "TOKEN": "{env:TOKEN}" }, "enabled": true },
+    "my-remote": { "type": "remote", "url": "https://…",
+                   "headers": { "Authorization": "Bearer …" }, "enabled": true } } }
+```
+
+**Capacity note:** on first use of a directory, opencode connects **all** MCP
+servers configured for it (not on-demand per tool). Budget roughly
+(workdirs × servers-per-workdir) concurrent MCP subprocesses — negligible for two
+users, but a real ceiling at scale.
