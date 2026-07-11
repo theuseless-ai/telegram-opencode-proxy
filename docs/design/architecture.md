@@ -63,6 +63,12 @@ Documented as conscious deferrals, not oversights:
   eviction (#33720), MCP-subprocess cleanup bugs on dispose (#21557, #30123),
   and per-directory model-catalog staleness (#36284). See §12.
 - **opencode server Basic Auth** — localhost only; proxy whitelist is the gate.
+- **Proxy spawning/supervising opencode** — **decided against (connect-only).**
+  The proxy is a pure client: it connects to externally-managed `opencode serve`
+  instances (systemd / compose / `./dev.sh`) and readiness-checks them. This
+  deletes the process-lifecycle surface (spawn, reap, stale-port, crash-loop
+  backoff — the N2/N3 tax) and lets opencode run anywhere reachable. The
+  one-instance-per-workdir isolation is unchanged — you just start them.
 
 ---
 
@@ -113,9 +119,9 @@ Documented as conscious deferrals, not oversights:
    └────────────────┘   └──────────────┘  └────┬─────┘         │                 │
                         ┌──────────────┐        │      ┌────────┴────────┐        │
                         │ opencode/    │        │      │ opencode/       │        │
-                        │ supervisor.rs│        │      │ events.rs (SSE) │        │
-                        │ spawn/keep-  │        │      │ /event stream:  │        │
-                        │ alive 2 procs│        │      │ text.delta,     │        │
+                        │ health.rs    │        │      │ events.rs (SSE) │        │
+                        │ readiness    │        │      │ /event stream:  │        │
+                        │ (connect)    │        │      │ text.delta,     │        │
                         └──────┬───────┘        │      │ step.ended,     │        │
                                │                │      │ permission.asked│        │
                                │         POST   │      └────────▲────────┘        │
@@ -138,7 +144,7 @@ Documented as conscious deferrals, not oversights:
 
 | Module | Responsibility |
 |---|---|
-| `main.rs` | Load config → spawn opencode procs → start bot + SSE listeners + outbox watchers + admin socket |
+| `main.rs` | Load config → **connect** to opencode instances (readiness-check) → start bot + SSE listeners + outbox watchers + admin socket |
 | `config.rs` | Config structs, `clap` CLI (`serve` + `pair` subcommands), slot definitions, validation |
 | `state.rs` | Shared `AppState`: routing table, pending-approvals, pending-pairings, instance registry |
 | `persistence.rs` | SQLite: `allowed_users`, `chat_id → session_id`, `pending_pairings`, pending approvals (survive restart) |
@@ -147,7 +153,7 @@ Documented as conscious deferrals, not oversights:
 | `session.rs` | Get-or-create session; `/new` reset; PATCH `git commit*`/`push*` = `ask` on create |
 | `opencode/client.rs` | reqwest: create_session, prompt_async, get_messages, patch/reply permission, read_file |
 | `opencode/events.rs` | SSE `/event` subscribe + parse `session.next.*` + `permission.asked` |
-| `opencode/supervisor.rs` | Spawn / keep-alive / restart the two `opencode serve` procs |
+| `opencode/health.rs` | Readiness check on each opencode URL + reconnect. **Connect-only:** the proxy does **not** spawn opencode — instances are external (systemd / compose / `./dev.sh`) |
 | `opencode/types.rs` | API structs (codegen from `/doc`, behind a V1/V2 version adapter) |
 | `telegram/bot.rs` | teloxide dispatcher: messages, `/new` `/whoami` `/get` `/stop`, `callback_query`, file download |
 | `telegram/render.rs` | opencode output → TG msg; 4096 chunking; stream-edit throttle ~1/s |
@@ -244,7 +250,7 @@ GitHub milestones use these version codes; **A/B/C** stay as shorthand (issue pr
 
 | Milestone | Adds | Proves |
 |---|---|---|
-| **v0.0.1** · A ~1d | config, auth + pairing handshake (CLI approve), `supervisor` (2 procs), blocking `POST /message`, chunked reply | the wire + enrollment work end-to-end |
+| **v0.0.1** · A ~1d | config, auth + pairing handshake (CLI approve), connect + readiness (opencode external), blocking `POST /message`, chunked reply | the wire + enrollment work end-to-end |
 | **v0.0.2** · B ~few days | SSE streaming + live edit, `typing` liveness, flat tool-status line, 2-user routing, `/new` `/whoami`, reconnect | daily-usable |
 | **v0.0.3** · C ~1–2wk | inbound files, outbox + `/get`, permission relay + buttons, git-ask on session create, `/quiet` `/verbose` + sub-agent tags | minutes → approve → commit |
 
@@ -362,13 +368,14 @@ Qwen models) is registered as a **custom OpenAI-compatible provider** in
 
 **Where to put it (matters for the two-instance setup):** opencode merges config,
 walking up from each server's working directory and layering it on the global
-`~/.config/opencode/opencode.json`. Because the proxy launches the two
-`opencode serve` instances in *different* workdirs, put the provider block in the
-**global** `~/.config/opencode/opencode.json` so both instances resolve the same
-provider regardless of workdir. A per-project `opencode.json` would apply to only
-that one workdir. → This is a **launch prerequisite**: `opencode/supervisor.rs`
-must not start an instance until its provider config resolves, or the proxy's
-`{providerID, modelID}` won't bind.
+`~/.config/opencode/opencode.json`. Because the two `opencode serve` instances
+run in *different* workdirs, put the provider block in the **global**
+`~/.config/opencode/opencode.json` so both resolve the same provider regardless
+of workdir. A per-project `opencode.json` would apply to only that one workdir.
+→ **Prerequisite (connect-only):** each externally-started opencode must have its
+provider config resolved *before* the proxy connects — `serve` validates
+`{providerID, modelID}` against `GET /config/providers` at startup and **fails
+fast** if the model isn't there.
 
 > **API-shape note (don't get this wrong in `client.rs`):** the HTTP session API
 > takes `model` as a **split object** `{ "providerID": "…", "modelID": "…" }` — not

@@ -3,5 +3,5 @@
 
 pub mod client;
 pub mod events;
-pub mod supervisor;
+pub mod health;
 pub mod types;
