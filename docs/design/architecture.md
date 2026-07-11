@@ -226,9 +226,9 @@ flight is queued. `/stop` maps to `POST /session/:id/abort` for explicit interru
 
 ## 7. Return-path flows
 
-- **Streaming:** `events.rs` (SSE) `text.delta` → `render.rs` (throttled edits) →
-  `bot.rs` → user. **Verbosity & liveness policy: §13.**
-- **Approval:** `events.rs` `permission.asked` → `permission.rs` posts
+- **Streaming:** `events.rs` (SSE, **`/global/event`**) `message.part.delta` →
+  `render.rs` (throttled edits) → `bot.rs` → user. **Verbosity & liveness policy: §13.**
+- **Approval:** `events.rs` `permission.asked` (on **`/global/event`**) → `permission.rs` posts
   `[✅][✏️][❌]`, stashes token in `state`/`persistence` → user taps →
   `callback_query` in `bot.rs` → `permission.rs` → `client.reply_permission`.
   opencode holds the agent turn blocked throughout — no resume machinery needed.
@@ -258,12 +258,32 @@ Deferred items (§3) live under the **v0.1.0+ — Backlog** milestone.
 `clap`, `rusqlite`, `notify`, `tracing`/`tracing-subscriber`, `anyhow`/`thiserror`,
 `base64`.
 
-## 10. Version sensitivity (opencode)
+## 10. Version sensitivity + A0-validated wire (opencode 1.17.18)
 
-Pin an opencode version. Fetch its live `GET /doc` (OpenAPI 3.1) at build time and
-codegen the client. Keep the permission relay behind a thin V1/V2 adapter
-(`opencode serve` ships **V1** today: `permission.asked`, `POST /permission/:id/reply`).
-Verify event-type strings against a live `/event` connection before hard-coding.
+Pin an opencode version; fetch its live `GET /doc` (OpenAPI 3.1) and codegen the
+client. **A0 (issue #20) validated the wire against a live `opencode serve`
+1.17.18** — fixtures under `fixtures/opencode/`. Ground truth below **supersedes**
+the dev-branch docs the earlier sections were first drafted against:
+
+- **`POST /session/:id/message` is blocking** — returns the completed assistant
+  message. The v0.0.1 blocking path is valid.
+- **Both API surfaces are live**: V1 (`/session`, `/permission/:id/reply`,
+  `/event`, `/global/event`) **and** V2 (`/api/*`). V2 is *not* lildax-only. The
+  proxy targets **V1** (validated); keep a thin V1/V2 adapter seam anyway.
+- **Subscribe to `/global/event`** (per instance) for the full event set. Real
+  event names are **`message.part.delta`** (streaming text), `message.part.updated`,
+  `message.updated`, `session.updated`, `session.status`, `session.diff`,
+  `step-start`, `reasoning`, `tool`, `busy`, **`permission.asked`** — **NOT** the
+  `session.next.*` names. Each frame is wrapped
+  `{directory, project, payload:{id, type, properties}}`. The directory-scoped
+  `/event` omits `permission.asked`.
+- **Reply to a gate** via `POST /permission/:id/reply {reply: once|always|reject, message?}`.
+  Request `properties`: `{id, sessionID, permission, patterns, metadata:{command},
+  always, tool:{messageID, callID}}`.
+- **`model` object differs by endpoint**: `{id, providerID}` on `POST /session`
+  vs `{providerID, modelID}` on `POST /session/:id/message`.
+
+Re-run A0 and re-diff `/doc` if you bump the pinned version.
 
 ---
 
@@ -289,8 +309,8 @@ workdir = "/Users/you/work/wife"
 
 [model]
 # SELECTOR ONLY — the endpoint URL + wire spec live in opencode.json (see §12).
-provider_id = "lmstudio"              # must match a provider key in opencode.json
-model_id    = "google/gemma-3n-e4b"  # must match a models key under that provider
+provider_id = "llm-lan"                # must match a provider key in opencode.json
+model_id    = "Qwen3.6-35B-A3B-bf16"   # must match a models key under that provider
 
 [permissions]
 ask = ["git commit*", "git push*"]   # PATCHed onto each session at creation
@@ -304,20 +324,24 @@ The model endpoint URL and wire spec are **opencode's** config, **not** the
 proxy's. The proxy only selects `{providerID, modelID}` (§11); opencode holds the
 URL, the spec, and the key. You set this up once, outside the proxy.
 
-Your local model (LM Studio / Ollama / MLX on the M3 Ultra) is registered as a
-**custom OpenAI-compatible provider** in `opencode.json`, via the Vercel AI SDK
-`@ai-sdk/openai-compatible` adapter (the `/v1/chat/completions` spec):
+Your local model (served OpenAI-compatible on your LAN — here `llm.lan:8080`,
+Qwen models) is registered as a **custom OpenAI-compatible provider** in
+`opencode.json`, via the Vercel AI SDK `@ai-sdk/openai-compatible` adapter (the
+`/v1/chat/completions` spec). This is the actual setup A0 ran against:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "lmstudio": {                          // ← this key IS the providerID
+    "llm-lan": {                              // ← this key IS the providerID
       "npm": "@ai-sdk/openai-compatible",
-      "name": "LM Studio (local)",
-      "options": { "baseURL": "http://127.0.0.1:1234/v1" },
+      "name": "Local LLM (llm.lan)",
+      "options": {
+        "baseURL": "http://llm.lan:8080/v1",
+        "apiKey": "{env:LLM_LAN_KEY}"         // use an env var — never hard-code the key
+      },
       "models": {
-        "google/gemma-3n-e4b": {}          // ← this key IS the modelID
+        "Qwen3.6-35B-A3B-bf16": {}            // ← this key IS the modelID
       }
     }
   }
@@ -391,9 +415,11 @@ users, but a real ceiling at scale.
 
 ## 13. Event relay, verbosity & liveness
 
-opencode's `/event` SSE stream carries reasoning, tool calls, sub-agent runs, and
-step boundaries. Telegram is **linear and rate-limited** (~1 edit/sec), so we
-surface a **flat status** — never a tree — plus native chat actions for liveness.
+opencode's **`/global/event`** SSE stream carries reasoning, tool calls, sub-agent
+runs, and step boundaries. Telegram is **linear and rate-limited** (~1 edit/sec),
+so we surface a **flat status** — never a tree — plus native chat actions for
+liveness. *(Authoritative A0-validated event names are in §10; names below are
+conceptual categories.)*
 
 ### Liveness via chat actions (all verbosity levels)
 
@@ -428,8 +454,8 @@ Failures are shown at **every** verbosity.
 ### Coalesce, don't mirror
 
 `render.rs` holds `{ current-activity, answer-buffer }` and flushes to Telegram
-**≤ 1/sec**. Ignore `tool.input.delta` (wait for `tool.called` with resolved
-args); never edit per-delta — flood limits.
+**≤ 1/sec**. Stream from `message.part.delta`; take tool state from the `tool`
+event (§10) rather than every intermediate delta; never edit per-delta — flood limits.
 
 ### Verbosity (per-user toggle: `/quiet` · `/verbose`, stored in `state`)
 
