@@ -113,15 +113,35 @@ pub async fn connect_slots(cfg: &Config) -> Result<HashMap<String, SlotConn>> {
 
     let mut registry: HashMap<String, SlotConn> = HashMap::with_capacity(cfg.slots.len());
     for slot in &cfg.slots {
-        let conn = bring_up_slot(
+        match bring_up_slot(
             &http,
             slot,
             &cfg.model,
             health::READY_ATTEMPTS,
             health::READY_INTERVAL,
         )
-        .await?;
-        registry.insert(slot.name.clone(), conn);
+        .await
+        {
+            Ok(conn) => {
+                registry.insert(slot.name.clone(), conn);
+            }
+            // Best-effort: one unreachable / mis-provisioned slot must NOT crash
+            // the daemon. Log it and keep serving the slots that did connect; the
+            // skipped one comes up later (no restart) via `proxy connect <name>`.
+            Err(err) => tracing::error!(
+                slot = %slot.name,
+                url = %slot.opencode_url,
+                error = format!("{err:#}"),
+                "slot failed to connect at startup — skipping it (retry with `proxy connect {}`)",
+                slot.name,
+            ),
+        }
+    }
+    if registry.is_empty() && !cfg.slots.is_empty() {
+        tracing::warn!(
+            "no slots connected at startup — the bot is running but will route nobody \
+             until a slot connects (`proxy connect <name>`)"
+        );
     }
     Ok(registry)
 }

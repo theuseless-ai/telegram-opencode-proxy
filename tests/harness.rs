@@ -169,25 +169,26 @@ async fn long_reply_is_split_into_chunks() {
     assert_eq!(total, 9000, "chunks must reconstruct the full reply length");
 }
 
-/// 4. Provider-validation failure → `serve`'s bring-up (`connect_slots`) errors
-///    with a clear, actionable message naming the missing model.
+/// 4. A slot that fails bring-up (here: model absent from the catalogue) is
+///    SKIPPED, not fatal — startup is best-effort so one bad slot never crashes
+///    the daemon. (The error message itself is covered by `validate_model`'s
+///    unit tests.)
 #[tokio::test]
-async fn provider_validation_failure_is_reported_clearly() {
+async fn failing_slot_is_skipped_not_fatal_at_startup() {
     let oc = MockOpencode::start_without_model().await;
     let cfg = config_for(&oc.url);
 
-    let err = connect_slots(&cfg)
+    // Best-effort: startup does NOT error; the bad slot is simply left out.
+    let registry = connect_slots(&cfg)
         .await
-        .expect_err("bring-up must fail when the model is absent from the catalogue");
-    let msg = format!("{err:#}");
-
+        .expect("startup tolerates a slot that fails to bring up");
     assert!(
-        msg.contains("Qwen3.6-35B-A3B-bf16"),
-        "error should name the missing model, got: {msg}"
+        !registry.contains_key("you"),
+        "the mis-provisioned slot must be skipped"
     );
     assert!(
-        msg.contains("validating model for slot 'you'"),
-        "error should identify the failing slot, got: {msg}"
+        registry.is_empty(),
+        "no other slots configured, so the registry is empty"
     );
 }
 
