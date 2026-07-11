@@ -188,6 +188,12 @@ pub trait AdminState: Send + Sync + 'static {
 /// connection never panics the daemon.
 pub async fn serve_admin(state: Arc<dyn AdminState>, socket_path: PathBuf) -> Result<()> {
     let socket_path = socket_path.as_path();
+    // Create the parent directory if it's missing so a first run doesn't fail
+    // with ENOENT on a fresh socket path.
+    if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating admin socket directory {}", parent.display()))?;
+    }
     remove_stale(socket_path)?;
 
     let listener = UnixListener::bind(socket_path)

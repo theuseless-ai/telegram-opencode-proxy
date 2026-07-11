@@ -5,8 +5,10 @@
 # never commit a real token). If set here, TELOXIDE_TOKEN still overrides it.
 bot_token = ""
 
-# Local-only admin control socket (CLI ↔ daemon). Wired in #4b.
-admin_socket = "/run/topx/admin.sock"
+# Local-only admin control socket (CLI ↔ daemon) for `proxy status|connect|pair`.
+# The daemon creates the parent dir and locks the socket to 0600. Use a writable
+# path — e.g. $XDG_RUNTIME_DIR/topx/admin.sock in production; /tmp is fine for dev.
+admin_socket = "/tmp/topx-admin.sock"
 
 # SQLite store for routing (chat_id → opencode session), the whitelist, and
 # pending pairings/approvals. Survives restarts. Relative paths resolve against

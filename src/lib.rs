@@ -60,21 +60,23 @@ pub async fn serve(cfg: Config) -> Result<()> {
     // #38 (runtime-mutable slots are #39).
     let admin_state: Arc<dyn admin::AdminState> = state.clone();
 
+    // The admin control socket is a SECONDARY feature — run it in a background
+    // task so a bind/permission failure only logs and is tolerated, never taking
+    // down the bot. The dispatcher is the primary and blocks until Ctrl-C.
+    let admin_socket_task = admin_socket.clone();
+    let admin_task = tokio::spawn(async move {
+        if let Err(err) = admin::serve_admin(admin_state, admin_socket_task).await {
+            tracing::error!(
+                error = format!("{err:#}"),
+                "admin control socket unavailable — continuing without it"
+            );
+        }
+    });
+
     tracing::info!("starting Telegram long-poll dispatcher (Ctrl-C to stop)");
-    // Run the dispatcher and the admin control socket concurrently. `run` returns
-    // on Ctrl-C; `serve_admin` accepts forever, so whichever finishes first
-    // (normally the dispatcher) cancels the other via `select!`.
-    tokio::select! {
-        () = telegram::bot::run(bot, state) => {
-            tracing::info!("dispatcher stopped — shutting down admin socket");
-        }
-        res = admin::serve_admin(admin_state, admin_socket.clone()) => {
-            match res {
-                Ok(()) => tracing::warn!("admin socket server exited unexpectedly"),
-                Err(err) => tracing::error!(error = format!("{err:#}"), "admin socket server failed"),
-            }
-        }
-    }
+    telegram::bot::run(bot, state).await;
+    tracing::info!("dispatcher stopped — shutting down");
+    admin_task.abort();
 
     // Best-effort unlink so a restart binds cleanly (and no stale socket lingers).
     match std::fs::remove_file(&admin_socket) {
