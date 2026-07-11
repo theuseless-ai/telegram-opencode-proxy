@@ -1,0 +1,32 @@
+# Example config for telegram-opencode-proxy. Copy to config.toml and edit.
+# See docs/design/architecture.md §11.
+
+# Leave empty and provide the token via the TELOXIDE_TOKEN env var (recommended;
+# never commit a real token). If set here, TELOXIDE_TOKEN still overrides it.
+bot_token = ""
+
+# Local-only admin control socket (CLI ↔ daemon). Wired in #4b.
+admin_socket = "/run/topx/admin.sock"
+
+# One "seat" per user. telegram_id is bound at pairing time (proxy pair approve),
+# NOT listed here. opencode_url must be distinct per slot; workdir must exist.
+[[slots]]
+name = "you"
+opencode_url = "http://127.0.0.1:4096"
+workdir = "/home/you/work/you"
+
+[[slots]]
+name = "wife"
+opencode_url = "http://127.0.0.1:4097"
+workdir = "/home/you/work/wife"
+
+# Model SELECTOR only — the endpoint URL + key live in opencode.json (§12).
+# These must match a provider/model configured there.
+[model]
+provider_id = "llm-lan"
+model_id = "Qwen3.6-35B-A3B-bf16"
+
+# Bash patterns gated per session. Held at `deny` until the permission relay
+# (#13) exists to answer prompts, then flipped to `ask`.
+[permissions]
+ask = ["git commit*", "git push*"]

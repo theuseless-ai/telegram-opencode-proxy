@@ -15,12 +15,37 @@ mod state;
 mod telegram;
 
 use anyhow::Result;
+use clap::Parser;
 use tracing_subscriber::EnvFilter;
+
+use config::{Cli, Command, PairAction};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    tracing::info!("telegram-opencode-proxy starting (v0.0.1 scaffold)");
+    match Cli::parse().command {
+        Command::Serve {
+            config: config_path,
+        } => {
+            let cfg = config::Config::load(&config_path)?;
+            tracing::info!(
+                slots = cfg.slots.len(),
+                model = %cfg.model.model_id,
+                admin_socket = %cfg.admin_socket.display(),
+                gated = cfg.permissions.ask.len(),
+                "config loaded — serve wiring lands in #5/#6"
+            );
+        }
+        Command::Pair { action } => match action {
+            PairAction::List => tracing::info!("pair list — not implemented (#4b)"),
+            PairAction::Approve { code, slot } => {
+                tracing::info!(%code, %slot, "pair approve — not implemented (#4b)");
+            }
+            PairAction::Deny { code } => {
+                tracing::info!(%code, "pair deny — not implemented (#4b)");
+            }
+        },
+    }
     Ok(())
 }
 
