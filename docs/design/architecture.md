@@ -227,7 +227,7 @@ flight is queued. `/stop` maps to `POST /session/:id/abort` for explicit interru
 ## 7. Return-path flows
 
 - **Streaming:** `events.rs` (SSE) `text.delta` → `render.rs` (throttled edits) →
-  `bot.rs` → user.
+  `bot.rs` → user. **Verbosity & liveness policy: §13.**
 - **Approval:** `events.rs` `permission.asked` → `permission.rs` posts
   `[✅][✏️][❌]`, stashes token in `state`/`persistence` → user taps →
   `callback_query` in `bot.rs` → `permission.rs` → `client.reply_permission`.
@@ -243,8 +243,8 @@ flight is queued. `/stop` maps to `POST /session/:id/abort` for explicit interru
 | Milestone | Adds | Proves |
 |---|---|---|
 | **A** ~1d | config, auth + pairing handshake (CLI approve), `supervisor` (2 procs), blocking `POST /message`, chunked reply | the wire + enrollment work end-to-end |
-| **B** ~few days | SSE streaming + live edit, 2-user routing, `/new` `/whoami`, reconnect | daily-usable |
-| **C** ~1–2wk | inbound files, outbox + `/get`, permission relay + buttons, git-ask on session create | minutes → approve → commit |
+| **B** ~few days | SSE streaming + live edit, `typing` liveness, flat tool-status line, 2-user routing, `/new` `/whoami`, reconnect | daily-usable |
+| **C** ~1–2wk | inbound files, outbox + `/get`, permission relay + buttons, git-ask on session create, `/quiet` `/verbose` + sub-agent tags | minutes → approve → commit |
 
 ---
 
@@ -382,3 +382,72 @@ MCP config shape (`opencode.json`):
 servers configured for it (not on-demand per tool). Budget roughly
 (workdirs × servers-per-workdir) concurrent MCP subprocesses — negligible for two
 users, but a real ceiling at scale.
+
+---
+
+## 13. Event relay, verbosity & liveness
+
+opencode's `/event` SSE stream carries reasoning, tool calls, sub-agent runs, and
+step boundaries. Telegram is **linear and rate-limited** (~1 edit/sec), so we
+surface a **flat status** — never a tree — plus native chat actions for liveness.
+
+### Liveness via chat actions (all verbosity levels)
+
+- **`typing`** — the ambient "bot is working" signal. Re-send every ~4s while
+  `session.status: busy` (it auto-expires ~5s). This is **off** the message-edit
+  budget, so "thinking" costs no edits and is not a message.
+- **`upload_document` / `upload_photo`** — fired right before an outbox / `/get`
+  file send ("sending a file…").
+
+### One live status line per turn (not a log, not a tree)
+
+A single live-edited line shows the **current top-level activity**, replaced each
+step; on completion it collapses to a one-line **summary footer** above the answer:
+
+```
+🧵 explore ▸ 🔍 grep "load_config"          ← during the turn (live-edited)
+────────────────────────────────
+✓ 6 tools · 1 subagent · edited 2 files      ← on completion
+<answer>
+```
+
+**Sub-agents are a *tag*, not a tree.** A `task`-tool child session prefixes the
+status line with its name (`🧵 explore ▸ …`); that label is the only nesting cue —
+no indentation, no live tree (unreadable and reflows badly in a chat column).
+Soft dependency: the tag needs a child-`sessionID` → name lookup; if unavailable,
+drop the tag and show the bare activity.
+
+**Tool lines** are lifecycle-driven — `⚙️ <tool>: <key arg>` → `✓` / `✗ <error>`,
+arg truncated (`bash: git status`, `📖 read main.rs`, `✏️ edit config.rs`).
+Failures are shown at **every** verbosity.
+
+### Coalesce, don't mirror
+
+`render.rs` holds `{ current-activity, answer-buffer }` and flushes to Telegram
+**≤ 1/sec**. Ignore `tool.input.delta` (wait for `tool.called` with resolved
+args); never edit per-delta — flood limits.
+
+### Verbosity (per-user toggle: `/quiet` · `/verbose`, stored in `state`)
+
+| Stream | Quiet | Normal (default) | Verbose |
+|---|---|---|---|
+| `text.*` (answer) | answer only | stream | stream |
+| `reasoning.*` | — | `typing` only | `typing` (+ note in status) |
+| tool calls | failures only | flat status line | + full args |
+| sub-agent (`task` child) | — | `🧵 name ▸` tag | tag on status |
+| `step.ended` | — | summary footer | + cost / files touched |
+| `permission.asked` | buttons | buttons | buttons |
+
+Liveness (`typing`, upload actions) applies at **all** levels.
+
+### Deliberately excluded
+
+No live tree; no per-step message spam (one edited message, not many); no file
+transcript — chat stays lightweight and linear.
+
+### Scope
+
+- **Milestone B:** `typing` liveness + answer streaming + flat tool-status line +
+  always-on failures.
+- **Milestone C / fast-follow:** `/quiet` `/verbose` toggle, sub-agent tags, the
+  summary footer.
