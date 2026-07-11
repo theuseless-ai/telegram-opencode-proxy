@@ -23,7 +23,10 @@ M3 Ultra** — from Telegram. Self-hosted, one machine, two known users.
 In scope:
 
 - **Long-poll** bot (teloxide `getUpdates`; no webhook, no public URL).
-- **Two known users**, whitelisted by **numeric Telegram ID** (config + `--allowed-users`).
+- **Two known users**, enrolled via a **pairing handshake** (no manual user-ID
+  lookup): unknown sender → bot issues a single-use 6-digit code → admin approves
+  it via a local CLI, binding the account to a slot. Whitelist persists in SQLite.
+  See §5.
 - **Separate workdirs:** two static `opencode serve` processes
   (`:4096` → user A, `:4097` → user B), proxy routes by `chat_id`.
 - **Stateless proxy:** opencode owns message/session persistence (SQLite);
@@ -50,6 +53,9 @@ Documented as conscious deferrals, not oversights:
   single-process. Telegram offset + opencode SQLite already provide durability.
 - **Durable proxy-side queue** (`yaque`, SQLite-as-queue) — redundant for 2 users.
 - **Webhook ingress** — long-poll only for a home box.
+- **Invite-code (bearer-token) enrollment** — rejected in favor of the
+  confirmation-nonce pairing in §5: a leaked invite code would grant access,
+  whereas a pairing code cannot (approval requires shell/CLI access).
 - **Per-request directory routing on one shared opencode** — upstream rough
   edges; we use one process per workdir instead.
 - **opencode server Basic Auth** — localhost only; proxy whitelist is the gate.
@@ -76,8 +82,8 @@ Documented as conscious deferrals, not oversights:
    └───────┬──────────────────────────────────────────┬────────────────────┘
            │                                           │
      ┌─────▼─────┐                            ┌────────▼────────┐
-     │  auth.rs  │  numeric-ID whitelist      │ telegram/       │  render.rs → chunk 4096,
-     │ (2 users) │  reject if not you/wife    │  render+files   │  throttle stream-edit ~1/s
+     │  auth.rs  │  pairing whitelist         │ telegram/       │  render.rs → chunk 4096,
+     │ pairing.rs│  unknown → issue code      │  render+files   │  throttle stream-edit ~1/s
      └─────┬─────┘                            │  base64 FilePart│  files.rs → send_document
            │ chat_id                          └────────▲────────┘
            ▼                                           │ outbound text/files
@@ -128,11 +134,12 @@ Documented as conscious deferrals, not oversights:
 
 | Module | Responsibility |
 |---|---|
-| `main.rs` | Load config → spawn opencode procs → start bot + SSE listeners + outbox watchers |
-| `config.rs` | Config structs, `clap` CLI, `--allowed-users` merge, validation |
-| `state.rs` | Shared `AppState`: routing table, pending-approvals, instance registry |
-| `persistence.rs` | SQLite: `chat_id → session_id`, pending approvals (survive restart) |
-| `auth.rs` | Numeric-ID whitelist (2 users); reject others |
+| `main.rs` | Load config → spawn opencode procs → start bot + SSE listeners + outbox watchers + admin socket |
+| `config.rs` | Config structs, `clap` CLI (`serve` + `pair` subcommands), slot definitions, validation |
+| `state.rs` | Shared `AppState`: routing table, pending-approvals, pending-pairings, instance registry |
+| `persistence.rs` | SQLite: `allowed_users`, `chat_id → session_id`, `pending_pairings`, pending approvals (survive restart) |
+| `auth.rs` | Whitelist check against persisted `allowed_users`; unknown sender → hand off to `pairing.rs` |
+| `pairing.rs` | Issue single-use 6-digit codes; admin CLI approve/deny/list over local socket; bind account → slot |
 | `session.rs` | Get-or-create session; `/new` reset; PATCH `git commit*`/`push*` = `ask` on create |
 | `opencode/client.rs` | reqwest: create_session, prompt_async, get_messages, patch/reply permission, read_file |
 | `opencode/events.rs` | SSE `/event` subscribe + parse `session.next.*` + `permission.asked` |
@@ -146,7 +153,60 @@ Documented as conscious deferrals, not oversights:
 
 ---
 
-## 5. Queue layers (three) + concurrency policy
+## 5. Enrollment / pairing (auth)
+
+Goal: authorize the two users **without ever looking up a numeric Telegram ID**,
+while keeping enrollment gated to admin (shell) access — mandatory, since
+opencode executes code.
+
+**Design: confirmation-nonce handshake** (chosen over an invite-code/bearer
+scheme — see §3). The code flows *user → admin*, so it is **not** an access
+credential: a leaked code is useless without the admin's CLI approval.
+
+```
+new user ──msg──► bot ──(not in allowed_users)──► create pending
+                       │   { code: rand 6-digit, chat_id, username, expires_at }
+                       └── reply: "Not authorized. Code 123456 (10 min).
+                                   Send it to the admin."
+       │
+admin ◄── user reads code out-of-band (in person / SMS) ──┘
+  │
+  └─ CLI:  proxy pair approve 123456 --slot wife
+                 │  (over local Unix socket, perms 0600 — admin channel)
+                 ▼
+             daemon: verify code + TTL → bind chat_id → slot(wife)
+                     → write allowed_users → delete pending
+                     → bot notifies user "✅ Approved."
+```
+
+Rules:
+
+- Codes are **single-use** with a short **TTL** (~10 min); regenerating replaces
+  the prior code. Generation is **rate-limited per `chat_id`**.
+- The code is a **confirmation nonce**, not a bearer token: it binds the specific
+  `chat_id` to the human who reads it back, defeating name-spoofing.
+- Approval **binds an account to a slot** (workdir / opencode instance), filling
+  in the slot's `telegram_id`.
+
+Admin CLI (same binary, two modes — `serve` vs client subcommands):
+
+| Command | Effect |
+|---|---|
+| `proxy pair list` | Show pending requests: code, @username, first name, age |
+| `proxy pair approve <code> --slot <name>` | Bind chat_id → slot, add to `allowed_users`, notify user |
+| `proxy pair deny <code>` | Drop a pending request |
+
+**Bootstrap:** whoever has shell access approves themselves and their wife the
+same way — **no config-seeded IDs at all**. "Can approve" == "has shell on the
+box" == admin.
+
+**Admin channel security (hold this line):** the admin socket is **local-only**
+(Unix domain socket, perms `0600`, or `127.0.0.1`); **never** exposed on the
+network. Enrollment must stay gated to shell access.
+
+---
+
+## 6. Queue layers (three) + concurrency policy
 
 1. **Telegram offset** — durable inbound buffer (retained ~24h). Advance offset
    **only after** the message is durably handed off → at-least-once delivery.
@@ -160,7 +220,7 @@ flight is queued. `/stop` maps to `POST /session/:id/abort` for explicit interru
 
 ---
 
-## 6. Return-path flows
+## 7. Return-path flows
 
 - **Streaming:** `events.rs` (SSE) `text.delta` → `render.rs` (throttled edits) →
   `bot.rs` → user.
@@ -174,23 +234,23 @@ flight is queued. `/stop` maps to `POST /session/:id/abort` for explicit interru
 
 ---
 
-## 7. Build order (each shippable)
+## 8. Build order (each shippable)
 
 | Milestone | Adds | Proves |
 |---|---|---|
-| **A** ~1d | config, auth, `supervisor` (2 procs), blocking `POST /message`, chunked reply | the wire works end-to-end |
+| **A** ~1d | config, auth + pairing handshake (CLI approve), `supervisor` (2 procs), blocking `POST /message`, chunked reply | the wire + enrollment work end-to-end |
 | **B** ~few days | SSE streaming + live edit, 2-user routing, `/new` `/whoami`, reconnect | daily-usable |
 | **C** ~1–2wk | inbound files, outbox + `/get`, permission relay + buttons, git-ask on session create | minutes → approve → commit |
 
 ---
 
-## 8. Dependencies (planned)
+## 9. Dependencies (planned)
 
 `tokio`, `teloxide`, `reqwest` + `reqwest-eventsource`, `serde`/`serde_json`,
 `clap`, `rusqlite`, `notify`, `tracing`/`tracing-subscriber`, `anyhow`/`thiserror`,
 `base64`.
 
-## 9. Version sensitivity (opencode)
+## 10. Version sensitivity (opencode)
 
 Pin an opencode version. Fetch its live `GET /doc` (OpenAPI 3.1) at build time and
 codegen the client. Keep the permission relay behind a thin V1/V2 adapter
@@ -199,18 +259,23 @@ Verify event-type strings against a live `/event` connection before hard-coding.
 
 ---
 
-## 10. Config sketch (`config.toml`)
+## 11. Config sketch (`config.toml`)
 
 ```toml
 bot_token = "…"                 # or env TELOXIDE_TOKEN
+admin_socket = "/run/topx/admin.sock"   # local-only CLI ↔ daemon channel (perms 0600)
 
-[[users]]
-telegram_id = 111111111         # user A (you)
+[pairing]
+code_ttl_secs = 600             # single-use 6-digit code lifetime
+# Telegram IDs are NOT listed here — bound at pairing time via `proxy pair approve`.
+
+[[slots]]                       # a user "seat"; telegram_id filled in by pairing
+name = "you"
 opencode_url = "http://127.0.0.1:4096"
 workdir = "/Users/you/work/you"
 
-[[users]]
-telegram_id = 222222222         # user B (wife)
+[[slots]]
+name = "wife"
 opencode_url = "http://127.0.0.1:4097"
 workdir = "/Users/you/work/wife"
 
