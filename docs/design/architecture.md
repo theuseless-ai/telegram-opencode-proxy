@@ -240,11 +240,15 @@ flight is queued. `/stop` maps to `POST /session/:id/abort` for explicit interru
 
 ## 8. Build order (each shippable)
 
+GitHub milestones use these version codes; **A/B/C** stay as shorthand (issue prefixes).
+
 | Milestone | Adds | Proves |
 |---|---|---|
-| **A** ~1d | config, auth + pairing handshake (CLI approve), `supervisor` (2 procs), blocking `POST /message`, chunked reply | the wire + enrollment work end-to-end |
-| **B** ~few days | SSE streaming + live edit, `typing` liveness, flat tool-status line, 2-user routing, `/new` `/whoami`, reconnect | daily-usable |
-| **C** ~1–2wk | inbound files, outbox + `/get`, permission relay + buttons, git-ask on session create, `/quiet` `/verbose` + sub-agent tags | minutes → approve → commit |
+| **v0.0.1** · A ~1d | config, auth + pairing handshake (CLI approve), `supervisor` (2 procs), blocking `POST /message`, chunked reply | the wire + enrollment work end-to-end |
+| **v0.0.2** · B ~few days | SSE streaming + live edit, `typing` liveness, flat tool-status line, 2-user routing, `/new` `/whoami`, reconnect | daily-usable |
+| **v0.0.3** · C ~1–2wk | inbound files, outbox + `/get`, permission relay + buttons, git-ask on session create, `/quiet` `/verbose` + sub-agent tags | minutes → approve → commit |
+
+Deferred items (§3) live under the **v0.1.0+ — Backlog** milestone.
 
 ---
 
