@@ -22,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 
 use config::{Cli, Command, Config, PairAction};
 use opencode::client::{self, OpencodeClient};
-use opencode::supervisor::{self, SlotProcess};
+use opencode::health;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,36 +47,36 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Bring up the daemon: for each slot spawn `opencode serve`, wait for it to be
-/// ready, validate the configured provider/model against its live catalogue,
-/// build a client — then run the Telegram dispatcher until Ctrl-C.
+/// Bring up the daemon: for each slot, connect to its (externally-managed)
+/// opencode instance, wait until it's reachable, validate the configured
+/// provider/model against its live catalogue, build a client — then run the
+/// Telegram dispatcher until Ctrl-C. The proxy is **connect-only**: it does not
+/// spawn opencode (start it via `./dev.sh` / systemd / compose).
 async fn serve(cfg: Config) -> Result<()> {
     tracing::info!(
         slots = cfg.slots.len(),
         provider = %cfg.model.provider_id,
         model = %cfg.model.model_id,
         gated = cfg.permissions.ask.len(),
-        "starting proxy"
+        "starting proxy (connect-only)"
     );
 
     let http = reqwest::Client::builder()
         .build()
         .context("building readiness http client")?;
 
-    // Kept alive for the daemon's lifetime; `kill_on_drop` reaps them on exit.
-    let mut procs: Vec<SlotProcess> = Vec::with_capacity(cfg.slots.len());
     let mut clients: HashMap<String, OpencodeClient> = HashMap::with_capacity(cfg.slots.len());
 
     for slot in &cfg.slots {
-        let proc = SlotProcess::spawn(slot)?;
-        tracing::info!(slot = %proc.name, port = proc.port, "spawned opencode — waiting for readiness");
-        supervisor::wait_ready(
+        tracing::info!(slot = %slot.name, url = %slot.opencode_url, "connecting to opencode");
+        health::wait_ready(
             &http,
             &slot.opencode_url,
-            supervisor::READY_ATTEMPTS,
-            supervisor::READY_INTERVAL,
+            health::READY_ATTEMPTS,
+            health::READY_INTERVAL,
         )
-        .await?;
+        .await
+        .with_context(|| format!("opencode for slot '{}' not reachable", slot.name))?;
 
         let ocl = OpencodeClient::for_slot(slot)?;
         let providers = ocl
@@ -86,9 +86,8 @@ async fn serve(cfg: Config) -> Result<()> {
         client::validate_model(&providers, &cfg.model.provider_id, &cfg.model.model_id)
             .with_context(|| format!("validating model for slot '{}'", slot.name))?;
 
-        tracing::info!(slot = %slot.name, "opencode ready — provider/model validated");
+        tracing::info!(slot = %slot.name, "connected — provider/model validated");
         clients.insert(slot.name.clone(), ocl);
-        procs.push(proc);
     }
 
     let bot = teloxide::Bot::new(cfg.bot_token.clone());
@@ -97,10 +96,8 @@ async fn serve(cfg: Config) -> Result<()> {
     tracing::info!("starting Telegram long-poll dispatcher (Ctrl-C to stop)");
     telegram::bot::run(bot, state).await;
 
-    // TODO(#N2): graceful shutdown — abort in-flight turns, then reap procs.
-    // For now the dispatcher's Ctrl-C handler returns here and `procs`
-    // (`kill_on_drop`) terminate the opencode children as they drop.
-    drop(procs);
+    // TODO(#N2): clean shutdown — drain in-flight turns, close SSE/HTTP, flush
+    // SQLite. No opencode children to reap (connect-only).
     Ok(())
 }
 
