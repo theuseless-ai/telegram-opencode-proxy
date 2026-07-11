@@ -70,6 +70,17 @@ pub struct Config {
     /// Session permission rules (see #13).
     #[serde(default)]
     pub permissions: Permissions,
+    /// Path to the proxy's SQLite store (routing + whitelist + pending
+    /// pairings/approvals; #3). Relative paths resolve against the process
+    /// working directory. Defaults to `proxy.db`. WAL creates sidecar
+    /// `-wal`/`-shm` files next to it.
+    #[serde(default = "default_db_path")]
+    pub db_path: PathBuf,
+}
+
+/// Default SQLite path when `db_path` is omitted from config.
+fn default_db_path() -> PathBuf {
+    PathBuf::from("proxy.db")
 }
 
 /// A user seat: one opencode instance bound to one working directory.

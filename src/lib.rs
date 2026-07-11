@@ -41,8 +41,12 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     let clients = connect_slots(&cfg).await?;
 
+    let db = persistence::Db::open(&cfg.db_path)
+        .with_context(|| format!("opening SQLite store at {}", cfg.db_path.display()))?;
+    tracing::info!(db = %cfg.db_path.display(), "opened SQLite store (WAL)");
+
     let bot = teloxide::Bot::new(cfg.bot_token.clone());
-    let state = telegram::bot::AppState::new(cfg, clients);
+    let state = telegram::bot::AppState::new(cfg, clients, db);
 
     tracing::info!("starting Telegram long-poll dispatcher (Ctrl-C to stop)");
     telegram::bot::run(bot, state).await;

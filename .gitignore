@@ -10,6 +10,14 @@
 config.toml
 config.local.toml
 
+# SQLite store (routing + whitelist + pending pairings/approvals) + WAL sidecars
+proxy.db
+proxy.db-wal
+proxy.db-shm
+*.db
+*.db-wal
+*.db-shm
+
 # rust build
 /target
 

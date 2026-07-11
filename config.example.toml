@@ -8,6 +8,12 @@ bot_token = ""
 # Local-only admin control socket (CLI ↔ daemon). Wired in #4b.
 admin_socket = "/run/topx/admin.sock"
 
+# SQLite store for routing (chat_id → opencode session), the whitelist, and
+# pending pairings/approvals. Survives restarts. Relative paths resolve against
+# the working directory; WAL creates proxy.db-wal / proxy.db-shm alongside it.
+# Optional — defaults to "proxy.db".
+db_path = "proxy.db"
+
 # One "seat" per user. opencode_url must be distinct per slot; workdir must exist.
 #
 # telegram_id is the TEMPORARY minimal auth gate (A4a): set it to your numeric

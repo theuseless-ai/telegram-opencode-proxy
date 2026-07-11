@@ -29,6 +29,7 @@ use teloxide::types::Message;
 use telegram_opencode_proxy::config::{Config, Model, Permissions, Slot};
 use telegram_opencode_proxy::connect_slots;
 use telegram_opencode_proxy::opencode::client::OpencodeClient;
+use telegram_opencode_proxy::persistence::Db;
 use telegram_opencode_proxy::telegram::bot::{AppState, handle_text};
 
 use support::mock_opencode::MockOpencode;
@@ -52,6 +53,7 @@ fn config_for(opencode_url: &str) -> Config {
             model_id: "Qwen3.6-35B-A3B-bf16".to_string(),
         },
         permissions: Permissions { ask: Vec::new() },
+        db_path: "proxy.db".into(),
     }
 }
 
@@ -83,7 +85,9 @@ async fn state_for(cfg: Config) -> Arc<AppState> {
     let clients: HashMap<String, OpencodeClient> = connect_slots(&cfg)
         .await
         .expect("connect_slots (readiness + model validation) succeeds against the mock");
-    AppState::new(cfg, clients)
+    // In-memory routing store — hermetic, no file touched by the harness.
+    let db = Db::open_in_memory().expect("in-memory persistence store opens");
+    AppState::new(cfg, clients, db)
 }
 
 /// 1. Authorized text → the mock records a `sendMessage` carrying the model reply.

@@ -38,3 +38,6 @@ axum = "0.8"
 teloxide = { version = "0.17.0", features = ["macros"] }
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["full"] }
+# Temp DB files for persistence reopen tests (src/persistence.rs). Already in
+# the lockfile transitively, so this direct edge reuses the pinned version.
+tempfile = "3"
