@@ -24,19 +24,23 @@ the local **`llm-lan`** provider (`http://llm.lan:8080/v1`, Qwen models).
 
 1. **`POST /session/:id/message` is BLOCKING** — returns the completed assistant
    message (HTTP 200, ~1.9s). v0.0.1's blocking reply path is valid.
-2. **Event taxonomy differs from the design's assumption.** Live v1.17.18 emits
-   `message.part.delta` (streaming text), `message.part.updated`, `message.updated`,
-   `session.updated`, `session.status`, `session.diff`, `step-start`, `text`,
-   `reasoning`, `tool`, `busy`, `server.connected/heartbeat` — **NOT** the
-   `session.next.*` names in the dev-branch docs. `events.rs` must target these.
+2. **Subscribe to `/global/event`** (per opencode instance) — it carries the full
+   event set: `message.part.delta` (streaming text), `message.part.updated`,
+   `message.updated`, `session.updated`, `session.status`, `session.diff`,
+   `step-start`, `text`, `reasoning`, `tool`, `busy`, **`permission.asked`**,
+   `server.connected/heartbeat`. The directory-scoped `/event` carries the message
+   events but **omits `permission.asked`**; `/api/event` and `/session/:id/event`
+   yielded nothing here. Names are **NOT** the dev-branch `session.next.*`. Each
+   `/global/event` frame is wrapped: `{directory, project, payload:{id, type, properties}}`.
 3. **Both API surfaces are exposed** by `opencode serve`: V1 (`/session`,
    `/permission/:id/reply`, `/event`) **and** V2 (`/api/*`). V2 is *not*
    lildax-only as earlier research suggested. V1 confirmed working here.
-4. **Permission gate** — V1 request shape confirmed via `GET /permission`:
+4. **Permission gate** — V1 request shape confirmed via `GET /permission` *and* the
+   `permission.asked` event on `/global/event` (see `events/gated-global.sse`):
    `{id, sessionID, permission, patterns, metadata:{command}, always, tool:{messageID,callID}}`.
-   `POST /permission/:id/reply {reply:"reject"}` → 200. **⚠️ The gate did NOT emit
-   a dedicated event on `/event`** — discover it via `GET /permission` (or check
-   `/api/event` / `/session/:id/event`). Open item for #13.
+   `POST /permission/:id/reply {reply:"reject"}` → 200. **RESOLVED for #13:** relay
+   subscribes `/global/event`, filters `permission.asked`, replies via
+   `POST /permission/:id/reply`.
 5. **`model` object differs by endpoint**: `POST /session` uses `{id, providerID}`;
    `POST /session/:id/message` uses `{providerID, modelID}`. `client.rs` must handle both.
 6. **Local provider**: `llm-lan` → `http://llm.lan:8080/v1`, models
