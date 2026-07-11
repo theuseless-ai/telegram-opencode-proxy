@@ -13,35 +13,33 @@ use std::sync::Arc;
 
 use teloxide::prelude::*;
 use teloxide::utils::command::BotCommands;
-use tokio::sync::Mutex;
 
 use crate::auth;
 use crate::config::{Config, Slot};
 use crate::opencode::client::OpencodeClient;
 use crate::opencode::types::PromptModel;
+use crate::persistence::Db;
 use crate::session;
 use crate::telegram::render::{self, TELEGRAM_LIMIT};
 
 /// Shared dispatcher state: config, one opencode client per slot (keyed by slot
-/// name), and the in-memory `chat_id → session_id` routing map.
+/// name), and the SQLite-backed `chat_id → session_id` routing store.
 ///
-/// The session map is a `tokio::sync::Mutex` — a plain guard around the map is
-/// enough at this scale; the per-user `mpsc` turn-serialization queue is #9.
-/// Persisting the routing map to SQLite is #3.
+/// Routing lives in the [`Db`] `routing` table (#3), so sessions survive a
+/// restart: `run_turn` reads the stored id, lets `session::get_or_create`
+/// resolve it (recreating a stale/404 id), then writes the resolved id back.
+/// The per-user `mpsc` turn-serialization queue is #9.
 pub struct AppState {
     pub cfg: Config,
     pub clients: HashMap<String, OpencodeClient>,
-    pub sessions: Mutex<HashMap<i64, String>>,
+    pub db: Db,
 }
 
 impl AppState {
-    /// Build state from config + already-validated per-slot clients.
-    pub fn new(cfg: Config, clients: HashMap<String, OpencodeClient>) -> Arc<Self> {
-        Arc::new(Self {
-            cfg,
-            clients,
-            sessions: Mutex::new(HashMap::new()),
-        })
+    /// Build state from config, already-validated per-slot clients, and an open
+    /// SQLite handle.
+    pub fn new(cfg: Config, clients: HashMap<String, OpencodeClient>, db: Db) -> Arc<Self> {
+        Arc::new(Self { cfg, clients, db })
     }
 }
 
@@ -142,7 +140,8 @@ async fn run_turn(
         .get(&slot.name)
         .ok_or_else(|| anyhow::anyhow!("no opencode client for slot '{}'", slot.name))?;
 
-    let stored = state.sessions.lock().await.get(&chat_id).cloned();
+    // Read routing from SQLite (sync, lock released before the await below).
+    let stored = state.db.get_session(chat_id)?;
     let session_id = session::get_or_create(
         client,
         stored.as_deref(),
@@ -150,11 +149,8 @@ async fn run_turn(
         &state.cfg.permissions.ask,
     )
     .await?;
-    state
-        .sessions
-        .lock()
-        .await
-        .insert(chat_id, session_id.clone());
+    // Persist the resolved id so it survives a restart (and a possible recreate).
+    state.db.set_session(chat_id, &session_id)?;
 
     let reply = client
         .prompt(&session_id, PromptModel::from(&state.cfg.model), text)
