@@ -1,0 +1,13 @@
+# secrets — never commit
+.ssh_secret
+*.secret
+*_secret
+.env
+.env.*
+!.env.example
+
+# rust build
+/target
+
+# orchestration scratch
+.sisyphus/
