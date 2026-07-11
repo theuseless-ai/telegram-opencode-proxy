@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use telegram_opencode_proxy::admin::{self, AdminRequest, AdminResponse};
+use telegram_opencode_proxy::admin::{self, AdminRequest, AdminResponse, ConnectOutcome};
 use telegram_opencode_proxy::config::{Cli, Command, Config, PairAction};
 use telegram_opencode_proxy::serve;
 
@@ -26,6 +26,16 @@ async fn main() -> Result<()> {
         }
         Command::Status { config, socket } => {
             status(config, socket).await?;
+        }
+        Command::Connect {
+            name,
+            url,
+            workdir,
+            telegram_id,
+            config,
+            socket,
+        } => {
+            connect(name, url, workdir, telegram_id, config, socket).await?;
         }
         Command::Pair { action } => match action {
             PairAction::List => tracing::info!("pair list — not implemented (#4b)"),
@@ -59,6 +69,43 @@ async fn status(config: PathBuf, socket: Option<PathBuf>) -> Result<()> {
             Ok(())
         }
         AdminResponse::Error { message } => bail!("daemon returned an error: {message}"),
+        other => bail!("unexpected response from daemon: {other:?}"),
+    }
+}
+
+/// `proxy connect <name>`: dial the running daemon and idempotently ensure the
+/// slot is connected. Prints the outcome; a daemon-side failure exits non-zero.
+async fn connect(
+    name: String,
+    url: Option<String>,
+    workdir: Option<String>,
+    telegram_id: Option<i64>,
+    config: PathBuf,
+    socket: Option<PathBuf>,
+) -> Result<()> {
+    let socket_path = match socket {
+        Some(path) => path,
+        None => Config::load(&config)?.admin_socket,
+    };
+
+    let req = AdminRequest::Connect {
+        name,
+        url,
+        workdir,
+        telegram_id,
+    };
+    match admin::send_request(&socket_path, &req).await? {
+        AdminResponse::Connect { name, outcome } => {
+            let label = match outcome {
+                ConnectOutcome::Connected => "connected",
+                ConnectOutcome::Reconnected => "reconnected",
+                ConnectOutcome::Added => "added",
+            };
+            println!("{name}: {label}");
+            Ok(())
+        }
+        AdminResponse::Error { message } => bail!("daemon returned an error: {message}"),
+        other => bail!("unexpected response from daemon: {other:?}"),
     }
 }
 

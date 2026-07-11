@@ -18,7 +18,9 @@
 //! match arm — #39 adds `Connect`, #4b adds `Pair*` — without breaking the frame
 //! format or the existing `status` client.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,6 +56,24 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(1);
 pub enum AdminRequest {
     /// Report every configured slot and whether its opencode is reachable now.
     Status,
+    /// Idempotently ensure `name` is connected (#39): report `connected` if it
+    /// is already up, `reconnect` it if it exists but its opencode is down, or
+    /// `add` it (requires `url`) if it does not exist. An added slot is also
+    /// persisted so it survives a restart.
+    Connect {
+        /// Slot name to ensure connected.
+        name: String,
+        /// opencode base URL — **required** when adding a slot that does not
+        /// exist; ignored for a slot that already exists.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// Working directory for a newly-added slot (defaults to `.`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workdir: Option<String>,
+        /// Telegram id to bind a newly-added slot to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        telegram_id: Option<i64>,
+    },
 }
 
 /// A response from the daemon to an admin CLI.
@@ -69,12 +89,51 @@ pub enum AdminResponse {
         /// One entry per configured slot, in config order.
         slots: Vec<SlotStatus>,
     },
+    /// Reply to [`AdminRequest::Connect`] — which of the three idempotent
+    /// outcomes was taken for `name`.
+    Connect {
+        /// The slot the command acted on.
+        name: String,
+        /// What the daemon did: already up, reconnected, or newly added.
+        outcome: ConnectOutcome,
+    },
     /// A handler failed; `message` is human-readable.
     Error {
         /// What went wrong.
         message: String,
     },
 }
+
+/// The idempotent result of an [`AdminRequest::Connect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectOutcome {
+    /// The slot existed and its opencode was already reachable — a no-op.
+    Connected,
+    /// The slot existed but was down; its client was rebuilt and re-validated.
+    Reconnected,
+    /// The slot did not exist; it was built, connected, and persisted.
+    Added,
+}
+
+/// Parameters for [`AdminState::ensure_connected`], mirroring
+/// [`AdminRequest::Connect`] minus the wire framing.
+#[derive(Debug, Clone)]
+pub struct ConnectParams {
+    /// Slot name to ensure connected.
+    pub name: String,
+    /// opencode base URL — required only when adding a new slot.
+    pub url: Option<String>,
+    /// Working directory for a newly-added slot (defaults to `.`).
+    pub workdir: Option<String>,
+    /// Telegram id to bind a newly-added slot to.
+    pub telegram_id: Option<i64>,
+}
+
+/// A boxed, `Send` future — the return type for the async [`AdminState`] method,
+/// hand-written so the trait stays object-safe (`Arc<dyn AdminState>`) without
+/// pulling in the `async-trait` macro.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Per-slot status line in an [`AdminResponse::Status`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,8 +165,16 @@ pub struct SlotInfo {
 /// slots, `Db` access) without touching the transport layer. `'static` so it can
 /// ride an `Arc<dyn AdminState>` across spawned connection tasks.
 pub trait AdminState: Send + Sync + 'static {
-    /// The configured slots to report and probe, in a stable (config) order.
+    /// The live slots to report and probe, in a stable order.
     fn slots(&self) -> Vec<SlotInfo>;
+
+    /// Idempotently ensure `params.name` is connected (#39): report the slot
+    /// already up, reconnect it, or add+persist it. Mutates the live registry.
+    /// Returns a boxed future so the trait stays object-safe.
+    fn ensure_connected<'a>(
+        &'a self,
+        params: ConnectParams,
+    ) -> BoxFuture<'a, Result<ConnectOutcome>>;
 }
 
 /// Serve the admin control socket at `socket_path` until the future is dropped
@@ -121,6 +188,12 @@ pub trait AdminState: Send + Sync + 'static {
 /// connection never panics the daemon.
 pub async fn serve_admin(state: Arc<dyn AdminState>, socket_path: PathBuf) -> Result<()> {
     let socket_path = socket_path.as_path();
+    // Create the parent directory if it's missing so a first run doesn't fail
+    // with ENOENT on a fresh socket path.
+    if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating admin socket directory {}", parent.display()))?;
+    }
     remove_stale(socket_path)?;
 
     let listener = UnixListener::bind(socket_path)
@@ -253,6 +326,22 @@ async fn handle(
         AdminRequest::Status => AdminResponse::Status {
             slots: status(state, http).await,
         },
+        AdminRequest::Connect {
+            name,
+            url,
+            workdir,
+            telegram_id,
+        } => {
+            let outcome = state
+                .ensure_connected(ConnectParams {
+                    name: name.clone(),
+                    url,
+                    workdir,
+                    telegram_id,
+                })
+                .await?;
+            AdminResponse::Connect { name, outcome }
+        }
     })
 }
 
@@ -344,6 +433,13 @@ mod tests {
         fn slots(&self) -> Vec<SlotInfo> {
             self.slots.clone()
         }
+
+        fn ensure_connected<'a>(
+            &'a self,
+            _params: ConnectParams,
+        ) -> BoxFuture<'a, Result<ConnectOutcome>> {
+            Box::pin(async { anyhow::bail!("FakeState does not support connect") })
+        }
     }
 
     fn fake(slots: &[(&str, &str)]) -> Arc<dyn AdminState> {
@@ -400,6 +496,39 @@ mod tests {
     fn request_serializes_to_tagged_json() {
         let json = serde_json::to_string(&AdminRequest::Status).unwrap();
         assert_eq!(json, r#"{"cmd":"status"}"#);
+    }
+
+    #[test]
+    fn connect_request_round_trips_and_omits_absent_options() {
+        // A bare connect (existing slot) carries no optional fields on the wire.
+        let bare = AdminRequest::Connect {
+            name: "you".into(),
+            url: None,
+            workdir: None,
+            telegram_id: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"cmd":"connect","name":"you"}"#
+        );
+
+        let full = AdminRequest::Connect {
+            name: "new".into(),
+            url: Some("http://127.0.0.1:4099".into()),
+            workdir: Some("/srv/new".into()),
+            telegram_id: Some(42),
+        };
+        let back: AdminRequest =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(full, back);
+
+        let resp = AdminResponse::Connect {
+            name: "new".into(),
+            outcome: ConnectOutcome::Added,
+        };
+        let back: AdminResponse =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(resp, back);
     }
 
     #[test]

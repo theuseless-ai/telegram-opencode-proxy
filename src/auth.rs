@@ -11,54 +11,52 @@
 //! logs the numeric `chat_id` (a bootstrap aid) and replies "not authorized".
 //! See `docs/design/architecture.md` §5. Issues #4a/#4b.
 
-use crate::config::{Config, Slot};
+use crate::config::Slot;
 
 /// Resolve the slot a Telegram `chat_id` is authorized for, or `None` if the
 /// sender is not on the whitelist. Matches `slot.telegram_id == Some(chat_id)`.
-pub fn resolve(cfg: &Config, chat_id: i64) -> Option<&Slot> {
-    cfg.slots
-        .iter()
-        .find(|slot| slot.telegram_id == Some(chat_id))
+///
+/// Takes a slot slice rather than the whole `Config` so the caller can pass a
+/// snapshot of the **runtime registry** (#39) — slots added at runtime via
+/// `proxy connect` are authorized here too, not just config `[[slots]]`.
+pub fn resolve(slots: &[Slot], chat_id: i64) -> Option<&Slot> {
+    slots.iter().find(|slot| slot.telegram_id == Some(chat_id))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cfg_with(slots: &[(&str, Option<i64>)]) -> Config {
-        let mut toml = String::from(
-            "bot_token = \"t\"\nadmin_socket = \"/tmp/a.sock\"\n\
-             [model]\nprovider_id = \"p\"\nmodel_id = \"m\"\n",
-        );
-        for (name, id) in slots {
-            toml.push_str(&format!(
-                "[[slots]]\nname = \"{name}\"\nopencode_url = \"http://127.0.0.1:0/{name}\"\nworkdir = \".\"\n"
-            ));
-            if let Some(id) = id {
-                toml.push_str(&format!("telegram_id = {id}\n"));
-            }
-        }
-        toml::from_str(&toml).expect("test config parses")
+    fn slots_with(specs: &[(&str, Option<i64>)]) -> Vec<Slot> {
+        specs
+            .iter()
+            .map(|(name, id)| Slot {
+                name: (*name).to_string(),
+                opencode_url: format!("http://127.0.0.1:0/{name}"),
+                workdir: ".".into(),
+                telegram_id: *id,
+            })
+            .collect()
     }
 
     #[test]
     fn resolves_matching_slot() {
-        let cfg = cfg_with(&[("you", Some(111)), ("wife", Some(222))]);
-        assert_eq!(resolve(&cfg, 111).map(|s| s.name.as_str()), Some("you"));
-        assert_eq!(resolve(&cfg, 222).map(|s| s.name.as_str()), Some("wife"));
+        let slots = slots_with(&[("you", Some(111)), ("wife", Some(222))]);
+        assert_eq!(resolve(&slots, 111).map(|s| s.name.as_str()), Some("you"));
+        assert_eq!(resolve(&slots, 222).map(|s| s.name.as_str()), Some("wife"));
     }
 
     #[test]
     fn unknown_sender_is_none() {
-        let cfg = cfg_with(&[("you", Some(111))]);
-        assert!(resolve(&cfg, 999).is_none());
+        let slots = slots_with(&[("you", Some(111))]);
+        assert!(resolve(&slots, 999).is_none());
     }
 
     #[test]
     fn unpaired_slot_matches_nobody() {
         // A slot with no telegram_id must never match, including a 0 chat_id.
-        let cfg = cfg_with(&[("you", None)]);
-        assert!(resolve(&cfg, 0).is_none());
-        assert!(resolve(&cfg, 111).is_none());
+        let slots = slots_with(&[("you", None)]);
+        assert!(resolve(&slots, 0).is_none());
+        assert!(resolve(&slots, 111).is_none());
     }
 }
