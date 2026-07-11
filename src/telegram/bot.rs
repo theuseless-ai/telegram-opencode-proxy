@@ -8,20 +8,25 @@
 //! reports the numeric chat id (a bootstrap aid). Streaming, files, `/new`,
 //! `/get`, `/stop`, and per-user mpsc serialization land in later issues.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use teloxide::prelude::*;
+use teloxide::types::ChatId;
 use teloxide::utils::command::BotCommands;
 
-use crate::admin::{BoxFuture, ConnectOutcome, ConnectParams, SlotInfo};
+use crate::admin::{
+    ApproveInfo, BoxFuture, ConnectOutcome, ConnectParams, PairingEntry, SlotInfo,
+    SlotInventoryBase, SlotSource,
+};
 use crate::auth;
 use crate::config::{Config, Slot};
 use crate::opencode::client::OpencodeClient;
 use crate::opencode::types::PromptModel;
+use crate::pairing;
 use crate::persistence::Db;
 use crate::session;
 use crate::state::SlotConn;
@@ -51,17 +56,47 @@ pub struct AppState {
     pub cfg: Config,
     pub registry: RwLock<HashMap<String, SlotConn>>,
     pub db: Db,
+    /// Bot handle used to notify a user out-of-band — specifically the pairing
+    /// approval ping (#4b), sent from the admin-socket handler (which has no
+    /// `Message` to reply to). `Bot` is `Arc`-backed, so this clone is cheap.
+    pub bot: Bot,
 }
 
 impl AppState {
-    /// Build state from config, the seeded per-slot registry (config ∪ DB), and
-    /// an open SQLite handle.
-    pub fn new(cfg: Config, registry: HashMap<String, SlotConn>, db: Db) -> Arc<Self> {
+    /// Build state from config, the seeded per-slot registry (config ∪ DB), an
+    /// open SQLite handle, and a bot handle for out-of-band notifications.
+    ///
+    /// Also **seeds the whitelist from config** (#4b): every config slot with a
+    /// `telegram_id` is idempotently written into `allowed_users`, so the A4a
+    /// config whitelist and A4b pairing share one lookup path. Seeding is
+    /// best-effort — a DB hiccup is logged, never fatal — since a live daemon
+    /// with an unwritable store has larger problems.
+    pub fn new(cfg: Config, registry: HashMap<String, SlotConn>, db: Db, bot: Bot) -> Arc<Self> {
+        for slot in &cfg.slots {
+            if let Some(id) = slot.telegram_id
+                && let Err(err) = db.add_allowed(id, &slot.name)
+            {
+                tracing::warn!(
+                    chat_id = id,
+                    slot = %slot.name,
+                    error = %err,
+                    "failed to seed config telegram_id into allowed_users"
+                );
+            }
+        }
         Arc::new(Self {
             cfg,
             registry: RwLock::new(registry),
             db,
+            bot,
         })
+    }
+
+    /// The names of every live slot in the registry (short read guard, dropped
+    /// before returning).
+    fn registry_names(&self) -> Vec<String> {
+        let guard = self.registry.read().unwrap_or_else(PoisonError::into_inner);
+        guard.values().map(|c| c.slot.name.clone()).collect()
     }
 
     /// A cloned snapshot of every live slot definition. Takes a short read guard
@@ -194,6 +229,95 @@ impl crate::admin::AdminState for AppState {
     ) -> BoxFuture<'a, anyhow::Result<ConnectOutcome>> {
         Box::pin(async move { self.ensure_connected_impl(params).await })
     }
+
+    /// Per-slot inventory (#4b): registry slots (name/url/workdir) folded with
+    /// the `allowed_users` bindings and tagged config- vs db-sourced. All reads
+    /// are synchronous; the `connected` probe is the transport layer's job.
+    fn slot_inventory(&self) -> anyhow::Result<Vec<SlotInventoryBase>> {
+        let config_names: HashSet<&str> = self.cfg.slots.iter().map(|s| s.name.as_str()).collect();
+        // (chat_id, slot) bindings grouped per slot.
+        let allowed = self.db.list_allowed()?;
+
+        let mut out: Vec<SlotInventoryBase> = {
+            let guard = self.registry.read().unwrap_or_else(PoisonError::into_inner);
+            guard
+                .values()
+                .map(|c| {
+                    let telegram_ids = allowed
+                        .iter()
+                        .filter(|(_, slot)| slot == &c.slot.name)
+                        .map(|(chat_id, _)| *chat_id)
+                        .collect();
+                    let source = if config_names.contains(c.slot.name.as_str()) {
+                        SlotSource::Config
+                    } else {
+                        SlotSource::Db
+                    };
+                    SlotInventoryBase {
+                        name: c.slot.name.clone(),
+                        opencode_url: c.slot.opencode_url.clone(),
+                        workdir: c.slot.workdir.to_string_lossy().into_owned(),
+                        telegram_ids,
+                        source,
+                    }
+                })
+                .collect()
+        };
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// The live pending pairings (#4b), each stamped with its age (derived from
+    /// `expires_at` and the configured TTL, since only expiry is persisted).
+    fn pair_list(&self) -> anyhow::Result<Vec<PairingEntry>> {
+        let now = pairing::now_epoch();
+        let ttl = self.cfg.pairing.code_ttl_secs;
+        let pending = pairing::list(&self.db, now)?;
+        Ok(pending
+            .into_iter()
+            .map(|p| {
+                let issued_at = p.expires_at.saturating_sub(ttl);
+                PairingEntry {
+                    code: p.code,
+                    username: p.username,
+                    chat_id: p.chat_id,
+                    age_secs: now.saturating_sub(issued_at).max(0),
+                }
+            })
+            .collect())
+    }
+
+    fn pair_approve<'a>(
+        &'a self,
+        code: String,
+        slot: String,
+    ) -> BoxFuture<'a, anyhow::Result<ApproveInfo>> {
+        Box::pin(async move {
+            // Bind synchronously (no lock held across the await below), then
+            // notify the freshly-paired user via the bot.
+            let names = self.registry_names();
+            let outcome = pairing::approve(&self.db, &names, &code, &slot, pairing::now_epoch())?;
+
+            let text = format!(
+                "✅ Approved! You're now paired to slot '{}'. Send me a message to get started.",
+                outcome.slot
+            );
+            self.bot
+                .send_message(ChatId(outcome.chat_id), text)
+                .await
+                .with_context(|| format!("notifying paired user {}", outcome.chat_id))?;
+
+            Ok(ApproveInfo {
+                chat_id: outcome.chat_id,
+                slot: outcome.slot,
+                username: outcome.username,
+            })
+        })
+    }
+
+    fn pair_deny(&self, code: String) -> anyhow::Result<bool> {
+        pairing::deny(&self.db, &code)
+    }
 }
 
 /// Bot commands. Kept minimal for #6 — `/whoami` aids bootstrap (the operator
@@ -247,23 +371,24 @@ pub async fn handle_text(bot: Bot, msg: Message, state: Arc<AppState>) -> Respon
     };
     let chat_id = msg.chat.id.0;
 
-    // Resolve against the *runtime* registry (snapshot under a short read lock),
-    // so slots added at runtime via `proxy connect` route too.
+    // Resolve against the persisted whitelist, mapping the bound slot name onto
+    // the *runtime* registry snapshot (short read lock) so runtime-added slots
+    // route too. A DB error here is treated as "unresolved" and reported.
     let slots = state.slot_snapshot();
-    let Some(slot) = auth::resolve(&slots, chat_id) else {
-        // Log the numeric id so the operator can whitelist it (bootstrap aid).
-        tracing::warn!(chat_id, "unauthorized sender — not on any slot whitelist");
-        bot.send_message(
-            msg.chat.id,
-            format!(
-                "Not authorized. Your chat id is {chat_id} — ask the admin to add it to a slot."
-            ),
-        )
-        .await?;
+    let resolved = match auth::resolve(&state.db, &slots, chat_id) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            tracing::error!(chat_id, error = %err, "auth lookup failed");
+            bot.send_message(msg.chat.id, ERROR_REPLY).await?;
+            return Ok(());
+        }
+    };
+    let Some(slot) = resolved else {
+        handle_unauthorized(&bot, &msg, &state, chat_id).await?;
         return Ok(());
     };
 
-    match run_turn(&state, slot, chat_id, text).await {
+    match run_turn(&state, &slot, chat_id, text).await {
         Ok(reply) => {
             let chunks = render::split_message(&reply, TELEGRAM_LIMIT);
             if chunks.is_empty() {
@@ -278,6 +403,51 @@ pub async fn handle_text(bot: Bot, msg: Message, state: Arc<AppState>) -> Respon
         Err(err) => {
             tracing::error!(chat_id, slot = %slot.name, error = %err, "turn failed");
             bot.send_message(msg.chat.id, ERROR_REPLY).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The unauthorized branch of [`handle_text`] (#4b): issue a single-use pairing
+/// code and tell the user how to get it approved. Rate-limited/idempotent per
+/// chat by [`pairing::issue_code`]. On a code-issue failure it never panics — it
+/// falls back to a plain rejection and logs the error.
+async fn handle_unauthorized(
+    bot: &Bot,
+    msg: &Message,
+    state: &AppState,
+    chat_id: i64,
+) -> ResponseResult<()> {
+    let username = msg.from.as_ref().and_then(|u| u.username.clone());
+    let ttl = state.cfg.pairing.code_ttl_secs;
+
+    match pairing::issue_code(
+        &state.db,
+        chat_id,
+        username.as_deref(),
+        ttl,
+        pairing::now_epoch(),
+    ) {
+        Ok(code) => {
+            let mins = (ttl / 60).max(1);
+            tracing::info!(chat_id, "issued pairing code to unauthorized sender");
+            bot.send_message(
+                msg.chat.id,
+                format!(
+                    "Not authorized. Your pairing code is {code} (expires in {mins} min). \
+                     Ask the admin to run: proxy pair approve {code} --slot <name>."
+                ),
+            )
+            .await?;
+        }
+        Err(err) => {
+            tracing::error!(chat_id, error = %err, "failed to issue pairing code");
+            bot.send_message(
+                msg.chat.id,
+                "Not authorized, and I couldn't issue a pairing code right now. \
+                 Please try again in a moment.",
+            )
+            .await?;
         }
     }
     Ok(())

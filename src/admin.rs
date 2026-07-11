@@ -74,6 +74,25 @@ pub enum AdminRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         telegram_id: Option<i64>,
     },
+    /// Per-slot inventory (#4b): name, url, workdir, the Telegram ids bound to it
+    /// (from `allowed_users`), whether opencode is reachable, and whether the
+    /// slot is config- or db-sourced. How an admin picks a `--slot` to pair to.
+    Slots,
+    /// List the live pending pairing requests (#4b).
+    PairList,
+    /// Approve a pending pairing code and bind its chat to `slot` (#4b). Writes
+    /// `allowed_users` and notifies the now-paired user via the bot.
+    PairApprove {
+        /// The 6-digit code the user was shown.
+        code: String,
+        /// Slot name to bind the chat to; must be a live slot.
+        slot: String,
+    },
+    /// Deny (drop) a pending pairing code (#4b).
+    PairDeny {
+        /// The 6-digit code to reject.
+        code: String,
+    },
 }
 
 /// A response from the daemon to an admin CLI.
@@ -96,6 +115,35 @@ pub enum AdminResponse {
         name: String,
         /// What the daemon did: already up, reconnected, or newly added.
         outcome: ConnectOutcome,
+    },
+    /// Reply to [`AdminRequest::Slots`] — one inventory entry per live slot.
+    Slots {
+        /// Every live slot, name-sorted.
+        slots: Vec<SlotInventory>,
+    },
+    /// Reply to [`AdminRequest::PairList`] — the live pending requests.
+    PairList {
+        /// Pending pairings, soonest-to-expire first.
+        pending: Vec<PairingEntry>,
+    },
+    /// Reply to [`AdminRequest::PairApprove`] — the binding that was made.
+    PairApprove {
+        /// The consumed code.
+        code: String,
+        /// The chat that was authorized (and notified).
+        chat_id: i64,
+        /// The slot it was bound to.
+        slot: String,
+        /// The paired user's `@username`, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+    },
+    /// Reply to [`AdminRequest::PairDeny`] — whether a pending row was removed.
+    PairDeny {
+        /// The code that was denied.
+        code: String,
+        /// `true` if a pending row was dropped; `false` if the code was unknown.
+        removed: bool,
     },
     /// A handler failed; `message` is human-readable.
     Error {
@@ -157,6 +205,78 @@ pub struct SlotInfo {
     pub opencode_url: String,
 }
 
+/// Where a live slot came from: a config `[[slots]]` entry, or the persisted
+/// `slots` table (added at runtime via `proxy connect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotSource {
+    /// Declared in `config.toml`.
+    Config,
+    /// Added at runtime and persisted in the `slots` table.
+    Db,
+}
+
+/// One line of the `proxy slots` inventory (an [`AdminResponse::Slots`] entry).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotInventory {
+    /// Slot name.
+    pub name: String,
+    /// The opencode base URL.
+    pub opencode_url: String,
+    /// The slot's working directory.
+    pub workdir: String,
+    /// The Telegram ids bound to this slot in `allowed_users`.
+    pub telegram_ids: Vec<i64>,
+    /// `true` iff a fresh readiness ping to `opencode_url` just succeeded.
+    pub connected: bool,
+    /// Whether the slot is config- or db-sourced.
+    pub source: SlotSource,
+}
+
+/// The inventory data an [`AdminState`] reports for one slot, before the admin
+/// transport layer probes reachability (`connected`). Split out so the
+/// (synchronous) state read stays free of the HTTP probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotInventoryBase {
+    /// Slot name.
+    pub name: String,
+    /// The opencode base URL.
+    pub opencode_url: String,
+    /// The slot's working directory.
+    pub workdir: String,
+    /// The Telegram ids bound to this slot in `allowed_users`.
+    pub telegram_ids: Vec<i64>,
+    /// Whether the slot is config- or db-sourced.
+    pub source: SlotSource,
+}
+
+/// One line of the `proxy pair list` table (an [`AdminResponse::PairList`]
+/// entry).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingEntry {
+    /// The 6-digit pending code.
+    pub code: String,
+    /// The requesting chat's `@username`, if Telegram exposed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// The requesting chat id.
+    pub chat_id: i64,
+    /// Seconds since the code was issued (derived from the configured TTL).
+    pub age_secs: i64,
+}
+
+/// The result of a successful [`AdminState::pair_approve`]: the binding made,
+/// for the admin CLI to print. The user notification is sent inside the impl.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApproveInfo {
+    /// The chat that was authorized.
+    pub chat_id: i64,
+    /// The slot it was bound to.
+    pub slot: String,
+    /// The paired user's `@username`, if any.
+    pub username: Option<String>,
+}
+
 /// The read-only slice of daemon state the admin handlers need.
 ///
 /// `AppState` implements this in `telegram::bot`. Keeping handlers behind a
@@ -175,6 +295,37 @@ pub trait AdminState: Send + Sync + 'static {
         &'a self,
         params: ConnectParams,
     ) -> BoxFuture<'a, Result<ConnectOutcome>>;
+
+    /// Per-slot inventory for `proxy slots` (#4b), minus the `connected` probe
+    /// which the transport layer runs. Default: empty (test fakes opt in).
+    fn slot_inventory(&self) -> Result<Vec<SlotInventoryBase>> {
+        Ok(Vec::new())
+    }
+
+    /// The live pending pairing requests for `proxy pair list` (#4b). Default:
+    /// empty.
+    fn pair_list(&self) -> Result<Vec<PairingEntry>> {
+        Ok(Vec::new())
+    }
+
+    /// Approve pending `code`, binding its chat to `slot`, and notify the user
+    /// via the bot (#4b). Default: unsupported. Returns a boxed future for the
+    /// bot round-trip so the trait stays object-safe.
+    fn pair_approve<'a>(
+        &'a self,
+        code: String,
+        slot: String,
+    ) -> BoxFuture<'a, Result<ApproveInfo>> {
+        let _ = (code, slot);
+        Box::pin(async { anyhow::bail!("pairing is not supported by this state") })
+    }
+
+    /// Deny (drop) pending `code` (#4b); `true` if a row was removed. Default:
+    /// unsupported.
+    fn pair_deny(&self, code: String) -> Result<bool> {
+        let _ = code;
+        anyhow::bail!("pairing is not supported by this state")
+    }
 }
 
 /// Serve the admin control socket at `socket_path` until the future is dropped
@@ -342,7 +493,47 @@ async fn handle(
                 .await?;
             AdminResponse::Connect { name, outcome }
         }
+        AdminRequest::Slots => AdminResponse::Slots {
+            slots: slot_inventory(state, http).await?,
+        },
+        AdminRequest::PairList => AdminResponse::PairList {
+            pending: state.pair_list()?,
+        },
+        AdminRequest::PairApprove { code, slot } => {
+            let info = state.pair_approve(code.clone(), slot).await?;
+            AdminResponse::PairApprove {
+                code,
+                chat_id: info.chat_id,
+                slot: info.slot,
+                username: info.username,
+            }
+        }
+        AdminRequest::PairDeny { code } => {
+            let removed = state.pair_deny(code.clone())?;
+            AdminResponse::PairDeny { code, removed }
+        }
     })
+}
+
+/// Assemble the `Slots` reply: the state's inventory, each entry finished with a
+/// fresh readiness ping (mirroring how `status` probes reachability).
+async fn slot_inventory(
+    state: &dyn AdminState,
+    http: &reqwest::Client,
+) -> Result<Vec<SlotInventory>> {
+    let mut out = Vec::new();
+    for base in state.slot_inventory()? {
+        let connected = probe_ready(http, &base.opencode_url).await;
+        out.push(SlotInventory {
+            name: base.name,
+            opencode_url: base.opencode_url,
+            workdir: base.workdir,
+            telegram_ids: base.telegram_ids,
+            connected,
+            source: base.source,
+        });
+    }
+    Ok(out)
 }
 
 /// Assemble the `Status` reply: for each configured slot, a fresh readiness ping.
