@@ -6,6 +6,7 @@
 //! the opencode client, and the `serve` bring-up validation — against the
 //! in-process mocks. Module layout follows `docs/design/architecture.md` §4.
 
+pub mod admin;
 pub mod auth;
 pub mod config;
 pub mod opencode;
@@ -18,6 +19,7 @@ pub mod state;
 pub mod telegram;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
@@ -45,11 +47,39 @@ pub async fn serve(cfg: Config) -> Result<()> {
         .with_context(|| format!("opening SQLite store at {}", cfg.db_path.display()))?;
     tracing::info!(db = %cfg.db_path.display(), "opened SQLite store (WAL)");
 
+    // Capture the admin socket path before `cfg` is moved into `AppState`, so we
+    // can both serve on it and clean it up on shutdown.
+    let admin_socket = cfg.admin_socket.clone();
     let bot = teloxide::Bot::new(cfg.bot_token.clone());
     let state = telegram::bot::AppState::new(cfg, clients, db);
+    // The admin server shares the same `Arc<AppState>` — read-only is enough for
+    // #38 (runtime-mutable slots are #39).
+    let admin_state: Arc<dyn admin::AdminState> = state.clone();
 
     tracing::info!("starting Telegram long-poll dispatcher (Ctrl-C to stop)");
-    telegram::bot::run(bot, state).await;
+    // Run the dispatcher and the admin control socket concurrently. `run` returns
+    // on Ctrl-C; `serve_admin` accepts forever, so whichever finishes first
+    // (normally the dispatcher) cancels the other via `select!`.
+    tokio::select! {
+        () = telegram::bot::run(bot, state) => {
+            tracing::info!("dispatcher stopped — shutting down admin socket");
+        }
+        res = admin::serve_admin(admin_state, admin_socket.clone()) => {
+            match res {
+                Ok(()) => tracing::warn!("admin socket server exited unexpectedly"),
+                Err(err) => tracing::error!(error = format!("{err:#}"), "admin socket server failed"),
+            }
+        }
+    }
+
+    // Best-effort unlink so a restart binds cleanly (and no stale socket lingers).
+    match std::fs::remove_file(&admin_socket) {
+        Ok(()) => tracing::debug!(socket = %admin_socket.display(), "removed admin socket"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(error = %err, socket = %admin_socket.display(), "failed to remove admin socket on shutdown");
+        }
+    }
 
     // TODO(#N2): clean shutdown — drain in-flight turns, close SSE/HTTP, flush
     // SQLite. No opencode children to reap (connect-only).

@@ -43,6 +43,21 @@ impl AppState {
     }
 }
 
+/// The admin control socket (#38) reports the configured slots. Read-only for
+/// now — #39 will widen this to drive runtime slot mutations.
+impl crate::admin::AdminState for AppState {
+    fn slots(&self) -> Vec<crate::admin::SlotInfo> {
+        self.cfg
+            .slots
+            .iter()
+            .map(|s| crate::admin::SlotInfo {
+                name: s.name.clone(),
+                opencode_url: s.opencode_url.clone(),
+            })
+            .collect()
+    }
+}
+
 /// Bot commands. Kept minimal for #6 — `/whoami` aids bootstrap (the operator
 /// learns their chat id to whitelist). `/new` `/get` `/stop` land later.
 #[derive(BotCommands, Clone)]
