@@ -19,6 +19,7 @@ pub mod state;
 pub mod telegram;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +35,11 @@ use state::SlotConn;
 /// provider/model against its live catalogue, build a client — then run the
 /// Telegram dispatcher until Ctrl-C. The proxy is **connect-only**: it does not
 /// spawn opencode (start it via `./dev.sh` / systemd / compose).
-pub async fn serve(cfg: Config) -> Result<()> {
+///
+/// `config_path` is the file `cfg` was loaded from; the daemon writes
+/// `proxy connect`-added slots back to it (#45), so config is the single source
+/// of truth for slots.
+pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
     tracing::info!(
         slots = cfg.slots.len(),
         provider = %cfg.model.provider_id,
@@ -43,19 +48,20 @@ pub async fn serve(cfg: Config) -> Result<()> {
         "starting proxy (connect-only)"
     );
 
-    // Open persistence first: the registry is seeded from config ∪ the persisted
-    // `slots` table (#39), so slots added last run via `proxy connect` reconnect.
+    // The registry is seeded from config `[[slots]]` only (#45): config is the
+    // single source of truth for slots, so there is no DB slot table to fold in.
+    let registry = connect_slots(&cfg).await?;
+
+    // Open persistence for routing + whitelist + pending pairings/approvals (#3).
     let db = persistence::Db::open(&cfg.db_path)
         .with_context(|| format!("opening SQLite store at {}", cfg.db_path.display()))?;
     tracing::info!(db = %cfg.db_path.display(), "opened SQLite store (WAL)");
-
-    let registry = connect_all(&cfg, &db).await?;
 
     // Capture the admin socket path before `cfg` is moved into `AppState`, so we
     // can both serve on it and clean it up on shutdown.
     let admin_socket = cfg.admin_socket.clone();
     let bot = teloxide::Bot::new(cfg.bot_token.clone());
-    let state = telegram::bot::AppState::new(cfg, registry, db, bot.clone());
+    let state = telegram::bot::AppState::new(cfg, config_path, registry, db, bot.clone());
     // The admin server shares the same `Arc<AppState>` — read-only is enough for
     // #38 (runtime-mutable slots are #39).
     let admin_state: Arc<dyn admin::AdminState> = state.clone();
@@ -95,10 +101,11 @@ pub async fn serve(cfg: Config) -> Result<()> {
 /// Connect to and validate every configured slot's opencode instance, returning
 /// a ready [`SlotConn`] per slot (keyed by slot name).
 ///
-/// Factored out of [`serve`] so the harness can exercise the exact bring-up
-/// sequence (readiness → provider catalogue → model validation) that gates a
-/// live proxy, without also starting the forever-running dispatcher. For the
-/// live daemon, [`connect_all`] additionally folds in the persisted slots.
+/// This is the whole startup seeding path (#45): `config.toml` is the single
+/// source of truth for slots, so the registry is built from `cfg.slots` alone —
+/// there is no DB slot table to fold in. Factored out of [`serve`] so the
+/// harness can exercise the exact bring-up sequence (readiness → provider
+/// catalogue → model validation) without starting the forever-running dispatcher.
 pub async fn connect_slots(cfg: &Config) -> Result<HashMap<String, SlotConn>> {
     let http = reqwest::Client::builder()
         .build()
@@ -109,47 +116,6 @@ pub async fn connect_slots(cfg: &Config) -> Result<HashMap<String, SlotConn>> {
         let conn = bring_up_slot(
             &http,
             slot,
-            &cfg.model,
-            health::READY_ATTEMPTS,
-            health::READY_INTERVAL,
-        )
-        .await?;
-        registry.insert(slot.name.clone(), conn);
-    }
-    Ok(registry)
-}
-
-/// Seed the runtime registry from config `[[slots]]` **∪** the persisted `slots`
-/// table (#39). Union is by name; a name present in both is one slot and the
-/// **config definition wins** (the persisted row is skipped), so config stays
-/// the source of truth for declared seats while runtime-added slots (which live
-/// only in the DB) are transparently reconnected on restart. Every slot goes
-/// through the same readiness → validate → build-client bring-up.
-pub async fn connect_all(cfg: &Config, db: &persistence::Db) -> Result<HashMap<String, SlotConn>> {
-    let http = reqwest::Client::builder()
-        .build()
-        .context("building readiness http client")?;
-
-    let mut registry: HashMap<String, SlotConn> = HashMap::new();
-    for slot in &cfg.slots {
-        let conn = bring_up_slot(
-            &http,
-            slot,
-            &cfg.model,
-            health::READY_ATTEMPTS,
-            health::READY_INTERVAL,
-        )
-        .await?;
-        registry.insert(slot.name.clone(), conn);
-    }
-    for slot in db.list_slots().context("loading persisted slots")? {
-        if registry.contains_key(&slot.name) {
-            tracing::info!(slot = %slot.name, "persisted slot shadowed by a config [[slots]] entry — config wins");
-            continue;
-        }
-        let conn = bring_up_slot(
-            &http,
-            &slot,
             &cfg.model,
             health::READY_ATTEMPTS,
             health::READY_INTERVAL,

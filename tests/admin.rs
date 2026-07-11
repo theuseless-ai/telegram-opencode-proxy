@@ -134,14 +134,39 @@ async fn status_reports_a_live_slot_as_connected() {
 }
 
 /// `connect` a slot that does not exist → `added`, live in the registry, and
-/// persisted to the `slots` table so it survives a restart.
+/// persisted to `config.toml` (format-preserving; #45) so it survives a restart.
 #[tokio::test]
 async fn connect_adds_and_persists_a_new_slot() {
     let oc = MockOpencode::start().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("admin.sock");
+
+    // A real config file with a comment we expect to survive the write.
+    let config_path = dir.path().join("config.toml");
+    let original = "\
+# keep-me: this comment must survive proxy connect
+bot_token = \"t\"
+admin_socket = \"/tmp/unused.sock\"
+
+[[slots]]
+name = \"you\"
+opencode_url = \"http://127.0.0.1:4096\"
+workdir = \".\"
+
+[model]
+provider_id = \"llm-lan\"
+model_id = \"Qwen3.6-35B-A3B-bf16\"
+";
+    std::fs::write(&config_path, original).expect("write temp config");
+
     let db = Db::open_in_memory().expect("in-memory db");
-    let state = AppState::new(cfg_with_model(), HashMap::new(), db.clone(), test_bot());
+    let state = AppState::new(
+        cfg_with_model(),
+        config_path.clone(),
+        HashMap::new(),
+        db.clone(),
+        test_bot(),
+    );
     let server = tokio::spawn(admin::serve_admin(state.clone(), socket.clone()));
 
     let req = AdminRequest::Connect {
@@ -163,12 +188,24 @@ async fn connect_adds_and_persists_a_new_slot() {
         state.registry.read().unwrap().contains_key("new"),
         "added slot must be live in the registry"
     );
-    // ...and it is persisted (survives a restart).
-    let persisted = db.list_slots().unwrap();
-    assert_eq!(persisted.len(), 1, "added slot must be persisted");
-    assert_eq!(persisted[0].name, "new");
-    assert_eq!(persisted[0].opencode_url, oc.url);
-    assert_eq!(persisted[0].telegram_id, Some(555));
+    // ...and it is persisted to config.toml (survives a restart), comment intact.
+    let written = std::fs::read_to_string(&config_path).expect("read back config");
+    assert!(
+        written.contains("# keep-me: this comment must survive proxy connect"),
+        "the config write must preserve comments, got:\n{written}"
+    );
+    // Re-parse via the real loader — proves the written file is valid config.
+    let cfg = Config::load(&config_path).expect("written config re-loads and validates");
+    let added = cfg
+        .slots
+        .iter()
+        .find(|s| s.name == "new")
+        .expect("the new slot must be in config.toml");
+    assert_eq!(added.opencode_url, oc.url);
+    assert_eq!(added.workdir, std::path::PathBuf::from("."));
+    assert_eq!(added.telegram_id, Some(555));
+    // The pre-existing slot is still there (append, not clobber).
+    assert!(cfg.slots.iter().any(|s| s.name == "you"));
     // ...and the --telegram-id is whitelisted immediately (auth reads
     // allowed_users, not the slot's telegram_id column).
     assert_eq!(
@@ -190,6 +227,7 @@ async fn connect_reports_existing_reachable_slot_as_connected() {
     registry.insert("you".to_string(), slot_conn("you", &oc.url, Some(111)));
     let state = AppState::new(
         cfg_with_model(),
+        "unused.toml".into(),
         registry,
         Db::open_in_memory().unwrap(),
         test_bot(),
@@ -225,6 +263,7 @@ async fn connect_reconnects_a_down_slot_when_it_returns() {
     registry.insert("you".to_string(), slot_conn("you", &oc.url, Some(111)));
     let state = AppState::new(
         cfg_with_model(),
+        "unused.toml".into(),
         registry,
         Db::open_in_memory().unwrap(),
         test_bot(),
@@ -257,6 +296,7 @@ async fn connect_errors_when_a_down_slot_stays_unreachable() {
     registry.insert("you".to_string(), slot_conn("you", dead, Some(111)));
     let state = AppState::new(
         cfg_with_model(),
+        "unused.toml".into(),
         registry,
         Db::open_in_memory().unwrap(),
         test_bot(),

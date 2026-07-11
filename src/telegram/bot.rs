@@ -8,7 +8,7 @@
 //! reports the numeric chat id (a bootstrap aid). Streaming, files, `/new`,
 //! `/get`, `/stop`, and per-user mpsc serialization land in later issues.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
@@ -20,7 +20,7 @@ use teloxide::utils::command::BotCommands;
 
 use crate::admin::{
     ApproveInfo, BoxFuture, ConnectOutcome, ConnectParams, PairingEntry, SlotInfo,
-    SlotInventoryBase, SlotSource,
+    SlotInventoryBase,
 };
 use crate::auth;
 use crate::config::{Config, Slot};
@@ -54,6 +54,10 @@ const CONNECT_READY_INTERVAL: Duration = Duration::from_millis(200);
 /// The per-user `mpsc` turn-serialization queue is #9.
 pub struct AppState {
     pub cfg: Config,
+    /// Path to the loaded `config.toml`. `proxy connect` writes newly-added slots
+    /// back here (format-preserving; #45), so config is the single source of
+    /// truth for slots and a `connect`-added seat survives a restart.
+    pub config_path: PathBuf,
     pub registry: RwLock<HashMap<String, SlotConn>>,
     pub db: Db,
     /// Bot handle used to notify a user out-of-band — specifically the pairing
@@ -63,15 +67,22 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Build state from config, the seeded per-slot registry (config ∪ DB), an
-    /// open SQLite handle, and a bot handle for out-of-band notifications.
+    /// Build state from config, the config file path (for `proxy connect`
+    /// writes; #45), the seeded per-slot registry, an open SQLite handle, and a
+    /// bot handle for out-of-band notifications.
     ///
-    /// Also **seeds the whitelist** (#4b): every slot in the registry
-    /// (config ∪ DB) that declares a `telegram_id` is idempotently written into
-    /// `allowed_users`, so config, `proxy connect --telegram-id`, and A4b pairing
-    /// all share one lookup path — and a `connect`-added binding survives a
-    /// restart. Seeding is best-effort — a DB hiccup is logged, never fatal.
-    pub fn new(cfg: Config, registry: HashMap<String, SlotConn>, db: Db, bot: Bot) -> Arc<Self> {
+    /// Also **seeds the whitelist** (#4b): every slot in the registry that
+    /// declares a `telegram_id` is idempotently written into `allowed_users`, so
+    /// config, `proxy connect --telegram-id`, and A4b pairing all share one
+    /// lookup path — and a `connect`-added binding survives a restart. Seeding is
+    /// best-effort — a DB hiccup is logged, never fatal.
+    pub fn new(
+        cfg: Config,
+        config_path: PathBuf,
+        registry: HashMap<String, SlotConn>,
+        db: Db,
+        bot: Bot,
+    ) -> Arc<Self> {
         for conn in registry.values() {
             let slot = &conn.slot;
             if let Some(id) = slot.telegram_id
@@ -87,6 +98,7 @@ impl AppState {
         }
         Arc::new(Self {
             cfg,
+            config_path,
             registry: RwLock::new(registry),
             db,
             bot,
@@ -189,10 +201,12 @@ impl AppState {
         )
         .await
         .with_context(|| format!("adding slot '{}'", slot.name))?;
-        // Persist so it survives a restart, then swap into the live registry.
-        self.db
-            .upsert_slot(&slot)
-            .with_context(|| format!("persisting slot '{}'", slot.name))?;
+        // Persist into config.toml (format-preserving; #45) so it survives a
+        // restart — config is the single source of truth for slots. This is
+        // best-effort-with-error: a failed write is reported, never silently
+        // swallowed, so we don't end up with a registry-only (non-persisted) slot.
+        crate::config::upsert_slot(&self.config_path, &slot)
+            .with_context(|| format!("persisting slot '{}' to config", slot.name))?;
         // Whitelist the bound user now (if declared) — auth reads allowed_users,
         // so a `--telegram-id` add takes effect immediately, like config/pairing.
         if let Some(id) = slot.telegram_id {
@@ -239,10 +253,10 @@ impl crate::admin::AdminState for AppState {
     }
 
     /// Per-slot inventory (#4b): registry slots (name/url/workdir) folded with
-    /// the `allowed_users` bindings and tagged config- vs db-sourced. All reads
-    /// are synchronous; the `connected` probe is the transport layer's job.
+    /// the `allowed_users` bindings. All reads are synchronous; the `connected`
+    /// probe is the transport layer's job. Since #45 every slot is config-sourced
+    /// (config is the single source of truth), so there is no source tagging.
     fn slot_inventory(&self) -> anyhow::Result<Vec<SlotInventoryBase>> {
-        let config_names: HashSet<&str> = self.cfg.slots.iter().map(|s| s.name.as_str()).collect();
         // (chat_id, slot) bindings grouped per slot.
         let allowed = self.db.list_allowed()?;
 
@@ -256,17 +270,11 @@ impl crate::admin::AdminState for AppState {
                         .filter(|(_, slot)| slot == &c.slot.name)
                         .map(|(chat_id, _)| *chat_id)
                         .collect();
-                    let source = if config_names.contains(c.slot.name.as_str()) {
-                        SlotSource::Config
-                    } else {
-                        SlotSource::Db
-                    };
                     SlotInventoryBase {
                         name: c.slot.name.clone(),
                         opencode_url: c.slot.opencode_url.clone(),
                         workdir: c.slot.workdir.to_string_lossy().into_owned(),
                         telegram_ids,
-                        source,
                     }
                 })
                 .collect()

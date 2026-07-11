@@ -3,11 +3,13 @@
 //! to #4b. See `docs/design/architecture.md` §11. Issue #2.
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 /// CLI entry point: `serve` (daemon) or `pair` (admin enrollment client).
 #[derive(Debug, Parser)]
@@ -228,6 +230,77 @@ impl Config {
     }
 }
 
+/// Persist `slot` into the `[[slots]]` array-of-tables of the config file at
+/// `path`, **format- and comment-preserving** (issue #45). `config.toml` is the
+/// single source of truth for slots, so `proxy connect` writes here rather than
+/// to the DB.
+///
+/// If a `[[slots]]` entry with the same `name` already exists, its fields are
+/// updated in place; otherwise a new table is appended. The write is atomic-ish:
+/// the mutated document is written to a sibling `*.tmp` file and then renamed
+/// over the original, so a crash mid-write never leaves a truncated config.
+pub fn upsert_slot(path: &Path, slot: &Slot) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config {} for slot update", path.display()))?;
+    let mut doc: DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing config {} for slot update", path.display()))?;
+
+    let item = doc
+        .as_table_mut()
+        .entry("slots")
+        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+    let slots = item.as_array_of_tables_mut().ok_or_else(|| {
+        anyhow!(
+            "`slots` in {} is not a [[slots]] array of tables",
+            path.display()
+        )
+    })?;
+
+    let existing = slots
+        .iter()
+        .position(|t| t.get("name").and_then(Item::as_str) == Some(slot.name.as_str()));
+    match existing {
+        Some(idx) => {
+            if let Some(table) = slots.get_mut(idx) {
+                set_slot_fields(table, slot);
+            }
+        }
+        None => {
+            let mut table = Table::new();
+            set_slot_fields(&mut table, slot);
+            slots.push(table);
+        }
+    }
+
+    let rendered = doc.to_string();
+    let mut tmp: OsString = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, rendered)
+        .with_context(|| format!("writing temp config {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "renaming temp config {} over {}",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Write a slot's fields into a `[[slots]]` table. `telegram_id` is only written
+/// when present, so an unbound slot leaves the key absent (matching `#[serde]`
+/// `Option` semantics on load).
+fn set_slot_fields(table: &mut Table, slot: &Slot) {
+    table["name"] = value(slot.name.as_str());
+    table["opencode_url"] = value(slot.opencode_url.as_str());
+    table["workdir"] = value(slot.workdir.to_string_lossy().into_owned());
+    if let Some(id) = slot.telegram_id {
+        table["telegram_id"] = value(id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +343,76 @@ mod tests {
     fn rejects_empty_model() {
         let cfg: Config = toml::from_str(&sample().replace("llm-lan", "")).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    fn slot(name: &str, url: &str, telegram_id: Option<i64>) -> Slot {
+        Slot {
+            name: name.to_string(),
+            opencode_url: url.to_string(),
+            workdir: PathBuf::from("/srv/wd"),
+            telegram_id,
+        }
+    }
+
+    #[test]
+    fn upsert_slot_appends_and_preserves_comments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let original = "\
+# top comment — keep me
+bot_token = \"t\"
+admin_socket = \"/tmp/admin.sock\"
+
+[[slots]]
+name = \"you\" # inline keep-me
+opencode_url = \"http://127.0.0.1:4096\"
+workdir = \".\"
+
+[model]
+provider_id = \"llm-lan\"
+model_id = \"Qwen3.6-35B-A3B-bf16\"
+";
+        std::fs::write(&path, original).unwrap();
+
+        upsert_slot(&path, &slot("wife", "http://127.0.0.1:4097", Some(222))).unwrap();
+
+        let back = std::fs::read_to_string(&path).unwrap();
+        // Comments survive the round-trip.
+        assert!(back.contains("# top comment — keep me"));
+        assert!(back.contains("# inline keep-me"));
+        // The new slot is parseable as a real Config slot.
+        let cfg: Config = toml::from_str(&back).unwrap();
+        assert_eq!(cfg.slots.len(), 2);
+        let added = cfg.slots.iter().find(|s| s.name == "wife").unwrap();
+        assert_eq!(added.opencode_url, "http://127.0.0.1:4097");
+        assert_eq!(added.workdir, PathBuf::from("/srv/wd"));
+        assert_eq!(added.telegram_id, Some(222));
+    }
+
+    #[test]
+    fn upsert_slot_updates_in_place_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "\
+admin_socket = \"/tmp/a.sock\"
+[[slots]]
+name = \"you\"
+opencode_url = \"http://127.0.0.1:4096\"
+workdir = \".\"
+[model]
+provider_id = \"llm-lan\"
+model_id = \"m\"
+",
+        )
+        .unwrap();
+
+        upsert_slot(&path, &slot("you", "http://127.0.0.1:5000", Some(999))).unwrap();
+
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.slots.len(), 1, "update must not duplicate the entry");
+        assert_eq!(cfg.slots[0].opencode_url, "http://127.0.0.1:5000");
+        assert_eq!(cfg.slots[0].telegram_id, Some(999));
     }
 }
