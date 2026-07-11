@@ -10,9 +10,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use telegram_opencode_proxy::admin::{
-    self, AdminRequest, AdminResponse, ConnectOutcome, SlotSource,
-};
+use telegram_opencode_proxy::admin::{self, AdminRequest, AdminResponse, ConnectOutcome};
 use telegram_opencode_proxy::config::{Cli, Command, Config, PairAction};
 use telegram_opencode_proxy::serve;
 
@@ -24,7 +22,7 @@ async fn main() -> Result<()> {
             config: config_path,
         } => {
             let cfg = Config::load(&config_path)?;
-            serve(cfg).await?;
+            serve(cfg, config_path).await?;
         }
         Command::Status { config, socket } => {
             status(config, socket).await?;
@@ -116,22 +114,18 @@ async fn connect(
 }
 
 /// `proxy slots`: dial the running daemon and print the per-slot inventory —
-/// name, opencode URL, workdir, the Telegram ids bound to it, reachability, and
-/// whether it is config- or db-sourced. This is how an admin picks a `--slot`.
+/// name, opencode URL, workdir, the Telegram ids bound to it, and reachability.
+/// This is how an admin picks a `--slot`. Since #45 every slot is config-sourced.
 async fn slots(config: PathBuf, socket: Option<PathBuf>) -> Result<()> {
     let socket_path = socket_path(config, socket)?;
 
     match admin::send_request(&socket_path, &AdminRequest::Slots).await? {
         AdminResponse::Slots { slots } => {
             println!(
-                "{:<14} {:<8} {:<6} {:<28} {:<20} TELEGRAM IDS",
-                "SLOT", "SOURCE", "STATE", "OPENCODE URL", "WORKDIR"
+                "{:<14} {:<6} {:<28} {:<20} TELEGRAM IDS",
+                "SLOT", "STATE", "OPENCODE URL", "WORKDIR"
             );
             for slot in slots {
-                let source = match slot.source {
-                    SlotSource::Config => "config",
-                    SlotSource::Db => "db",
-                };
                 let state = if slot.connected { "up" } else { "down" };
                 let ids = if slot.telegram_ids.is_empty() {
                     "-".to_string()
@@ -143,8 +137,8 @@ async fn slots(config: PathBuf, socket: Option<PathBuf>) -> Result<()> {
                         .join(", ")
                 };
                 println!(
-                    "{:<14} {:<8} {:<6} {:<28} {:<20} {ids}",
-                    slot.name, source, state, slot.opencode_url, slot.workdir
+                    "{:<14} {:<6} {:<28} {:<20} {ids}",
+                    slot.name, state, slot.opencode_url, slot.workdir
                 );
             }
             Ok(())

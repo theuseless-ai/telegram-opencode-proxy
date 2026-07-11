@@ -27,7 +27,7 @@ use serde_json::json;
 use teloxide::Bot;
 use teloxide::types::Message;
 
-use telegram_opencode_proxy::admin::{self, AdminRequest, AdminResponse, AdminState, SlotSource};
+use telegram_opencode_proxy::admin::{self, AdminRequest, AdminResponse, AdminState};
 use telegram_opencode_proxy::config::{Config, Model, Pairing, Permissions, Slot};
 use telegram_opencode_proxy::connect_slots;
 use telegram_opencode_proxy::persistence::Db;
@@ -91,7 +91,8 @@ async fn state_for(cfg: Config) -> Arc<AppState> {
     let db = Db::open_in_memory().expect("in-memory persistence store opens");
     // A bare bot handle — the notify path (pairing approval) isn't driven here.
     let bot = Bot::new("12345:test-token");
-    AppState::new(cfg, registry, db, bot)
+    // No config file is written in these turn tests, so a placeholder path is fine.
+    AppState::new(cfg, "unused.toml".into(), registry, db, bot)
 }
 
 /// 1. Authorized text → the mock records a `sendMessage` carrying the model reply.
@@ -207,7 +208,7 @@ async fn state_with_bot(cfg: Config, bot: Bot) -> Arc<AppState> {
         .await
         .expect("connect_slots succeeds against the mock");
     let db = Db::open_in_memory().expect("in-memory persistence store opens");
-    AppState::new(cfg, registry, db, bot)
+    AppState::new(cfg, "unused.toml".into(), registry, db, bot)
 }
 
 /// Retry `send_request` briefly so a test doesn't race the admin-socket bind.
@@ -321,7 +322,6 @@ async fn pairing_round_trip_issues_approves_notifies_and_authorizes() {
                 .expect("slot 'you' present in inventory");
             assert!(you.telegram_ids.contains(&stranger));
             assert!(you.connected, "the live mock slot must report connected");
-            assert_eq!(you.source, SlotSource::Config);
         }
         other => panic!("expected Slots, got {other:?}"),
     }

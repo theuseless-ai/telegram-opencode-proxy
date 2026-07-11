@@ -75,8 +75,8 @@ pub enum AdminRequest {
         telegram_id: Option<i64>,
     },
     /// Per-slot inventory (#4b): name, url, workdir, the Telegram ids bound to it
-    /// (from `allowed_users`), whether opencode is reachable, and whether the
-    /// slot is config- or db-sourced. How an admin picks a `--slot` to pair to.
+    /// (from `allowed_users`), and whether opencode is reachable. How an admin
+    /// picks a `--slot` to pair to.
     Slots,
     /// List the live pending pairing requests (#4b).
     PairList,
@@ -205,18 +205,10 @@ pub struct SlotInfo {
     pub opencode_url: String,
 }
 
-/// Where a live slot came from: a config `[[slots]]` entry, or the persisted
-/// `slots` table (added at runtime via `proxy connect`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SlotSource {
-    /// Declared in `config.toml`.
-    Config,
-    /// Added at runtime and persisted in the `slots` table.
-    Db,
-}
-
 /// One line of the `proxy slots` inventory (an [`AdminResponse::Slots`] entry).
+///
+/// Since #45 all slots are config-sourced (`config.toml` is the single source of
+/// truth), so there is no longer a config-vs-db `source` distinction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotInventory {
     /// Slot name.
@@ -229,8 +221,6 @@ pub struct SlotInventory {
     pub telegram_ids: Vec<i64>,
     /// `true` iff a fresh readiness ping to `opencode_url` just succeeded.
     pub connected: bool,
-    /// Whether the slot is config- or db-sourced.
-    pub source: SlotSource,
 }
 
 /// The inventory data an [`AdminState`] reports for one slot, before the admin
@@ -246,8 +236,6 @@ pub struct SlotInventoryBase {
     pub workdir: String,
     /// The Telegram ids bound to this slot in `allowed_users`.
     pub telegram_ids: Vec<i64>,
-    /// Whether the slot is config- or db-sourced.
-    pub source: SlotSource,
 }
 
 /// One line of the `proxy pair list` table (an [`AdminResponse::PairList`]
@@ -530,7 +518,6 @@ async fn slot_inventory(
             workdir: base.workdir,
             telegram_ids: base.telegram_ids,
             connected,
-            source: base.source,
         });
     }
     Ok(out)

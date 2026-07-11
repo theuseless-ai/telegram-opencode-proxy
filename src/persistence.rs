@@ -25,21 +25,20 @@
 //! Bookkeeping stamps (`allowed_users.added_at`, `pending_approvals.created_at`)
 //! are taken from [`SystemTime`] at the edge, since nothing branches on them.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::config::Slot;
-
 /// Current schema version, tracked via SQLite's `PRAGMA user_version`. Bump this
 /// and add a matching arm in [`migrate`] when the schema changes.
 ///
-/// v2 adds the `slots` table (#39) so slots added at runtime via `proxy connect`
-/// survive a restart. The migration is purely additive.
-const SCHEMA_VERSION: i64 = 2;
+/// v2 added a `slots` table (#39). v3 (#45) **drops** it: `config.toml` is now
+/// the single source of truth for slots (`proxy connect` writes the config file,
+/// format-preserving), so the DB no longer persists slot definitions.
+const SCHEMA_VERSION: i64 = 3;
 
 /// How long a query waits on a locked database before erroring (WAL still
 /// serialises writers). Generous — local, low-contention, two users.
@@ -397,85 +396,6 @@ impl Db {
             Ok(out)
         })
     }
-
-    // --- slots: runtime-added seats that must survive restart (#39) -------
-
-    /// Insert (or replace by `name`) a slot. `added_at` is stamped on first
-    /// insert and preserved across updates, so re-connecting an existing slot
-    /// keeps its original enrolment time.
-    pub fn upsert_slot(&self, slot: &Slot) -> Result<()> {
-        let added_at = now_epoch();
-        let workdir = slot.workdir.to_string_lossy().into_owned();
-        self.with_conn(|c| {
-            c.execute(
-                "INSERT INTO slots(name, opencode_url, workdir, telegram_id, added_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(name) DO UPDATE SET
-                     opencode_url = excluded.opencode_url,
-                     workdir = excluded.workdir,
-                     telegram_id = excluded.telegram_id",
-                params![
-                    slot.name,
-                    slot.opencode_url,
-                    workdir,
-                    slot.telegram_id,
-                    added_at
-                ],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Look up a persisted slot by name.
-    pub fn get_slot(&self, name: &str) -> Result<Option<Slot>> {
-        self.with_conn(|c| {
-            let out = c
-                .query_row(
-                    "SELECT name, opencode_url, workdir, telegram_id
-                     FROM slots WHERE name = ?1",
-                    params![name],
-                    row_to_slot,
-                )
-                .optional()?;
-            Ok(out)
-        })
-    }
-
-    /// Every persisted slot, in enrolment order (`added_at`, then name).
-    pub fn list_slots(&self) -> Result<Vec<Slot>> {
-        self.with_conn(|c| {
-            let mut stmt = c.prepare(
-                "SELECT name, opencode_url, workdir, telegram_id
-                 FROM slots ORDER BY added_at, name",
-            )?;
-            let rows = stmt.query_map([], row_to_slot)?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            Ok(out)
-        })
-    }
-
-    /// Remove a persisted slot by name. No-op if absent.
-    pub fn remove_slot(&self, name: &str) -> Result<()> {
-        self.with_conn(|c| {
-            c.execute("DELETE FROM slots WHERE name = ?1", params![name])?;
-            Ok(())
-        })
-    }
-}
-
-/// Decode a `slots` row into a [`Slot`]. `workdir` is stored as TEXT and
-/// `telegram_id` as a nullable INTEGER.
-fn row_to_slot(row: &rusqlite::Row) -> rusqlite::Result<Slot> {
-    let workdir: String = row.get(2)?;
-    Ok(Slot {
-        name: row.get(0)?,
-        opencode_url: row.get(1)?,
-        workdir: PathBuf::from(workdir),
-        telegram_id: row.get(3)?,
-    })
 }
 
 /// Current wall-clock time in epoch seconds, saturating at 0 before 1970.
@@ -517,17 +437,15 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
     if version < 2 {
-        // Additive: runtime-added slots (#39) persist here so `proxy connect`
-        // survives a restart. `telegram_id` is nullable; `workdir` is TEXT.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS slots(
-                 name         TEXT PRIMARY KEY,
-                 opencode_url TEXT NOT NULL,
-                 workdir      TEXT NOT NULL,
-                 telegram_id  INTEGER,
-                 added_at     INTEGER
-             );",
-        )?;
+        // v2 (#39) added a `slots` table; v3 (#45) drops it again (below), so a
+        // fresh database never materialises it. Kept as a no-op stub to preserve
+        // the version-guard ladder for databases that were created at v1.
+    }
+    if version < 3 {
+        // #45: `config.toml` is now the single source of truth for slots
+        // (`proxy connect` writes the config file). Drop the DB `slots` table;
+        // `IF EXISTS` makes this a no-op on a v1-created database.
+        conn.execute_batch("DROP TABLE IF EXISTS slots;")?;
     }
     // Stamp the version regardless (a fresh :memory: db starts at 0).
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -682,70 +600,6 @@ mod tests {
         assert_eq!(db.list_approvals().unwrap().len(), 1);
     }
 
-    fn slot(name: &str, url: &str, telegram_id: Option<i64>) -> Slot {
-        Slot {
-            name: name.to_string(),
-            opencode_url: url.to_string(),
-            workdir: PathBuf::from("/tmp/wd"),
-            telegram_id,
-        }
-    }
-
-    #[test]
-    fn slots_round_trip_upsert_and_list() {
-        let db = db();
-        assert_eq!(db.get_slot("you").unwrap(), None);
-        assert!(db.list_slots().unwrap().is_empty());
-
-        db.upsert_slot(&slot("you", "http://127.0.0.1:4096", Some(111)))
-            .unwrap();
-        db.upsert_slot(&slot("wife", "http://127.0.0.1:4097", None))
-            .unwrap();
-
-        let got = db.get_slot("you").unwrap().expect("slot present");
-        assert_eq!(got.name, "you");
-        assert_eq!(got.opencode_url, "http://127.0.0.1:4096");
-        assert_eq!(got.workdir, PathBuf::from("/tmp/wd"));
-        assert_eq!(got.telegram_id, Some(111));
-        assert_eq!(db.get_slot("wife").unwrap().unwrap().telegram_id, None);
-
-        // upsert replaces by name rather than duplicating.
-        db.upsert_slot(&slot("you", "http://127.0.0.1:5000", Some(222)))
-            .unwrap();
-        let got = db.get_slot("you").unwrap().expect("slot present");
-        assert_eq!(got.opencode_url, "http://127.0.0.1:5000");
-        assert_eq!(got.telegram_id, Some(222));
-
-        let all = db.list_slots().unwrap();
-        assert_eq!(all.len(), 2, "upsert must not duplicate");
-        let names: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"you") && names.contains(&"wife"));
-
-        db.remove_slot("you").unwrap();
-        assert_eq!(db.get_slot("you").unwrap(), None);
-        assert_eq!(db.list_slots().unwrap().len(), 1);
-        // removing a missing slot is a no-op, not an error.
-        db.remove_slot("you").unwrap();
-    }
-
-    #[test]
-    fn slots_survive_reopen_of_same_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("proxy.db");
-        {
-            let db = Db::open(&path).expect("open fresh db");
-            db.upsert_slot(&slot("added", "http://127.0.0.1:9000", Some(7)))
-                .unwrap();
-        }
-        let db = Db::open(&path).expect("reopen db");
-        let got = db
-            .get_slot("added")
-            .unwrap()
-            .expect("persisted slot present");
-        assert_eq!(got.opencode_url, "http://127.0.0.1:9000");
-        assert_eq!(got.telegram_id, Some(7));
-    }
-
     #[test]
     fn migration_is_idempotent() {
         // A single connection migrated twice must not error and keeps schema.
@@ -756,7 +610,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("user_version readable");
         assert_eq!(version, SCHEMA_VERSION);
-        // All four tables exist.
+        // The four surviving tables exist...
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
@@ -766,6 +620,54 @@ mod tests {
             )
             .expect("table count");
         assert_eq!(count, 4);
+        // ...and the dropped `slots` table (#45) does not.
+        let slots_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='slots'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("slots table count");
+        assert_eq!(slots_exists, 0, "the slots table must be dropped at v3");
+    }
+
+    #[test]
+    fn v2_slots_table_is_dropped_on_upgrade_to_v3() {
+        // Simulate a database created at v2 (with a populated `slots` table), then
+        // run the current migration and assert the table is gone but other data
+        // survives.
+        let conn = Connection::open_in_memory().expect("open");
+        conn.execute_batch(
+            "CREATE TABLE routing(chat_id INTEGER PRIMARY KEY, session_id TEXT NOT NULL);
+             CREATE TABLE slots(
+                 name TEXT PRIMARY KEY, opencode_url TEXT NOT NULL, workdir TEXT NOT NULL,
+                 telegram_id INTEGER, added_at INTEGER);
+             INSERT INTO routing(chat_id, session_id) VALUES(7, 'ses_keep');
+             INSERT INTO slots(name, opencode_url, workdir) VALUES('you', 'http://x', '.');",
+        )
+        .expect("seed a v2-shaped db");
+        conn.pragma_update(None, "user_version", 2i64)
+            .expect("stamp v2");
+
+        migrate(&conn).expect("migrate v2 → v3");
+
+        let slots_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='slots'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("slots table count");
+        assert_eq!(slots_exists, 0, "v3 must drop the slots table");
+        // Non-slot data is untouched.
+        let kept: String = conn
+            .query_row(
+                "SELECT session_id FROM routing WHERE chat_id = 7",
+                [],
+                |r| r.get(0),
+            )
+            .expect("routing row survives");
+        assert_eq!(kept, "ses_keep");
     }
 
     #[test]
