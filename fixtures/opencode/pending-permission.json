@@ -1,0 +1,1 @@
+[{"id":"per_f4f774a12001KMMuoK7Eu3HvTR","sessionID":"ses_0b088bb0effeUig7fBZU7aF4Uq","permission":"bash","patterns":["echo hello"],"metadata":{"command":"echo hello"},"always":["echo *"],"tool":{"messageID":"msg_f4f774517001uffsL9vpclkM4c","callID":"call_00_brKFB4XQZem6FLXCglUx2542"}}]
