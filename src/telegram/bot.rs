@@ -66,13 +66,14 @@ impl AppState {
     /// Build state from config, the seeded per-slot registry (config ∪ DB), an
     /// open SQLite handle, and a bot handle for out-of-band notifications.
     ///
-    /// Also **seeds the whitelist from config** (#4b): every config slot with a
-    /// `telegram_id` is idempotently written into `allowed_users`, so the A4a
-    /// config whitelist and A4b pairing share one lookup path. Seeding is
-    /// best-effort — a DB hiccup is logged, never fatal — since a live daemon
-    /// with an unwritable store has larger problems.
+    /// Also **seeds the whitelist** (#4b): every slot in the registry
+    /// (config ∪ DB) that declares a `telegram_id` is idempotently written into
+    /// `allowed_users`, so config, `proxy connect --telegram-id`, and A4b pairing
+    /// all share one lookup path — and a `connect`-added binding survives a
+    /// restart. Seeding is best-effort — a DB hiccup is logged, never fatal.
     pub fn new(cfg: Config, registry: HashMap<String, SlotConn>, db: Db, bot: Bot) -> Arc<Self> {
-        for slot in &cfg.slots {
+        for conn in registry.values() {
+            let slot = &conn.slot;
             if let Some(id) = slot.telegram_id
                 && let Err(err) = db.add_allowed(id, &slot.name)
             {
@@ -80,7 +81,7 @@ impl AppState {
                     chat_id = id,
                     slot = %slot.name,
                     error = %err,
-                    "failed to seed config telegram_id into allowed_users"
+                    "failed to seed telegram_id into allowed_users"
                 );
             }
         }
@@ -192,6 +193,13 @@ impl AppState {
         self.db
             .upsert_slot(&slot)
             .with_context(|| format!("persisting slot '{}'", slot.name))?;
+        // Whitelist the bound user now (if declared) — auth reads allowed_users,
+        // so a `--telegram-id` add takes effect immediately, like config/pairing.
+        if let Some(id) = slot.telegram_id {
+            self.db
+                .add_allowed(id, &slot.name)
+                .with_context(|| format!("whitelisting telegram_id for slot '{}'", slot.name))?;
+        }
         {
             let mut guard = self
                 .registry

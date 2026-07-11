@@ -169,6 +169,13 @@ async fn connect_adds_and_persists_a_new_slot() {
     assert_eq!(persisted[0].name, "new");
     assert_eq!(persisted[0].opencode_url, oc.url);
     assert_eq!(persisted[0].telegram_id, Some(555));
+    // ...and the --telegram-id is whitelisted immediately (auth reads
+    // allowed_users, not the slot's telegram_id column).
+    assert_eq!(
+        db.allowed_slot(555).unwrap(),
+        Some("new".to_string()),
+        "connect --telegram-id must write allowed_users so auth authorizes the user"
+    );
 
     server.abort();
 }
