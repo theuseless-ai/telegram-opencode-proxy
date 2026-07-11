@@ -176,6 +176,41 @@ impl AppState {
             return Ok(ConnectOutcome::Reconnected);
         }
 
+        // Not live in the registry — but a config-declared slot that failed to
+        // connect at startup (its opencode wasn't up yet) is still KNOWN. Bring
+        // that slot online now (no config write — it's already declared), rather
+        // than rejecting it as "does not exist".
+        if let Some(slot) = self
+            .cfg
+            .slots
+            .iter()
+            .find(|s| s.name == params.name)
+            .cloned()
+        {
+            let conn = crate::bring_up_slot(
+                &http,
+                &slot,
+                &self.cfg.model,
+                CONNECT_READY_ATTEMPTS,
+                CONNECT_READY_INTERVAL,
+            )
+            .await
+            .with_context(|| format!("connecting config slot '{}'", slot.name))?;
+            if let Some(id) = slot.telegram_id {
+                self.db.add_allowed(id, &slot.name).with_context(|| {
+                    format!("whitelisting telegram_id for slot '{}'", slot.name)
+                })?;
+            }
+            {
+                let mut guard = self
+                    .registry
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
+                guard.insert(slot.name.clone(), conn);
+            }
+            return Ok(ConnectOutcome::Connected);
+        }
+
         // Missing → add. A URL is required; workdir defaults to the cwd.
         let url = params.url.ok_or_else(|| {
             anyhow!(

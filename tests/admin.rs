@@ -217,6 +217,56 @@ model_id = \"Qwen3.6-35B-A3B-bf16\"
     server.abort();
 }
 
+/// Fix for the startup-crash bug: `connect <name>` with NO --url brings up a
+/// CONFIG-declared slot that was skipped at startup (its opencode was down at
+/// boot), so an unreachable slot recovers without a restart.
+#[tokio::test]
+async fn connect_brings_up_a_skipped_config_slot_by_name() {
+    let oc = MockOpencode::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("admin.sock");
+    let config_path = dir.path().join("config.toml"); // not rewritten for a known slot
+
+    // Config declares "wife" (pointing at the live mock) but the registry is
+    // EMPTY — as if her opencode was down at startup and the slot was skipped.
+    let mut cfg = cfg_with_model();
+    cfg.slots = vec![Slot {
+        name: "wife".to_string(),
+        opencode_url: oc.url.clone(),
+        workdir: ".".into(),
+        telegram_id: Some(777),
+    }];
+    let db = Db::open_in_memory().expect("in-memory db");
+    let state = AppState::new(cfg, config_path, HashMap::new(), db.clone(), test_bot());
+    let server = tokio::spawn(admin::serve_admin(state.clone(), socket.clone()));
+
+    // Bare `connect wife` (no --url) must resolve from config, not error.
+    let req = AdminRequest::Connect {
+        name: "wife".to_string(),
+        url: None,
+        workdir: None,
+        telegram_id: None,
+    };
+    match send_retry(&socket, &req).await {
+        AdminResponse::Connect { name, outcome } => {
+            assert_eq!(name, "wife");
+            assert_eq!(outcome, ConnectOutcome::Connected);
+        }
+        other => panic!("expected Connect, got {other:?}"),
+    }
+    assert!(
+        state.registry.read().unwrap().contains_key("wife"),
+        "the skipped config slot is now live in the registry"
+    );
+    assert_eq!(
+        db.allowed_slot(777).unwrap(),
+        Some("wife".to_string()),
+        "its config telegram_id is whitelisted on connect"
+    );
+
+    server.abort();
+}
+
 /// `connect` an existing slot whose opencode is up → `connected` (no-op).
 #[tokio::test]
 async fn connect_reports_existing_reachable_slot_as_connected() {
