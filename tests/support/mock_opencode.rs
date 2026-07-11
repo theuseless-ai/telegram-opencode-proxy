@@ -48,6 +48,11 @@ struct OcState {
     sessions: Arc<Mutex<HashSet<String>>>,
     /// Monotonic counter for minted session ids.
     next_id: Arc<AtomicU64>,
+    /// Number of remaining `GET /config` requests that must answer `503`
+    /// (simulating a down instance) before readiness starts succeeding. Lets a
+    /// test drive the `connect` reconnect path: the first probe sees the slot
+    /// down, the reconnect bring-up then finds it up.
+    config_fails: Arc<AtomicU64>,
 }
 
 /// A running in-process mock opencode instance. Dropping it leaves the spawned
@@ -61,13 +66,22 @@ pub struct MockOpencode {
 impl MockOpencode {
     /// Start a mock whose provider catalogue **contains** the harness model.
     pub async fn start() -> Self {
-        Self::start_inner(true).await
+        Self::start_inner(true, 0).await
     }
 
     /// Start a mock whose provider catalogue does **not** contain the model, so
     /// `validate_model` fails (the provider-validation-failure test).
     pub async fn start_without_model() -> Self {
-        Self::start_inner(false).await
+        Self::start_inner(false, 0).await
+    }
+
+    /// Start a mock whose first `config_fails` readiness probes (`GET /config`)
+    /// answer `503` before it starts reporting ready. Drives the `connect`
+    /// reconnect path (down at probe, up at reconnect bring-up). Only the admin
+    /// test crate uses this; the harness crate does not, hence `allow(dead_code)`.
+    #[allow(dead_code)]
+    pub async fn start_with_config_failures(config_fails: u64) -> Self {
+        Self::start_inner(true, config_fails).await
     }
 
     /// Pin the reply returned by `POST /session/:id/message` (e.g. a >4096-char
@@ -76,13 +90,14 @@ impl MockOpencode {
         *self.reply.lock().expect("mock_opencode reply lock") = Some(text.into());
     }
 
-    async fn start_inner(include_model: bool) -> Self {
+    async fn start_inner(include_model: bool, config_fails: u64) -> Self {
         let reply: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let state = OcState {
             include_model,
             reply: Arc::clone(&reply),
             sessions: Arc::new(Mutex::new(HashSet::new())),
             next_id: Arc::new(AtomicU64::new(1)),
+            config_fails: Arc::new(AtomicU64::new(config_fails)),
         };
 
         let app = Router::new()
@@ -109,9 +124,14 @@ impl MockOpencode {
     }
 }
 
-/// `GET /config` — readiness probe; any 2xx satisfies `wait_ready`.
-async fn config() -> impl IntoResponse {
-    Json(json!({}))
+/// `GET /config` — readiness probe. Answers `503` for the first `config_fails`
+/// requests (simulating a down instance), then `200` thereafter.
+async fn config(State(st): State<OcState>) -> Response {
+    if st.config_fails.load(Ordering::SeqCst) > 0 {
+        st.config_fails.fetch_sub(1, Ordering::SeqCst);
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({}))).into_response();
+    }
+    Json(json!({})).into_response()
 }
 
 /// `GET /config/providers` — the catalogue `validate_model` checks against.

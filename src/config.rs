@@ -35,6 +35,27 @@ pub enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Idempotently ensure a slot exists and is connected on the running daemon
+    /// (#39): reports `connected`, `reconnected`, or `added`.
+    Connect {
+        /// Slot name to ensure connected.
+        name: String,
+        /// opencode base URL — required when adding a slot that does not exist.
+        #[arg(long)]
+        url: Option<String>,
+        /// Working directory for a newly-added slot (defaults to ".").
+        #[arg(long)]
+        workdir: Option<String>,
+        /// Telegram id to bind a newly-added slot to.
+        #[arg(long)]
+        telegram_id: Option<i64>,
+        /// Path to the TOML config file (read for `admin_socket`).
+        #[arg(short, long, default_value = "config.toml")]
+        config: PathBuf,
+        /// Admin socket path override. When set, the config file is not read.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Admin enrollment client (behaviour lands in #4b).
     Pair {
         #[command(subcommand)]
@@ -92,7 +113,7 @@ fn default_db_path() -> PathBuf {
 }
 
 /// A user seat: one opencode instance bound to one working directory.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Slot {
     pub name: String,
     pub opencode_url: String,

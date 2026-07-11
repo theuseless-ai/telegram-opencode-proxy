@@ -19,7 +19,6 @@
 
 mod support;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::json;
@@ -28,7 +27,6 @@ use teloxide::types::Message;
 
 use telegram_opencode_proxy::config::{Config, Model, Permissions, Slot};
 use telegram_opencode_proxy::connect_slots;
-use telegram_opencode_proxy::opencode::client::OpencodeClient;
 use telegram_opencode_proxy::persistence::Db;
 use telegram_opencode_proxy::telegram::bot::{AppState, handle_text};
 
@@ -80,14 +78,14 @@ fn text_message(chat_id: i64, text: &str) -> Message {
     .expect("constructing a teloxide Message from wire JSON")
 }
 
-/// Bring up the real per-slot clients for `cfg` against the running mock.
+/// Bring up the real per-slot registry for `cfg` against the running mock.
 async fn state_for(cfg: Config) -> Arc<AppState> {
-    let clients: HashMap<String, OpencodeClient> = connect_slots(&cfg)
+    let registry = connect_slots(&cfg)
         .await
         .expect("connect_slots (readiness + model validation) succeeds against the mock");
     // In-memory routing store — hermetic, no file touched by the harness.
     let db = Db::open_in_memory().expect("in-memory persistence store opens");
-    AppState::new(cfg, clients, db)
+    AppState::new(cfg, registry, db)
 }
 
 /// 1. Authorized text → the mock records a `sendMessage` carrying the model reply.

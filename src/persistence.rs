@@ -25,16 +25,21 @@
 //! Bookkeeping stamps (`allowed_users.added_at`, `pending_approvals.created_at`)
 //! are taken from [`SystemTime`] at the edge, since nothing branches on them.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::config::Slot;
+
 /// Current schema version, tracked via SQLite's `PRAGMA user_version`. Bump this
 /// and add a matching arm in [`migrate`] when the schema changes.
-const SCHEMA_VERSION: i64 = 1;
+///
+/// v2 adds the `slots` table (#39) so slots added at runtime via `proxy connect`
+/// survive a restart. The migration is purely additive.
+const SCHEMA_VERSION: i64 = 2;
 
 /// How long a query waits on a locked database before erroring (WAL still
 /// serialises writers). Generous — local, low-contention, two users.
@@ -355,6 +360,85 @@ impl Db {
             Ok(out)
         })
     }
+
+    // --- slots: runtime-added seats that must survive restart (#39) -------
+
+    /// Insert (or replace by `name`) a slot. `added_at` is stamped on first
+    /// insert and preserved across updates, so re-connecting an existing slot
+    /// keeps its original enrolment time.
+    pub fn upsert_slot(&self, slot: &Slot) -> Result<()> {
+        let added_at = now_epoch();
+        let workdir = slot.workdir.to_string_lossy().into_owned();
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO slots(name, opencode_url, workdir, telegram_id, added_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(name) DO UPDATE SET
+                     opencode_url = excluded.opencode_url,
+                     workdir = excluded.workdir,
+                     telegram_id = excluded.telegram_id",
+                params![
+                    slot.name,
+                    slot.opencode_url,
+                    workdir,
+                    slot.telegram_id,
+                    added_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Look up a persisted slot by name.
+    pub fn get_slot(&self, name: &str) -> Result<Option<Slot>> {
+        self.with_conn(|c| {
+            let out = c
+                .query_row(
+                    "SELECT name, opencode_url, workdir, telegram_id
+                     FROM slots WHERE name = ?1",
+                    params![name],
+                    row_to_slot,
+                )
+                .optional()?;
+            Ok(out)
+        })
+    }
+
+    /// Every persisted slot, in enrolment order (`added_at`, then name).
+    pub fn list_slots(&self) -> Result<Vec<Slot>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT name, opencode_url, workdir, telegram_id
+                 FROM slots ORDER BY added_at, name",
+            )?;
+            let rows = stmt.query_map([], row_to_slot)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Remove a persisted slot by name. No-op if absent.
+    pub fn remove_slot(&self, name: &str) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute("DELETE FROM slots WHERE name = ?1", params![name])?;
+            Ok(())
+        })
+    }
+}
+
+/// Decode a `slots` row into a [`Slot`]. `workdir` is stored as TEXT and
+/// `telegram_id` as a nullable INTEGER.
+fn row_to_slot(row: &rusqlite::Row) -> rusqlite::Result<Slot> {
+    let workdir: String = row.get(2)?;
+    Ok(Slot {
+        name: row.get(0)?,
+        opencode_url: row.get(1)?,
+        workdir: PathBuf::from(workdir),
+        telegram_id: row.get(3)?,
+    })
 }
 
 /// Current wall-clock time in epoch seconds, saturating at 0 before 1970.
@@ -392,6 +476,19 @@ fn migrate(conn: &Connection) -> Result<()> {
                  session_id    TEXT NOT NULL,
                  permission_id TEXT,
                  created_at    INTEGER
+             );",
+        )?;
+    }
+    if version < 2 {
+        // Additive: runtime-added slots (#39) persist here so `proxy connect`
+        // survives a restart. `telegram_id` is nullable; `workdir` is TEXT.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS slots(
+                 name         TEXT PRIMARY KEY,
+                 opencode_url TEXT NOT NULL,
+                 workdir      TEXT NOT NULL,
+                 telegram_id  INTEGER,
+                 added_at     INTEGER
              );",
         )?;
     }
@@ -520,6 +617,70 @@ mod tests {
         db.delete_approval("tok1").unwrap();
         assert_eq!(db.approval("tok1").unwrap(), None);
         assert_eq!(db.list_approvals().unwrap().len(), 1);
+    }
+
+    fn slot(name: &str, url: &str, telegram_id: Option<i64>) -> Slot {
+        Slot {
+            name: name.to_string(),
+            opencode_url: url.to_string(),
+            workdir: PathBuf::from("/tmp/wd"),
+            telegram_id,
+        }
+    }
+
+    #[test]
+    fn slots_round_trip_upsert_and_list() {
+        let db = db();
+        assert_eq!(db.get_slot("you").unwrap(), None);
+        assert!(db.list_slots().unwrap().is_empty());
+
+        db.upsert_slot(&slot("you", "http://127.0.0.1:4096", Some(111)))
+            .unwrap();
+        db.upsert_slot(&slot("wife", "http://127.0.0.1:4097", None))
+            .unwrap();
+
+        let got = db.get_slot("you").unwrap().expect("slot present");
+        assert_eq!(got.name, "you");
+        assert_eq!(got.opencode_url, "http://127.0.0.1:4096");
+        assert_eq!(got.workdir, PathBuf::from("/tmp/wd"));
+        assert_eq!(got.telegram_id, Some(111));
+        assert_eq!(db.get_slot("wife").unwrap().unwrap().telegram_id, None);
+
+        // upsert replaces by name rather than duplicating.
+        db.upsert_slot(&slot("you", "http://127.0.0.1:5000", Some(222)))
+            .unwrap();
+        let got = db.get_slot("you").unwrap().expect("slot present");
+        assert_eq!(got.opencode_url, "http://127.0.0.1:5000");
+        assert_eq!(got.telegram_id, Some(222));
+
+        let all = db.list_slots().unwrap();
+        assert_eq!(all.len(), 2, "upsert must not duplicate");
+        let names: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"you") && names.contains(&"wife"));
+
+        db.remove_slot("you").unwrap();
+        assert_eq!(db.get_slot("you").unwrap(), None);
+        assert_eq!(db.list_slots().unwrap().len(), 1);
+        // removing a missing slot is a no-op, not an error.
+        db.remove_slot("you").unwrap();
+    }
+
+    #[test]
+    fn slots_survive_reopen_of_same_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.db");
+        {
+            let db = Db::open(&path).expect("open fresh db");
+            db.upsert_slot(&slot("added", "http://127.0.0.1:9000", Some(7)))
+                .unwrap();
+        }
+        let db = Db::open(&path).expect("reopen db");
+        let got = db
+            .get_slot("added")
+            .unwrap()
+            .expect("persisted slot present");
+        assert_eq!(got.opencode_url, "http://127.0.0.1:9000");
+        assert_eq!(got.telegram_id, Some(7));
     }
 
     #[test]
