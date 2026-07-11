@@ -8,10 +8,6 @@
 //! ([`supervise`]). Full crash-loop backoff and health tracking are #N3.
 //! See `docs/design/architecture.md` §4.
 
-// Forward-declared: the spawn/supervise entry points are invoked by the serve
-// startup wiring (#6). Port parsing + readiness are exercised by unit tests.
-#![allow(dead_code)]
-
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
@@ -21,8 +17,8 @@ use tokio::process::{Child, Command};
 use crate::config::Slot;
 
 /// Default readiness budget: 120 attempts × 500 ms ≈ 60 s.
-const READY_ATTEMPTS: u32 = 120;
-const READY_INTERVAL: Duration = Duration::from_millis(500);
+pub const READY_ATTEMPTS: u32 = 120;
+pub const READY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Parse the TCP port from an opencode base URL
 /// (`http://127.0.0.1:4096` → `4096`).
@@ -48,6 +44,9 @@ pub fn port_from_url(url: &str) -> Result<u16> {
 pub struct SlotProcess {
     pub name: String,
     pub port: u16,
+    // Held to keep the child alive (reaped via `kill_on_drop` when the
+    // supervisor is dropped). Only the #N3 restart loop reads it directly.
+    #[allow(dead_code)]
     child: Child,
 }
 
@@ -74,7 +73,8 @@ impl SlotProcess {
         })
     }
 
-    /// Wait for the child to exit (used by the restart loop).
+    /// Wait for the child to exit (used by the #N3 restart loop).
+    #[allow(dead_code)]
     pub async fn wait(&mut self) -> Result<ExitStatus> {
         self.child
             .wait()
@@ -82,7 +82,8 @@ impl SlotProcess {
             .with_context(|| format!("waiting on opencode child for slot '{}'", self.name))
     }
 
-    /// Best-effort terminate and reap the child.
+    /// Best-effort terminate and reap the child (used by graceful shutdown, #N2).
+    #[allow(dead_code)]
     pub async fn shutdown(&mut self) -> Result<()> {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
@@ -115,6 +116,10 @@ pub async fn wait_ready(
 /// Keep one slot's opencode alive: spawn, wait until ready, then respawn on
 /// exit. This is the restart-on-exit **skeleton** — crash-loop backoff and
 /// health tracking land in #N3. Runs until the future is dropped.
+///
+/// Not yet wired: the serve path (#6) spawns + waits inline so it can validate
+/// providers and build clients before dispatching; the supervise loop is #N3.
+#[allow(dead_code)]
 pub async fn supervise(slot: Slot, http: reqwest::Client) -> Result<()> {
     loop {
         let mut proc = SlotProcess::spawn(&slot)?;

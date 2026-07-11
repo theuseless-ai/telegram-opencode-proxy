@@ -13,6 +13,8 @@
 // unit tests below; the `dead_code` allow keeps the not-yet-wired items green.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::Model;
@@ -130,6 +132,35 @@ pub enum PermissionReply {
     Once,
     Always,
     Reject,
+}
+
+// ---------------------------------------------------------------------------
+// Provider catalogue (`GET /config/providers`) — startup model validation (#6)
+// ---------------------------------------------------------------------------
+
+/// Response from `GET /config/providers`. Shape (from `doc.json`):
+/// `{ providers: [{ id, name, models: { <modelID>: {…} } }], default: {…} }`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProvidersResponse {
+    #[serde(default)]
+    pub providers: Vec<ProviderInfo>,
+    /// providerID → default modelID. Present in the wire but unused here.
+    #[serde(default)]
+    pub default: HashMap<String, String>,
+}
+
+/// One configured provider. We only need `id` + the `models` key set to
+/// validate the proxy's `{provider_id, model_id}` selector; other fields
+/// (`name`, `source`, `env`, `options`, …) are ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// modelID → model metadata. We check presence of the key only, so the
+    /// value is kept opaque for forward-compatibility.
+    #[serde(default)]
+    pub models: HashMap<String, serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------

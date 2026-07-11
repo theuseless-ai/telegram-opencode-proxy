@@ -6,10 +6,6 @@
 //! interactive responder exists until #13, so gating with `ask` would wedge the
 //! turn. #13 flips these to `ask`. See `architecture.md` §2.6. Issues #5/#13.
 
-// `get_or_create` is invoked by the per-user turn loop (#6); `deny_rules` is
-// exercised by the unit tests below.
-#![allow(dead_code)]
-
 use anyhow::Result;
 
 use crate::config::Model;

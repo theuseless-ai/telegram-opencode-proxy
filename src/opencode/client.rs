@@ -12,10 +12,6 @@
 //! live server. V1/V2 seam: all paths are built through `url()`; a V2 adapter
 //! would prefix `/api` there. We target V1. See `architecture.md` §10.
 
-// Forward-declared client surface: `prompt`/`get_messages` are wired by the
-// turn loop (#6) and the stubs by #13. Keeps the not-yet-called methods green.
-#![allow(dead_code)]
-
 use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 
@@ -23,7 +19,8 @@ use crate::config::Slot;
 
 use super::types::{
     CreateModel, CreateSessionRequest, MessageEnvelope, PartInput, PatchSessionRequest,
-    PermissionReplyRequest, PermissionRule, PromptModel, PromptRequest, SessionResponse,
+    PermissionReplyRequest, PermissionRule, PromptModel, PromptRequest, ProvidersResponse,
+    SessionResponse,
 };
 
 /// An async client for a single opencode instance.
@@ -52,7 +49,8 @@ impl OpencodeClient {
         Self::new(slot.opencode_url.clone())
     }
 
-    /// The instance base URL (trailing slash stripped).
+    /// The instance base URL (trailing slash stripped). Test/diagnostic helper.
+    #[allow(dead_code)] // exercised by unit tests; not needed on the live path.
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -60,6 +58,23 @@ impl OpencodeClient {
     /// V1 path seam — join the base URL with a root-relative endpoint `path`.
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+
+    /// `GET /config/providers` — the instance's configured provider catalogue.
+    /// Used at startup to fail fast if the proxy's `{provider_id, model_id}`
+    /// selector does not resolve on this instance (see [`validate_model`]).
+    pub async fn config_providers(&self) -> Result<ProvidersResponse> {
+        let resp = self
+            .http
+            .get(self.url("/config/providers"))
+            .send()
+            .await
+            .context("GET /config/providers")?
+            .error_for_status()
+            .context("GET /config/providers returned an error status")?;
+        resp.json::<ProvidersResponse>()
+            .await
+            .context("decoding /config/providers response")
     }
 
     /// `POST /session` — create a session, optionally with a title and model.
@@ -109,7 +124,9 @@ impl OpencodeClient {
             .context("decoding prompt response")
     }
 
-    /// `GET /session/:id/message` — list the session's messages.
+    /// `GET /session/:id/message` — list the session's messages. Not needed by
+    /// the blocking turn loop; used by the SSE reconnect/backfill path (#7).
+    #[allow(dead_code)]
     pub async fn get_messages(&self, session_id: &str) -> Result<Vec<MessageEnvelope>> {
         let resp = self
             .http
@@ -165,6 +182,7 @@ impl OpencodeClient {
 
     /// `POST /permission/:id/reply` — stubbed until the permission responder
     /// lands in #13.
+    #[allow(dead_code)]
     pub async fn reply_permission(
         &self,
         _request_id: &str,
@@ -175,9 +193,40 @@ impl OpencodeClient {
 
     /// `GET /file/content` — read a file from the instance workdir. Stubbed
     /// until outbound file support (#13).
+    #[allow(dead_code)]
     pub async fn read_file(&self, _path: &str) -> Result<String> {
         bail!("not implemented (#13)")
     }
+}
+
+/// Verify the configured `{provider_id, model_id}` exists in a
+/// `/config/providers` response. On mismatch, returns an error that lists what
+/// IS available so the operator can fix `config.toml` / `opencode.json`.
+pub fn validate_model(
+    providers: &ProvidersResponse,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<()> {
+    let Some(provider) = providers.providers.iter().find(|p| p.id == provider_id) else {
+        let available: Vec<&str> = providers.providers.iter().map(|p| p.id.as_str()).collect();
+        bail!(
+            "provider '{provider_id}' is not configured in opencode — \
+             available providers: [{}]. Fix `[model].provider_id` in config.toml \
+             or register the provider in opencode.json (architecture.md §12).",
+            available.join(", ")
+        );
+    };
+    if !provider.models.contains_key(model_id) {
+        let mut models: Vec<&str> = provider.models.keys().map(String::as_str).collect();
+        models.sort_unstable();
+        bail!(
+            "model '{model_id}' is not configured under provider '{provider_id}' — \
+             available models: [{}]. Fix `[model].model_id` in config.toml or add \
+             the model under that provider in opencode.json (architecture.md §12).",
+            models.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Strip trailing slashes from a base URL so `url()` never doubles them.
@@ -191,6 +240,48 @@ fn normalize_base(mut s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PROVIDERS: &str = include_str!("../../fixtures/opencode/config-providers.json");
+
+    fn providers() -> ProvidersResponse {
+        serde_json::from_str(PROVIDERS).expect("providers fixture parses")
+    }
+
+    #[test]
+    fn deserializes_providers_fixture() {
+        let p = providers();
+        assert_eq!(p.providers.len(), 1);
+        assert_eq!(p.providers[0].id, "llm-lan");
+        assert!(p.providers[0].models.contains_key("Qwen3.6-35B-A3B-bf16"));
+        assert_eq!(
+            p.default.get("llm-lan").map(String::as_str),
+            Some("Qwen3.6-35B-A3B-bf16")
+        );
+    }
+
+    #[test]
+    fn validate_model_accepts_configured_selector() {
+        assert!(validate_model(&providers(), "llm-lan", "Qwen3.6-35B-A3B-bf16").is_ok());
+    }
+
+    #[test]
+    fn validate_model_rejects_unknown_provider() {
+        let err = validate_model(&providers(), "nope", "Qwen3.6-35B-A3B-bf16")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider 'nope'"), "{err}");
+        // Error lists what IS available.
+        assert!(err.contains("llm-lan"), "{err}");
+    }
+
+    #[test]
+    fn validate_model_rejects_unknown_model() {
+        let err = validate_model(&providers(), "llm-lan", "ghost-model")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("model 'ghost-model'"), "{err}");
+        assert!(err.contains("Qwen3.6-35B-A3B-bf16"), "{err}");
+    }
 
     #[test]
     fn normalizes_trailing_slashes() {
