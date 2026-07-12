@@ -74,6 +74,11 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
         health::READY_ATTEMPTS,
         health::READY_INTERVAL,
     );
+    // Outbound files (#12): one filesystem watcher per slot's `./outbox` → send
+    // new files to the owning user. The handles must stay alive for the process
+    // lifetime (dropping a watcher stops the watch), so hold them until shutdown.
+    let _outbox_watchers = outbox::spawn_watchers(&state);
+
     // The admin server shares the same `Arc<AppState>` — read-only is enough for
     // #38 (runtime-mutable slots are #39).
     let admin_state: Arc<dyn admin::AdminState> = state.clone();

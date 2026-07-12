@@ -35,7 +35,8 @@ use telegram_opencode_proxy::opencode::client::OpencodeClient;
 use telegram_opencode_proxy::persistence::{Db, PendingApproval};
 use telegram_opencode_proxy::state::SlotConn;
 use telegram_opencode_proxy::telegram::bot::{
-    AppState, handle_callback, handle_media, handle_new, handle_stop, handle_text, handle_verbosity,
+    AppState, handle_callback, handle_get, handle_media, handle_new, handle_stop, handle_text,
+    handle_verbosity,
 };
 use telegram_opencode_proxy::telegram::render::Verbosity;
 use telegram_opencode_proxy::{connect_slots, spawn_slot_bringup};
@@ -954,6 +955,125 @@ async fn permission_callback_replies_and_clears_the_gate() {
     assert!(
         state.db.approval("per_test").unwrap().is_none(),
         "the gate must be cleared after answering"
+    );
+}
+
+// --- outbound files: /get + outbox watcher (#12) ------------------------------
+
+/// A single-slot config pointing at `opencode_url` with a real on-disk `workdir`
+/// (so `/get` and the outbox watcher have a filesystem to work against).
+fn config_with_workdir(opencode_url: &str, workdir: &Path) -> Config {
+    let mut cfg = config_for(opencode_url);
+    cfg.slots[0].workdir = workdir.to_path_buf();
+    cfg
+}
+
+/// `/get <file>` uploads a file from the user's workdir as a document, firing an
+/// `upload_document` chat action first for liveness.
+#[tokio::test]
+async fn get_command_sends_a_workdir_file() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("notes.md"), b"# hello").expect("write notes");
+    let state = state_for(config_with_workdir(&oc.url, dir.path())).await;
+    let bot = bot_pointed_at(&tg);
+
+    handle_get(
+        bot,
+        text_message(SLOT_ID, "/get notes.md"),
+        state,
+        "notes.md".to_string(),
+    )
+    .await
+    .expect("handle_get succeeds");
+
+    let files = tg.sent_files();
+    assert_eq!(files.len(), 1, "one file upload expected, got {files:?}");
+    assert_eq!(files[0].chat_id, SLOT_ID);
+    assert_eq!(files[0].filename, "notes.md");
+    assert_eq!(
+        files[0].kind, "document",
+        "a .md is a document, not a photo"
+    );
+    assert!(
+        tg.chat_actions().iter().any(|a| a == "upload_document"),
+        "expected an upload_document action, got {:?}",
+        tg.chat_actions()
+    );
+}
+
+/// `/get ../secret` (a path escaping the workdir) is rejected: nothing is
+/// uploaded and the user gets a clear refusal.
+#[tokio::test]
+async fn get_command_rejects_path_escape() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workdir = dir.path().join("wd");
+    std::fs::create_dir(&workdir).expect("mkdir wd");
+    // A secret sibling OUTSIDE the workdir the guard must refuse.
+    std::fs::write(dir.path().join("secret.txt"), b"nope").expect("write secret");
+    let state = state_for(config_with_workdir(&oc.url, &workdir)).await;
+    let bot = bot_pointed_at(&tg);
+
+    handle_get(
+        bot,
+        text_message(SLOT_ID, "/get ../secret.txt"),
+        state,
+        "../secret.txt".to_string(),
+    )
+    .await
+    .expect("handle_get succeeds");
+
+    assert!(
+        tg.sent_files().is_empty(),
+        "an escaping path must not upload a file, got {:?}",
+        tg.sent_files()
+    );
+    assert!(
+        tg.sent_messages()
+            .iter()
+            .any(|m| m.text.contains("Can't get")),
+        "expected a rejection reply, got {:?}",
+        tg.sent_messages()
+    );
+}
+
+/// The outbox watcher relays a file written into a slot's `./outbox` to the
+/// owning user (end-to-end: real `notify` watch → debounce → upload).
+#[tokio::test]
+async fn outbox_watcher_sends_new_files() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = state_with_bot(
+        config_with_workdir(&oc.url, dir.path()),
+        bot_pointed_at(&tg),
+    )
+    .await;
+
+    // Hold the watcher handles alive for the test (dropping them stops the watch).
+    let _watchers = telegram_opencode_proxy::outbox::spawn_watchers(&state);
+
+    // The agent writes a deliverable into the outbox; the watcher should send it.
+    let outbox = dir.path().join("outbox");
+    std::fs::create_dir_all(&outbox).expect("outbox dir");
+    std::fs::write(outbox.join("report.txt"), b"the report").expect("write report");
+
+    let delivered = wait_for(
+        || {
+            tg.sent_files()
+                .iter()
+                .any(|f| f.filename == "report.txt" && f.chat_id == SLOT_ID)
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        delivered,
+        "outbox file should be delivered to its owner, got {:?}",
+        tg.sent_files()
     );
 }
 

@@ -18,6 +18,12 @@ db_path = "proxy.db"
 
 # One "seat" per user. opencode_url must be distinct per slot; workdir must exist.
 #
+# workdir is this slot's opencode working directory. Outbound files (the ./outbox
+# watcher) and /get read it by LOCAL PATH, so the proxy and this slot's opencode
+# must share a filesystem: run them on the same host, or bind-mount workdir to the
+# very directory opencode reads/writes. (The prompt/stream path is HTTP and works
+# with a remote opencode; the disk-based file conventions do not.)
+#
 # telegram_id is the TEMPORARY minimal auth gate (A4a): set it to your numeric
 # Telegram id to whitelist yourself for this slot. Find your id by texting the
 # running bot `/whoami`. This is a bootstrap stand-in — A4b pairing (proxy pair

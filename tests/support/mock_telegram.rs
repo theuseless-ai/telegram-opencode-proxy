@@ -61,12 +61,24 @@ pub struct EditMessage {
     pub text: String,
 }
 
+/// A `sendDocument`/`sendPhoto` file upload the mock recorded (outbound files,
+/// #12). Parsed out of the multipart body; `kind` is `"document"` or `"photo"`.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct SentFile {
+    pub chat_id: i64,
+    pub filename: String,
+    pub kind: String,
+}
+
 /// Shared mutable state behind the mock's single catch-all handler.
 #[derive(Clone)]
 struct TgState {
     sent: Arc<Mutex<Vec<SentMessage>>>,
     edits: Arc<Mutex<Vec<EditMessage>>>,
     chat_actions: Arc<Mutex<Vec<String>>>,
+    /// `sendDocument`/`sendPhoto` uploads recorded from their multipart bodies (#12).
+    files: Arc<Mutex<Vec<SentFile>>>,
     /// Count of send/edit attempts rejected for whitespace-only text — the
     /// driver's non-empty guard (#8) should keep this at 0.
     empty_rejections: Arc<AtomicI64>,
@@ -91,6 +103,7 @@ pub struct MockTelegram {
     sent: Arc<Mutex<Vec<SentMessage>>>,
     edits: Arc<Mutex<Vec<EditMessage>>>,
     chat_actions: Arc<Mutex<Vec<String>>>,
+    files: Arc<Mutex<Vec<SentFile>>>,
     empty_rejections: Arc<AtomicI64>,
     send_attempts: Arc<AtomicI64>,
     fail_429: Arc<AtomicI64>,
@@ -105,6 +118,7 @@ impl MockTelegram {
         let sent: Arc<Mutex<Vec<SentMessage>>> = Arc::new(Mutex::new(Vec::new()));
         let edits: Arc<Mutex<Vec<EditMessage>>> = Arc::new(Mutex::new(Vec::new()));
         let chat_actions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let files: Arc<Mutex<Vec<SentFile>>> = Arc::new(Mutex::new(Vec::new()));
         let empty_rejections = Arc::new(AtomicI64::new(0));
         let send_attempts = Arc::new(AtomicI64::new(0));
         let fail_429 = Arc::new(AtomicI64::new(0));
@@ -115,6 +129,7 @@ impl MockTelegram {
             sent: Arc::clone(&sent),
             edits: Arc::clone(&edits),
             chat_actions: Arc::clone(&chat_actions),
+            files: Arc::clone(&files),
             empty_rejections: Arc::clone(&empty_rejections),
             send_attempts: Arc::clone(&send_attempts),
             fail_429: Arc::clone(&fail_429),
@@ -145,6 +160,7 @@ impl MockTelegram {
             sent,
             edits,
             chat_actions,
+            files,
             empty_rejections,
             send_attempts,
             fail_429,
@@ -193,6 +209,12 @@ impl MockTelegram {
             .lock()
             .expect("mock_telegram chat_actions lock")
             .clone()
+    }
+
+    /// Snapshot of every recorded `sendDocument`/`sendPhoto` upload (#12 outbound).
+    #[allow(dead_code)]
+    pub fn sent_files(&self) -> Vec<SentFile> {
+        self.files.lock().expect("mock_telegram files lock").clone()
     }
 
     /// How many send/edit attempts were rejected for whitespace-only text. The
@@ -336,6 +358,11 @@ async fn handler(
                 .push(action);
             Value::Bool(true)
         }
+        // Outbound file uploads (#12) arrive as `multipart/form-data`, not JSON,
+        // so parse `chat_id` + `filename` out of the raw body and echo back a
+        // Message that carries the media so teloxide deserializes the response.
+        "SendDocument" => record_file(&st, &body, "document"),
+        "SendPhoto" => record_file(&st, &body, "photo"),
         "GetFile" => {
             // Echo the requested file id and point at a downloadable path (#11).
             let file_id = req["file_id"].as_str().unwrap_or("file").to_string();
@@ -351,6 +378,63 @@ async fn handler(
     };
 
     Json(json!({ "ok": true, "result": result }))
+}
+
+/// Record a `sendDocument`/`sendPhoto` upload (#12) parsed from its multipart
+/// body, and return a `Message` result carrying the matching media so teloxide
+/// can deserialize the response. `kind` is `"document"` or `"photo"`.
+fn record_file(st: &TgState, body: &Bytes, kind: &str) -> Value {
+    let text = String::from_utf8_lossy(body);
+    let chat_id = multipart_field(&text, "chat_id")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or_default();
+    let filename = multipart_filename(&text).unwrap_or_else(|| "file".to_string());
+    st.files
+        .lock()
+        .expect("mock_telegram files lock")
+        .push(SentFile {
+            chat_id,
+            filename: filename.clone(),
+            kind: kind.to_string(),
+        });
+
+    let mid = st.next_msg_id.fetch_add(1, Ordering::SeqCst);
+    let media = if kind == "photo" {
+        json!({ "photo": [
+            { "file_id": "out", "file_unique_id": "u", "width": 1, "height": 1, "file_size": 1 }
+        ] })
+    } else {
+        json!({ "document": { "file_id": "out", "file_unique_id": "u", "file_name": filename } })
+    };
+    let mut msg = json!({
+        "message_id": mid,
+        "date": 0,
+        "chat": { "id": chat_id, "type": "private", "first_name": "Test" },
+        "from": { "id": st.bot_id, "is_bot": true, "first_name": "MockBot" }
+    });
+    // Splice the media kind into the Message object.
+    if let (Value::Object(msg), Value::Object(media)) = (&mut msg, media) {
+        msg.extend(media);
+    }
+    msg
+}
+
+/// Read a scalar multipart form field's value by `name` (the text between the
+/// part's header and the next boundary). ASCII-only headers, so operating on the
+/// lossy-UTF8 body is safe even when a later part carries binary bytes.
+fn multipart_field(body: &str, name: &str) -> Option<String> {
+    let marker = format!("name=\"{name}\"");
+    let after = &body[body.find(&marker)? + marker.len()..];
+    let value = &after[after.find("\r\n\r\n")? + 4..];
+    let end = value.find("\r\n").unwrap_or(value.len());
+    Some(value[..end].to_string())
+}
+
+/// Read the `filename="…"` of the file part of a multipart body.
+fn multipart_filename(body: &str) -> Option<String> {
+    let marker = "filename=\"";
+    let rest = &body[body.find(marker)? + marker.len()..];
+    Some(rest[..rest.find('"')?].to_string())
 }
 
 /// Canned bytes served by the file-download endpoint (#11).
