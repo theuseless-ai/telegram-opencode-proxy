@@ -42,18 +42,60 @@ fn pick_attachment(msg: &Message) -> Option<Attachment> {
         });
     }
     if let Some(doc) = msg.document() {
+        let telegram_mime = doc.mime_type.as_ref().map(|m| m.to_string());
         return Some(Attachment {
             file_id: doc.file.id.clone(),
-            mime: doc
-                .mime_type
-                .as_ref()
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            mime: resolve_mime(telegram_mime.as_deref(), doc.file_name.as_deref()),
             filename: doc.file_name.clone(),
             size: doc.file.size,
         });
     }
     None
+}
+
+/// Choose the MIME to attach a document with. A **useful** MIME from Telegram
+/// wins; otherwise (missing, or the useless `application/octet-stream` default)
+/// we infer it from the file extension. This matters because opencode only
+/// inlines a file's content when it has a real (esp. `text/*`) MIME — an
+/// `application/octet-stream` part yields an **empty** model reply (#11 fix).
+fn resolve_mime(telegram_mime: Option<&str>, filename: Option<&str>) -> String {
+    if let Some(mime) = telegram_mime
+        && !mime.is_empty()
+        && mime != "application/octet-stream"
+    {
+        return mime.to_string();
+    }
+    mime_from_extension(filename).unwrap_or_else(|| "application/octet-stream".to_string())
+}
+
+/// Infer a MIME from a filename's extension, for the common text/code/doc types
+/// (and images). `None` for unknown extensions.
+fn mime_from_extension(filename: Option<&str>) -> Option<String> {
+    let ext = filename?
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())?;
+    let mime = match ext.as_str() {
+        "txt" | "text" | "log" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "yaml" | "yml" => "application/yaml",
+        // Config + source files: opencode just needs a text/* MIME to inline them.
+        "toml" | "ini" | "cfg" | "conf" | "env" => "text/plain",
+        "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" => "text/plain",
+        "rs" | "go" | "py" | "rb" | "php" | "java" | "kt" | "c" | "h" | "cpp" | "hpp" | "cc"
+        | "cs" | "swift" | "sh" | "bash" | "zsh" | "sql" | "lua" | "r" => "text/plain",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => return None,
+    };
+    Some(mime.to_string())
 }
 
 /// Build the prompt parts for an inbound media message (#11): download the
@@ -137,6 +179,29 @@ mod tests {
         assert_eq!(att.file_id.0, "big", "largest size chosen");
         assert_eq!(att.mime, "image/jpeg");
         assert_eq!(att.filename.as_deref(), Some("photo.jpg"));
+    }
+
+    #[test]
+    fn resolve_mime_infers_from_extension_when_octet_stream() {
+        // The useless octet-stream default is overridden by the extension.
+        assert_eq!(
+            resolve_mime(Some("application/octet-stream"), Some("index.html")),
+            "text/html"
+        );
+        assert_eq!(resolve_mime(None, Some("notes.md")), "text/markdown");
+        assert_eq!(resolve_mime(None, Some("data.json")), "application/json");
+        assert_eq!(resolve_mime(None, Some("main.rs")), "text/plain");
+        // A genuine MIME from Telegram is kept as-is.
+        assert_eq!(
+            resolve_mime(Some("application/pdf"), Some("x.bin")),
+            "application/pdf"
+        );
+        // Truly unknown → octet-stream.
+        assert_eq!(
+            resolve_mime(None, Some("archive.xyz")),
+            "application/octet-stream"
+        );
+        assert_eq!(resolve_mime(None, None), "application/octet-stream");
     }
 
     #[test]
