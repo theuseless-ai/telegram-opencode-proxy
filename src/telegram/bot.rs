@@ -1,12 +1,10 @@
-//! teloxide long-poll dispatcher: text messages, `/new` `/whoami` `/get` `/stop`,
-//! `callback_query` (approval buttons), inbound file download. Whitelist gate.
-//! See `docs/design/architecture.md` §4/§13. Issue #6.
+//! teloxide long-poll dispatcher: text + media messages, `/whoami` `/stop` `/new`
+//! `/quiet` `/verbose`, and the whitelist gate. See `architecture.md` §4/§13.
 //!
-//! #6 wires the "wire green" subset: a text message from a whitelisted user is
-//! routed to that user's opencode slot (blocking `POST /session/:id/message`)
-//! and the reply is chunked back with [`render::split_message`]. `/whoami`
-//! reports the numeric chat id (a bootstrap aid). Streaming, files, `/new`,
-//! `/get`, `/stop`, and per-user mpsc serialization land in later issues.
+//! A whitelisted user's text is routed to their opencode slot and answered by a
+//! streaming turn (#8) run through a per-user serial worker (#9); an inbound
+//! photo/document is downloaded and attached as a file part (#11, `handle_media`).
+//! `/get`, outbound files, and the permission relay land in later issues.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -27,13 +25,13 @@ use crate::admin::{
 use crate::auth;
 use crate::config::{Config, Slot};
 use crate::opencode::client::OpencodeClient;
-use crate::opencode::types::PromptModel;
+use crate::opencode::types::{PartInput, PromptModel};
 use crate::pairing;
 use crate::persistence::Db;
 use crate::session;
 use crate::state::SlotConn;
 use crate::telegram::render::Verbosity;
-use crate::telegram::{retry, stream};
+use crate::telegram::{files, retry, stream};
 
 /// Readiness budget for the interactive `proxy connect` bring-up — short so the
 /// command fails fast on an unreachable slot (unlike the 60 s startup budget).
@@ -50,10 +48,11 @@ const BUSY_REPLY: &str =
     "⏳ I'm still working through your messages — please hold on a moment before sending more.";
 
 /// One queued turn for a user's [serial worker](user_worker): the routed slot and
-/// the prompt text. The `chat_id` is fixed per worker, so it isn't carried here.
+/// the prompt parts (text and/or inbound files, #11). The `chat_id` is fixed per
+/// worker, so it isn't carried here.
 struct TurnJob {
     slot: Slot,
-    text: String,
+    parts: Vec<PartInput>,
 }
 
 /// Outcome of [`AppState::enqueue_turn`].
@@ -578,7 +577,10 @@ pub async fn run(bot: Bot, state: Arc<AppState>) {
 
     let handler = Update::filter_message()
         .branch(teloxide::filter_command::<Command, _>().endpoint(handle_command))
-        .branch(dptree::endpoint(handle_text));
+        // Text (non-command) → the text turn; everything else (photo/document)
+        // → the media handler, which downloads inbound files (#11).
+        .branch(dptree::filter(|msg: Message| msg.text().is_some()).endpoint(handle_text))
+        .branch(dptree::endpoint(handle_media));
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])
@@ -757,35 +759,81 @@ pub async fn handle_stop(bot: Bot, msg: Message, state: Arc<AppState>) -> Respon
 /// against the in-process mocks without spinning up the long-poll dispatcher.
 pub async fn handle_text(bot: Bot, msg: Message, state: Arc<AppState>) -> ResponseResult<()> {
     let Some(text) = msg.text() else {
-        return Ok(()); // non-text (photo/doc/etc.) — inbound files are #8.
+        return Ok(()); // non-text is routed to `handle_media`.
     };
     let chat_id = msg.chat.id.0;
+    if let Some(slot) = resolve_or_reject(&bot, &msg, &state, chat_id).await? {
+        let parts = vec![PartInput::Text {
+            text: text.to_string(),
+        }];
+        enqueue_parts(&bot, &msg, &state, chat_id, slot, parts).await?;
+    }
+    Ok(())
+}
 
-    // Resolve against the persisted whitelist, mapping the bound slot name onto
-    // the *runtime* registry snapshot (short read lock) so runtime-added slots
-    // route too. A DB error here is treated as "unresolved" and reported.
+/// Handle a media message — an inbound photo or document (#11). Downloads the
+/// file, base64-encodes it as a data-URI [`PartInput::File`], appends any caption
+/// as text, and runs a turn. Non-file, non-text messages are ignored.
+///
+/// `pub` so the harness can drive it directly (like [`handle_text`]).
+pub async fn handle_media(bot: Bot, msg: Message, state: Arc<AppState>) -> ResponseResult<()> {
+    let chat_id = msg.chat.id.0;
+    let Some(slot) = resolve_or_reject(&bot, &msg, &state, chat_id).await? else {
+        return Ok(());
+    };
+    match files::inbound_parts(&bot, &msg).await {
+        Ok(Some(parts)) => enqueue_parts(&bot, &msg, &state, chat_id, slot, parts).await?,
+        Ok(None) => {} // not a photo/document — nothing to do.
+        Err(err) => {
+            tracing::warn!(chat_id, slot = %slot.name, error = format!("{err:#}"), "inbound file failed");
+            bot.send_message(
+                msg.chat.id,
+                "⚠️ I couldn't read that file — please try again.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the sender's bound slot against the whitelist + runtime registry.
+/// Returns `Some(slot)` to proceed; on an unauthorized sender it runs the
+/// pairing flow ([`handle_unauthorized`]) and returns `None`; a DB error is
+/// reported and returns `None`.
+async fn resolve_or_reject(
+    bot: &Bot,
+    msg: &Message,
+    state: &Arc<AppState>,
+    chat_id: i64,
+) -> ResponseResult<Option<Slot>> {
     let slots = state.slot_snapshot();
-    let resolved = match auth::resolve(&state.db, &slots, chat_id) {
-        Ok(resolved) => resolved,
+    match auth::resolve(&state.db, &slots, chat_id) {
+        Ok(Some(slot)) => Ok(Some(slot)),
+        Ok(None) => {
+            handle_unauthorized(bot, msg, state, chat_id).await?;
+            Ok(None)
+        }
         Err(err) => {
             tracing::error!(chat_id, error = %err, "auth lookup failed");
             bot.send_message(msg.chat.id, ERROR_REPLY).await?;
-            return Ok(());
+            Ok(None)
         }
-    };
-    let Some(slot) = resolved else {
-        handle_unauthorized(&bot, &msg, &state, chat_id).await?;
-        return Ok(());
-    };
+    }
+}
 
-    // Hand the turn to the user's serial worker (#9): turns for one user run one
-    // at a time, and a full queue is rejected here rather than blocking the
-    // dispatcher. The reply is produced by the worker, through `bot`.
-    let job = TurnJob {
-        slot,
-        text: text.to_string(),
-    };
-    match state.enqueue_turn(&bot, chat_id, job) {
+/// Hand a resolved turn to the user's serial worker (#9): turns for one user run
+/// one at a time, and a full queue is rejected here (with [`BUSY_REPLY`]) rather
+/// than blocking the dispatcher. The reply is produced by the worker.
+async fn enqueue_parts(
+    bot: &Bot,
+    msg: &Message,
+    state: &Arc<AppState>,
+    chat_id: i64,
+    slot: Slot,
+    parts: Vec<PartInput>,
+) -> ResponseResult<()> {
+    let job = TurnJob { slot, parts };
+    match state.enqueue_turn(bot, chat_id, job) {
         Enqueue::Queued => {}
         Enqueue::Full => {
             let chat = msg.chat.id;
@@ -825,7 +873,7 @@ async fn user_worker(
 ) {
     while let Some(job) = rx.recv().await {
         let span = turn_span(chat_id, &job.slot.name);
-        let result = run_turn(&bot, &state, &job.slot, chat_id, &job.text)
+        let result = run_turn(&bot, &state, &job.slot, chat_id, job.parts)
             .instrument(span)
             .await;
         if let Err(err) = result {
@@ -904,7 +952,7 @@ async fn run_turn(
     state: &AppState,
     slot: &Slot,
     chat_id: i64,
-    text: &str,
+    parts: Vec<PartInput>,
 ) -> anyhow::Result<()> {
     // Clone the client out of the registry under a short read lock; the guard is
     // dropped inside `client_for` before any await below.
@@ -940,7 +988,7 @@ async fn run_turn(
         chat_id,
         &session_id,
         PromptModel::from(&state.cfg.model),
-        text,
+        parts,
         verbosity,
         stream::StreamTiming::default(),
     )

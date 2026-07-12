@@ -79,6 +79,9 @@ struct OcState {
     message_delay_ms: Arc<AtomicU64>,
     /// Session ids passed to `POST /session/:id/abort` (the `/stop` path, #9).
     aborts: Arc<Mutex<Vec<String>>>,
+    /// MIME types of `type:"file"` parts seen on `POST /session/:id/message`
+    /// (inbound files, #11).
+    file_part_mimes: Arc<Mutex<Vec<String>>>,
 }
 
 /// A running in-process mock opencode instance. Dropping it leaves the spawned
@@ -93,6 +96,7 @@ pub struct MockOpencode {
     event_frames: EventFrames,
     message_delay_ms: Arc<AtomicU64>,
     aborts: Arc<Mutex<Vec<String>>>,
+    file_part_mimes: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockOpencode {
@@ -175,6 +179,15 @@ impl MockOpencode {
             .clone()
     }
 
+    /// MIME types of file parts the proxy sent in prompts (inbound files, #11).
+    #[allow(dead_code)]
+    pub fn file_part_mimes(&self) -> Vec<String> {
+        self.file_part_mimes
+            .lock()
+            .expect("mock_opencode file mimes lock")
+            .clone()
+    }
+
     async fn start_inner(include_model: bool, config_fails: u64) -> Self {
         let reply: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let event_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -183,6 +196,7 @@ impl MockOpencode {
         let event_frames: EventFrames = Arc::new(Mutex::new(None));
         let message_delay_ms = Arc::new(AtomicU64::new(0));
         let aborts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let file_part_mimes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let state = OcState {
             include_model,
             reply: Arc::clone(&reply),
@@ -195,6 +209,7 @@ impl MockOpencode {
             event_frames: Arc::clone(&event_frames),
             message_delay_ms: Arc::clone(&message_delay_ms),
             aborts: Arc::clone(&aborts),
+            file_part_mimes: Arc::clone(&file_part_mimes),
         };
 
         let app = Router::new()
@@ -227,6 +242,7 @@ impl MockOpencode {
             event_frames,
             message_delay_ms,
             aborts,
+            file_part_mimes,
         }
     }
 }
@@ -321,6 +337,19 @@ async fn message(
     }
 
     let req: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    // Record any inbound file parts (#11) so a test can assert the proxy attached
+    // the download as a base64 data-URI FilePart.
+    if let Some(parts) = req["parts"].as_array() {
+        let mut mimes = st
+            .file_part_mimes
+            .lock()
+            .expect("mock_opencode file mimes lock");
+        for part in parts {
+            if part["type"] == "file" {
+                mimes.push(part["mime"].as_str().unwrap_or_default().to_string());
+            }
+        }
+    }
     let prompt = req["parts"]
         .as_array()
         .and_then(|parts| parts.iter().find_map(|p| p["text"].as_str()))

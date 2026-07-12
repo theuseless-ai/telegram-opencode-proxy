@@ -99,17 +99,15 @@ impl OpencodeClient {
     }
 
     /// `POST /session/:id/message` — **blocking**; returns the completed
-    /// assistant message once opencode finishes the turn.
+    /// assistant message once opencode finishes the turn. `parts` is the prompt
+    /// body: text and/or inbound files (#11).
     pub async fn prompt(
         &self,
         session_id: &str,
         model: PromptModel,
-        text: impl Into<String>,
+        parts: Vec<PartInput>,
     ) -> Result<MessageEnvelope> {
-        let body = PromptRequest {
-            model,
-            parts: vec![PartInput::Text { text: text.into() }],
-        };
+        let body = PromptRequest { model, parts };
         let resp = self
             .http
             .post(self.url(&format!("/session/{session_id}/message")))

@@ -29,7 +29,7 @@ use teloxide::types::{ChatAction, ChatId, Message, MessageId};
 
 use crate::opencode::client::OpencodeClient;
 use crate::opencode::events::{Event, PartKind, Subscription};
-use crate::opencode::types::PromptModel;
+use crate::opencode::types::{PartInput, PromptModel};
 use crate::telegram::render::{LiveState, TELEGRAM_LIMIT, Verbosity, split_message};
 use crate::telegram::retry;
 
@@ -67,7 +67,7 @@ pub async fn run_streaming_turn(
     chat_id: i64,
     session_id: &str,
     model: PromptModel,
-    text: &str,
+    parts: Vec<PartInput>,
     verbosity: Verbosity,
     timing: StreamTiming,
 ) -> Result<()> {
@@ -80,7 +80,7 @@ pub async fn run_streaming_turn(
     let mut reasoning_parts: HashSet<String> = HashSet::new();
     let mut sink = LiveSink::new(bot, chat_id);
 
-    let prompt = client.prompt(session_id, model, text);
+    let prompt = client.prompt(session_id, model, parts);
     tokio::pin!(prompt);
 
     let mut flush_tick = tokio::time::interval(timing.flush_interval);

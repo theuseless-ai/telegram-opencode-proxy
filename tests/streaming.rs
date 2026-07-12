@@ -22,7 +22,7 @@ use std::time::Duration;
 use teloxide::Bot;
 
 use telegram_opencode_proxy::opencode::client::OpencodeClient;
-use telegram_opencode_proxy::opencode::types::PromptModel;
+use telegram_opencode_proxy::opencode::types::{PartInput, PromptModel};
 use telegram_opencode_proxy::telegram::render::Verbosity;
 use telegram_opencode_proxy::telegram::stream::{StreamTiming, run_streaming_turn};
 
@@ -31,6 +31,12 @@ use mock_telegram::MockTelegram;
 
 const CHAT_ID: i64 = 111;
 const SESSION: &str = "ses_stream";
+
+fn text_parts(s: &str) -> Vec<PartInput> {
+    vec![PartInput::Text {
+        text: s.to_string(),
+    }]
+}
 
 /// One paced SSE `data:` frame from a JSON payload value.
 fn frame(payload: serde_json::Value) -> String {
@@ -113,7 +119,7 @@ async fn streaming_turn_live_edits_typing_and_finalizes() {
         CHAT_ID,
         SESSION,
         model,
-        "hi",
+        text_parts("hi"),
         Verbosity::Normal,
         timing,
     )
@@ -196,7 +202,7 @@ async fn leading_whitespace_delta_does_not_trigger_empty_send() {
         CHAT_ID,
         SESSION,
         model,
-        "hi",
+        text_parts("hi"),
         Verbosity::Normal,
         StreamTiming {
             flush_interval: Duration::from_millis(10),
@@ -246,7 +252,7 @@ async fn streaming_turn_with_no_stream_still_posts_final_reply() {
         CHAT_ID,
         SESSION,
         model,
-        "ping",
+        text_parts("ping"),
         Verbosity::Normal,
         StreamTiming {
             flush_interval: Duration::from_millis(10),
