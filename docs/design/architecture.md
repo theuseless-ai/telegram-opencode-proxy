@@ -242,6 +242,16 @@ flight is queued. `/stop` maps to `POST /session/:id/abort` for explicit interru
   prompt. Outbound → `outbox.rs` fires → `files.rs` sends. `/get <path>` guarded
   by canonicalize-within-workdir.
 
+  > **Constraint — the outbox watcher and `/get` assume the proxy and the slot's
+  > opencode share a filesystem** (same host, or a bind-mounted `workdir`): both
+  > read files by local path, so the proxy's `slot.workdir` must be the very
+  > directory opencode reads/writes. The prompt/stream path is HTTP and
+  > host-independent, but these disk conventions are not. A future *file-server*
+  > evolution (the proxy exposes HTTP upload/download — see the v0.1.0 backlog)
+  > lifts this by trading the filesystem coupling for a network one. The inbound
+  > `FilePart` path stays host-independent regardless (base64 over HTTP), so it is
+  > the required path whenever the two do not share a filesystem.
+
 ---
 
 ## 8. Build order (each shippable)

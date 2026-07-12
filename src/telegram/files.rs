@@ -4,7 +4,14 @@
 //!
 //! #11 implements the **inbound** half: [`inbound_parts`] turns a media message
 //! into the prompt parts for a turn — the file as a base64 data-URI
-//! [`PartInput::File`], plus any caption as text. Outbound (#12) is still ahead.
+//! [`PartInput::File`], plus any caption as text.
+//!
+//! #12 implements the **outbound** half: [`send_outbound_file`] uploads a local
+//! file to a user (photo for images, document otherwise), and
+//! [`resolve_within_workdir`] is the canonicalize-guard that keeps `/get` and the
+//! outbox watcher from ever reading outside a slot's workdir.
+
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -12,7 +19,7 @@ use base64::engine::general_purpose::STANDARD;
 use futures_util::StreamExt;
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{FileId, Message};
+use teloxide::types::{ChatAction, ChatId, FileId, InputFile, Message};
 
 use crate::opencode::types::PartInput;
 
@@ -143,6 +150,69 @@ fn data_uri(mime: &str, bytes: &[u8]) -> String {
     format!("data:{mime};base64,{}", STANDARD.encode(bytes))
 }
 
+/// Send a local file to `chat_id` (#12): an image MIME goes as a **photo**,
+/// everything else as a **document**. A matching `upload_*` chat action is fired
+/// first so the client shows "sending a file…" while the upload runs (§13). The
+/// MIME is inferred from the extension via [`resolve_mime`] — Telegram picks the
+/// same rendering off the filename, so this only drives the photo/document split.
+pub async fn send_outbound_file(bot: &Bot, chat_id: ChatId, path: &Path) -> Result<()> {
+    let filename = path.file_name().and_then(|n| n.to_str());
+    let mime = resolve_mime(None, filename);
+    let is_image = mime.starts_with("image/");
+
+    // Liveness only — a failed chat action must not sink the send (§13).
+    let action = if is_image {
+        ChatAction::UploadPhoto
+    } else {
+        ChatAction::UploadDocument
+    };
+    let _ = bot.send_chat_action(chat_id, action).await;
+
+    let file = InputFile::file(path);
+    if is_image {
+        bot.send_photo(chat_id, file)
+            .await
+            .with_context(|| format!("send_photo {}", path.display()))?;
+    } else {
+        bot.send_document(chat_id, file)
+            .await
+            .with_context(|| format!("send_document {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Resolve a user-supplied `requested` path against a slot's `workdir` and prove
+/// it stays **inside** that workdir (#12). This is the guard for `/get`: it
+/// canonicalizes both the workdir and the target (following symlinks, collapsing
+/// `..`) and rejects anything that escapes — a `../` traversal, an absolute path
+/// elsewhere, or a symlink pointing out. The target must exist (it's about to be
+/// read and sent), so a missing file is an error too.
+pub fn resolve_within_workdir(workdir: &Path, requested: &str) -> Result<PathBuf> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        bail!("no path given");
+    }
+    let root = workdir
+        .canonicalize()
+        .with_context(|| format!("workdir {} is not accessible", workdir.display()))?;
+    // An absolute request is taken as-is; a relative one hangs off the workdir.
+    let joined = if Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        root.join(requested)
+    };
+    let target = joined
+        .canonicalize()
+        .with_context(|| format!("no such file: {requested}"))?;
+    if !target.starts_with(&root) {
+        bail!("path escapes the workdir: {requested}");
+    }
+    if !target.is_file() {
+        bail!("not a file: {requested}");
+    }
+    Ok(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +272,46 @@ mod tests {
             "application/octet-stream"
         );
         assert_eq!(resolve_mime(None, None), "application/octet-stream");
+    }
+
+    /// The within-workdir guard (#12): a plain relative file resolves, while a
+    /// `../` escape, an absolute path outside, and a missing file are all rejected.
+    #[test]
+    fn resolve_within_workdir_allows_inside_and_rejects_escapes() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let workdir = root.path().join("wd");
+        std::fs::create_dir(&workdir).expect("mkdir wd");
+        // A file inside the workdir (and one in a subdir) resolves.
+        std::fs::write(workdir.join("report.txt"), b"hi").expect("write");
+        std::fs::create_dir(workdir.join("sub")).expect("mkdir sub");
+        std::fs::write(workdir.join("sub/nested.md"), b"x").expect("write nested");
+        // A secret sibling OUTSIDE the workdir the guard must never hand back.
+        std::fs::write(root.path().join("secret.txt"), b"nope").expect("write secret");
+
+        assert!(resolve_within_workdir(&workdir, "report.txt").is_ok());
+        assert!(resolve_within_workdir(&workdir, "sub/nested.md").is_ok());
+
+        // `..` traversal out of the workdir → rejected.
+        let esc = resolve_within_workdir(&workdir, "../secret.txt").unwrap_err();
+        assert!(esc.to_string().contains("escape"), "{esc}");
+        // An absolute path elsewhere → rejected.
+        let abs = root.path().join("secret.txt");
+        let abs = resolve_within_workdir(&workdir, abs.to_str().unwrap()).unwrap_err();
+        assert!(abs.to_string().contains("escape"), "{abs}");
+        // A missing file → rejected (nothing to send).
+        assert!(resolve_within_workdir(&workdir, "ghost.txt").is_err());
+        // An empty request → rejected.
+        assert!(resolve_within_workdir(&workdir, "   ").is_err());
+    }
+
+    /// A directory (not a file) inside the workdir is rejected — `/get` only
+    /// sends files.
+    #[test]
+    fn resolve_within_workdir_rejects_a_directory() {
+        let workdir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(workdir.path().join("outbox")).expect("mkdir");
+        let err = resolve_within_workdir(workdir.path(), "outbox").unwrap_err();
+        assert!(err.to_string().contains("not a file"), "{err}");
     }
 
     #[test]
