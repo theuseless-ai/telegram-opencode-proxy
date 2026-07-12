@@ -4,3 +4,4 @@
 pub mod bot;
 pub mod files;
 pub mod render;
+pub mod stream;

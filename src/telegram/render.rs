@@ -1,12 +1,119 @@
 //! opencode output → Telegram: 4096-char chunking, ≤1/sec stream-edit throttle,
-//! `typing` liveness, flat tool-status line, summary footer.
+//! `typing` liveness, flat tool-status line.
 //! See `docs/design/architecture.md` §13. Issues #6/#8.
 //!
-//! Only [`split_message`] (the blocking-reply chunker) lands in #6; the
-//! stream-edit throttle and status line land with SSE streaming (#7/#8).
+//! [`split_message`] (the blocking-reply chunker) landed in #6. [`LiveState`] is
+//! the B2 streaming render machine (#8): a pure state accumulator the streaming
+//! turn driver (`telegram::stream`) feeds opencode events into, asking it what a
+//! single Telegram message should currently show. It does **no** I/O — the driver
+//! owns the throttle ticker and the `editMessageText` calls — so the layout and
+//! coalescing logic are unit-testable without a `Bot`.
+
+use crate::opencode::events::{PartKind, ToolStatus};
 
 /// Telegram's hard per-message limit (characters).
 pub const TELEGRAM_LIMIT: usize = 4096;
+
+/// The streaming render state for one turn (Option A: answer-first, transient
+/// tool line, failures always shown).
+///
+/// The driver pushes text deltas and tool-part updates in; [`render`](Self::render)
+/// returns the text the live Telegram message should show **right now**:
+///
+/// - before any answer text, the current tool activity (`⚙️ bash`);
+/// - once the answer streams, the answer itself;
+/// - tool failures are appended and kept at every stage (`✗ bash: …`).
+///
+/// The driver edits the message on a ≤1/sec ticker and only when [`render`] has
+/// changed, so this type carries no timing — just the content.
+#[derive(Debug, Default, Clone)]
+pub struct LiveState {
+    /// Accumulated visible answer text (concatenated `text` deltas).
+    answer: String,
+    /// The current in-flight tool, shown while there is no answer text yet.
+    active_tool: Option<String>,
+    /// Tool failures, shown at every stage and preserved into the final render.
+    failures: Vec<String>,
+}
+
+impl LiveState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a streamed text chunk to the answer buffer. A non-empty answer
+    /// supersedes the transient tool line in [`render`].
+    pub fn push_text(&mut self, delta: &str) {
+        self.answer.push_str(delta);
+    }
+
+    /// Apply a `message.part.updated` tool lifecycle: set/clear the active-tool
+    /// line and record failures (kept visible at every verbosity, §13). Non-tool
+    /// parts are ignored here — text arrives via [`push_text`].
+    pub fn apply_part(&mut self, kind: &PartKind) {
+        if let PartKind::Tool { name, status, .. } = kind {
+            match status {
+                ToolStatus::Pending | ToolStatus::Running => {
+                    self.active_tool = Some(name.clone());
+                }
+                ToolStatus::Completed => {
+                    self.active_tool = None;
+                }
+                ToolStatus::Error => {
+                    self.active_tool = None;
+                    let line = format!("✗ {name}: failed");
+                    if !self.failures.contains(&line) {
+                        self.failures.push(line);
+                    }
+                }
+                ToolStatus::Other(_) => {}
+            }
+        }
+    }
+
+    /// Whether any visible content exists yet (answer, a tool line, or a
+    /// failure) — the driver uses this to defer creating the Telegram message
+    /// until there is something to show.
+    pub fn has_content(&self) -> bool {
+        !self.answer.is_empty() || self.active_tool.is_some() || !self.failures.is_empty()
+    }
+
+    /// The full text the live message should show now — answer (or the transient
+    /// tool line before any answer) plus any failure lines. May exceed
+    /// [`TELEGRAM_LIMIT`]; the driver clamps to the first chunk via
+    /// [`split_message`] while streaming and chunks the rest on finalize.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        if self.answer.is_empty() {
+            if let Some(tool) = &self.active_tool {
+                out.push_str("⚙️ ");
+                out.push_str(tool);
+            }
+        } else {
+            out.push_str(&self.answer);
+        }
+        for failure in &self.failures {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(failure);
+        }
+        out
+    }
+
+    /// The authoritative answer text (no tool decoration) for the final render,
+    /// with failures appended so a blocked command is never silently dropped.
+    pub fn finalize(&self, authoritative: &str) -> String {
+        let mut out = authoritative.to_string();
+        for failure in &self.failures {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(failure);
+        }
+        out
+    }
+}
 
 /// Split `text` into pieces of at most `limit` characters, cutting only on
 /// character boundaries (never mid-multibyte-char).
@@ -110,5 +217,67 @@ mod tests {
             // but assert the round-trip to be explicit.
         }
         assert_eq!(out.concat(), text);
+    }
+
+    fn tool(name: &str, status: ToolStatus) -> PartKind {
+        PartKind::Tool {
+            name: name.to_string(),
+            call_id: "call_x".to_string(),
+            status,
+        }
+    }
+
+    #[test]
+    fn live_state_shows_tool_line_before_any_answer() {
+        let mut s = LiveState::new();
+        assert!(!s.has_content());
+        s.apply_part(&tool("bash", ToolStatus::Running));
+        assert!(s.has_content());
+        assert_eq!(s.render(), "⚙️ bash");
+    }
+
+    #[test]
+    fn live_state_answer_supersedes_tool_line() {
+        let mut s = LiveState::new();
+        s.apply_part(&tool("bash", ToolStatus::Running));
+        s.push_text("The output ");
+        s.push_text("is hi.");
+        // Once answer text exists, the transient tool line is gone.
+        assert_eq!(s.render(), "The output is hi.");
+    }
+
+    #[test]
+    fn live_state_completed_tool_clears_line() {
+        let mut s = LiveState::new();
+        s.apply_part(&tool("bash", ToolStatus::Pending));
+        assert_eq!(s.render(), "⚙️ bash");
+        s.apply_part(&tool("bash", ToolStatus::Completed));
+        // No answer, no active tool → nothing to show yet.
+        assert!(!s.has_content());
+        assert_eq!(s.render(), "");
+    }
+
+    #[test]
+    fn live_state_failures_always_shown() {
+        let mut s = LiveState::new();
+        s.apply_part(&tool("bash", ToolStatus::Error));
+        // A failure surfaces even with no answer text.
+        assert_eq!(s.render(), "✗ bash: failed");
+        s.push_text("The command was blocked.");
+        assert_eq!(s.render(), "The command was blocked.\n✗ bash: failed");
+        // Dedup: the same failure is not repeated.
+        s.apply_part(&tool("bash", ToolStatus::Error));
+        assert_eq!(s.render().matches("✗ bash").count(), 1);
+    }
+
+    #[test]
+    fn live_state_finalize_appends_failures_to_authoritative_text() {
+        let mut s = LiveState::new();
+        s.push_text("partial…"); // streamed buffer is ignored by finalize
+        s.apply_part(&tool("bash", ToolStatus::Error));
+        assert_eq!(
+            s.finalize("The full answer."),
+            "The full answer.\n✗ bash: failed"
+        );
     }
 }

@@ -30,7 +30,7 @@ use crate::pairing;
 use crate::persistence::Db;
 use crate::session;
 use crate::state::SlotConn;
-use crate::telegram::render::{self, TELEGRAM_LIMIT};
+use crate::telegram::stream;
 
 /// Readiness budget for the interactive `proxy connect` bring-up — short so the
 /// command fails fast on an unreachable slot (unlike the 60 s startup budget).
@@ -448,22 +448,9 @@ pub async fn handle_text(bot: Bot, msg: Message, state: Arc<AppState>) -> Respon
         return Ok(());
     };
 
-    match run_turn(&state, &slot, chat_id, text).await {
-        Ok(reply) => {
-            let chunks = render::split_message(&reply, TELEGRAM_LIMIT);
-            if chunks.is_empty() {
-                bot.send_message(msg.chat.id, "(opencode returned no text)")
-                    .await?;
-            } else {
-                for chunk in chunks {
-                    bot.send_message(msg.chat.id, chunk).await?;
-                }
-            }
-        }
-        Err(err) => {
-            tracing::error!(chat_id, slot = %slot.name, error = %err, "turn failed");
-            bot.send_message(msg.chat.id, ERROR_REPLY).await?;
-        }
+    if let Err(err) = run_turn(&bot, &state, &slot, chat_id, text).await {
+        tracing::error!(chat_id, slot = %slot.name, error = %err, "turn failed");
+        bot.send_message(msg.chat.id, ERROR_REPLY).await?;
     }
     Ok(())
 }
@@ -513,14 +500,17 @@ async fn handle_unauthorized(
     Ok(())
 }
 
-/// One blocking turn: resolve/create the session for `chat_id`, send the prompt,
-/// return the assistant's visible text. Errors bubble up as `anyhow::Error`.
+/// One streaming turn: resolve/create the session for `chat_id`, then hand off
+/// to [`stream::run_streaming_turn`], which fires the blocking prompt and renders
+/// live (deltas → throttled edits, `typing` liveness, tool status) until the
+/// assistant message is finalized. Errors bubble up as `anyhow::Error`.
 async fn run_turn(
+    bot: &Bot,
     state: &AppState,
     slot: &Slot,
     chat_id: i64,
     text: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<()> {
     // Clone the client out of the registry under a short read lock; the guard is
     // dropped inside `client_for` before any await below.
     let client = state
@@ -539,8 +529,18 @@ async fn run_turn(
     // Persist the resolved id so it survives a restart (and a possible recreate).
     state.db.set_session(chat_id, &session_id)?;
 
-    let reply = client
-        .prompt(&session_id, PromptModel::from(&state.cfg.model), text)
-        .await?;
-    Ok(reply.text())
+    // A short-lived HTTP client for this turn's `/global/event` subscription.
+    let http = reqwest::Client::new();
+    stream::run_streaming_turn(
+        bot,
+        &http,
+        &client,
+        &slot.opencode_url,
+        chat_id,
+        &session_id,
+        PromptModel::from(&state.cfg.model),
+        text,
+        stream::StreamTiming::default(),
+    )
+    .await
 }
