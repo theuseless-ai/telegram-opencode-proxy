@@ -43,7 +43,7 @@ const SLOT_ID: i64 = 111;
 /// Build a single-slot config pointing at `opencode_url`, bound to `SLOT_ID`.
 fn config_for(opencode_url: &str) -> Config {
     Config {
-        bot_token: "12345:test-token".to_string(),
+        bot_token: "12345:test-token".into(),
         admin_socket: "/tmp/mock-admin.sock".into(),
         slots: vec![Slot {
             name: "you".to_string(),
