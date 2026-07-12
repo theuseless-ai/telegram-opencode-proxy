@@ -31,13 +31,20 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use std::time::Duration;
+
 use axum::Json;
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, body::Bytes};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
+
+/// Paced SSE frames `(frames, gap_ms)` for `GET /global/event` (#8 streaming).
+type EventFrames = Arc<Mutex<Option<(Vec<String>, u64)>>>;
 
 /// Shared mutable state behind the mock's handlers.
 #[derive(Clone)]
@@ -63,6 +70,13 @@ struct OcState {
     event_connections: Arc<AtomicU64>,
     /// Canned body for `GET /session/:id/message` (backfill, #7); `None` → `[]`.
     message_list: Arc<Mutex<Option<String>>>,
+    /// Paced SSE frames `(frames, gap_ms)` served by `GET /global/event` — each
+    /// frame is flushed after `gap_ms`, so the stream trickles like a live turn
+    /// (#8). Takes precedence over `event_body` when set.
+    event_frames: EventFrames,
+    /// Delay (ms) before `POST /session/:id/message` returns, so the paced SSE
+    /// stream and its throttled edits happen before the blocking turn resolves.
+    message_delay_ms: Arc<AtomicU64>,
 }
 
 /// A running in-process mock opencode instance. Dropping it leaves the spawned
@@ -74,6 +88,8 @@ pub struct MockOpencode {
     event_body: Arc<Mutex<Option<String>>>,
     event_connections: Arc<AtomicU64>,
     message_list: Arc<Mutex<Option<String>>>,
+    event_frames: EventFrames,
+    message_delay_ms: Arc<AtomicU64>,
 }
 
 impl MockOpencode {
@@ -129,11 +145,30 @@ impl MockOpencode {
         self.event_connections.load(Ordering::SeqCst)
     }
 
+    /// Serve `frames` on `GET /global/event`, flushing one every `gap`, so the
+    /// SSE stream trickles like a live turn (#8 streaming render). Each frame
+    /// should be a complete `data: {…}\n\n` block.
+    #[allow(dead_code)]
+    pub fn set_event_frames(&self, frames: Vec<String>, gap: Duration) {
+        *self.event_frames.lock().expect("mock_opencode frames lock") =
+            Some((frames, gap.as_millis() as u64));
+    }
+
+    /// Delay every `POST /session/:id/message` by `delay` before it returns, so
+    /// a paced event stream and its throttled edits complete first (#8).
+    #[allow(dead_code)]
+    pub fn set_message_delay(&self, delay: Duration) {
+        self.message_delay_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+
     async fn start_inner(include_model: bool, config_fails: u64) -> Self {
         let reply: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let event_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let event_connections = Arc::new(AtomicU64::new(0));
         let message_list: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let event_frames: EventFrames = Arc::new(Mutex::new(None));
+        let message_delay_ms = Arc::new(AtomicU64::new(0));
         let state = OcState {
             include_model,
             reply: Arc::clone(&reply),
@@ -143,6 +178,8 @@ impl MockOpencode {
             event_body: Arc::clone(&event_body),
             event_connections: Arc::clone(&event_connections),
             message_list: Arc::clone(&message_list),
+            event_frames: Arc::clone(&event_frames),
+            message_delay_ms: Arc::clone(&message_delay_ms),
         };
 
         let app = Router::new()
@@ -171,6 +208,8 @@ impl MockOpencode {
             event_body,
             event_connections,
             message_list,
+            event_frames,
+            message_delay_ms,
         }
     }
 }
@@ -246,6 +285,14 @@ async fn message(
     Path(id): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
+    // Hold the blocking turn open so a paced event stream (and its throttled
+    // edits) can play out first — mirrors a real turn where deltas precede the
+    // completed message (#8).
+    let delay = st.message_delay_ms.load(Ordering::SeqCst);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+
     let req: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
     let prompt = req["parts"]
         .as_array()
@@ -264,15 +311,38 @@ async fn message(
     }))
 }
 
-/// `GET /global/event` — SSE stub. Serves the [`set_event_stream`] body (or a
-/// minimal `server.connected`-only frame), then the response ends and the
-/// connection closes, so a reconnecting client re-fetches it. Each accepted
-/// connection bumps [`event_connections`], so a test can assert the reconnect.
+/// `GET /global/event` — SSE stub. With [`set_event_frames`] it trickles frames
+/// one per gap (a live-turn stream, #8); otherwise it serves the
+/// [`set_event_stream`] body (or a minimal `server.connected` frame) in one shot.
+/// Either way the response then ends and the connection closes, so a reconnecting
+/// client re-fetches it. Each accepted connection bumps [`event_connections`].
 ///
+/// [`set_event_frames`]: MockOpencode::set_event_frames
 /// [`set_event_stream`]: MockOpencode::set_event_stream
 /// [`event_connections`]: MockOpencode::event_connections
 async fn global_event(State(st): State<OcState>) -> Response {
     st.event_connections.fetch_add(1, Ordering::SeqCst);
+
+    // Paced stream: yield one frame per `gap` so the client renders incrementally.
+    if let Some((frames, gap_ms)) = st
+        .event_frames
+        .lock()
+        .expect("mock_opencode frames lock")
+        .clone()
+    {
+        let stream = futures_util::stream::iter(frames).then(move |frame| async move {
+            if gap_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+            }
+            Ok::<Bytes, std::io::Error>(Bytes::from(frame))
+        });
+        return (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            Body::from_stream(stream),
+        )
+            .into_response();
+    }
+
     let body = st
         .event_body
         .lock()

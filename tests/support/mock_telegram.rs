@@ -24,6 +24,11 @@
 //! - `GetUpdates` → drains test-injected updates once, then `[]`.
 //! - `SendMessage` → **records** `{chat_id, text}` (assertable via
 //!   [`MockTelegram::sent_messages`]) and returns a valid `Message`.
+//! - `EditMessageText` → **records** `{chat_id, message_id, text}` (assertable
+//!   via [`MockTelegram::edits`]) and returns the edited `Message` — the live
+//!   streaming path (#8).
+//! - `SendChatAction` → **records** the action string (assertable via
+//!   [`MockTelegram::chat_actions`]) and returns `true` — the `typing` liveness.
 //! - anything else → `true` (harmless default).
 //!
 //! [`Me`]: https://core.telegram.org/bots/api#getme
@@ -45,10 +50,23 @@ pub struct SentMessage {
     pub text: String,
 }
 
+/// An `editMessageText` call the mock recorded (the live streaming edits, #8).
+/// Read by the streaming test crate; `allow(dead_code)` covers crates that only
+/// assert on `sent_messages`.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct EditMessage {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub text: String,
+}
+
 /// Shared mutable state behind the mock's single catch-all handler.
 #[derive(Clone)]
 struct TgState {
     sent: Arc<Mutex<Vec<SentMessage>>>,
+    edits: Arc<Mutex<Vec<EditMessage>>>,
+    chat_actions: Arc<Mutex<Vec<String>>>,
     updates: Arc<Mutex<VecDeque<Value>>>,
     next_msg_id: Arc<AtomicI64>,
     bot_id: i64,
@@ -59,6 +77,8 @@ pub struct MockTelegram {
     /// Base API URL to hand to `Bot::set_api_url`.
     pub url: String,
     sent: Arc<Mutex<Vec<SentMessage>>>,
+    edits: Arc<Mutex<Vec<EditMessage>>>,
+    chat_actions: Arc<Mutex<Vec<String>>>,
     updates: Arc<Mutex<VecDeque<Value>>>,
 }
 
@@ -66,9 +86,13 @@ impl MockTelegram {
     /// Bind an ephemeral port and start serving.
     pub async fn start() -> Self {
         let sent: Arc<Mutex<Vec<SentMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let edits: Arc<Mutex<Vec<EditMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let chat_actions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let updates: Arc<Mutex<VecDeque<Value>>> = Arc::new(Mutex::new(VecDeque::new()));
         let state = TgState {
             sent: Arc::clone(&sent),
+            edits: Arc::clone(&edits),
+            chat_actions: Arc::clone(&chat_actions),
             updates: Arc::clone(&updates),
             next_msg_id: Arc::new(AtomicI64::new(1)),
             bot_id: 424242,
@@ -89,6 +113,8 @@ impl MockTelegram {
         Self {
             url: format!("http://{addr}"),
             sent,
+            edits,
+            chat_actions,
             updates,
         }
     }
@@ -96,6 +122,21 @@ impl MockTelegram {
     /// Snapshot of every recorded `sendMessage` call, in order.
     pub fn sent_messages(&self) -> Vec<SentMessage> {
         self.sent.lock().expect("mock_telegram sent lock").clone()
+    }
+
+    /// Snapshot of every recorded `editMessageText` call, in order (#8 streaming).
+    #[allow(dead_code)]
+    pub fn edits(&self) -> Vec<EditMessage> {
+        self.edits.lock().expect("mock_telegram edits lock").clone()
+    }
+
+    /// Snapshot of every recorded `sendChatAction` action string (#8 typing).
+    #[allow(dead_code)]
+    pub fn chat_actions(&self) -> Vec<String> {
+        self.chat_actions
+            .lock()
+            .expect("mock_telegram chat_actions lock")
+            .clone()
     }
 
     /// Queue an incoming `Update` JSON to be served by the next `getUpdates`.
@@ -157,6 +198,34 @@ async fn handler(
                 "from": { "id": st.bot_id, "is_bot": true, "first_name": "MockBot" },
                 "text": text
             })
+        }
+        "EditMessageText" => {
+            let chat_id = req["chat_id"].as_i64().unwrap_or_default();
+            let message_id = req["message_id"].as_i64().unwrap_or_default();
+            let text = req["text"].as_str().unwrap_or_default().to_string();
+            st.edits
+                .lock()
+                .expect("mock_telegram edits lock")
+                .push(EditMessage {
+                    chat_id,
+                    message_id,
+                    text: text.clone(),
+                });
+            json!({
+                "message_id": message_id,
+                "date": 0,
+                "chat": { "id": chat_id, "type": "private", "first_name": "Test" },
+                "from": { "id": st.bot_id, "is_bot": true, "first_name": "MockBot" },
+                "text": text
+            })
+        }
+        "SendChatAction" => {
+            let action = req["action"].as_str().unwrap_or_default().to_string();
+            st.chat_actions
+                .lock()
+                .expect("mock_telegram chat_actions lock")
+                .push(action);
+            Value::Bool(true)
         }
         // DeleteWebhook and any other method: a bare `true` result is valid.
         _ => Value::Bool(true),
