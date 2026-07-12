@@ -62,6 +62,13 @@ enum Enqueue {
     Full,
 }
 
+/// A live per-user turn worker: the bounded channel into it, plus its task
+/// handle so [`AppState::shutdown`] can drain it gracefully (#21).
+struct Worker {
+    tx: mpsc::Sender<TurnJob>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
 /// Shared dispatcher state: config, the runtime-mutable slot registry, and the
 /// SQLite-backed `chat_id → session_id` routing store.
 ///
@@ -89,11 +96,12 @@ pub struct AppState {
     /// approval ping (#4b), sent from the admin-socket handler (which has no
     /// `Message` to reply to). `Bot` is `Arc`-backed, so this clone is cheap.
     pub bot: Bot,
-    /// Per-user turn queues (#9): `chat_id → bounded sender` into that user's
-    /// serial [worker](user_worker). A `std::sync::Mutex` — locked only briefly to
-    /// look up / insert a sender, never held across an await. Turns for one user
-    /// run strictly one at a time; a full queue is rejected, not blocked (§6).
-    user_queues: Mutex<HashMap<i64, mpsc::Sender<TurnJob>>>,
+    /// Per-user turn queues (#9): `chat_id → `[`Worker`] (bounded sender + task
+    /// handle) for that user's serial worker. A `std::sync::Mutex` — locked only
+    /// briefly to look up / insert an entry, never held across an await. Turns for
+    /// one user run strictly one at a time; a full queue is rejected, not blocked
+    /// (§6). [`shutdown`](Self::shutdown) drains these on exit (#21).
+    user_queues: Mutex<HashMap<i64, Worker>>,
 }
 
 impl AppState {
@@ -151,7 +159,7 @@ impl AppState {
         // Fast path: a live worker exists. Recover the job if its channel is
         // full (reject) or closed (worker gone — respawn below).
         let job = match queues.get(&chat_id) {
-            Some(tx) => match tx.try_send(job) {
+            Some(worker) => match worker.tx.try_send(job) {
                 Ok(()) => return Enqueue::Queued,
                 Err(mpsc::error::TrySendError::Full(_)) => return Enqueue::Full,
                 Err(mpsc::error::TrySendError::Closed(job)) => {
@@ -166,9 +174,44 @@ impl AppState {
         let (tx, rx) = mpsc::channel(USER_QUEUE_DEPTH);
         // A fresh channel has capacity ≥ 1, so this send cannot fail.
         let _ = tx.try_send(job);
-        queues.insert(chat_id, tx);
-        tokio::spawn(user_worker(Arc::clone(self), bot.clone(), chat_id, rx));
+        let handle = tokio::spawn(user_worker(Arc::clone(self), bot.clone(), chat_id, rx));
+        queues.insert(chat_id, Worker { tx, handle });
         Enqueue::Queued
+    }
+
+    /// Graceful shutdown (#21): stop the turn workers and flush the store.
+    ///
+    /// Dropping every worker's sender closes its channel, so each worker finishes
+    /// its in-flight turn, drains any queued turns, and exits. We then await the
+    /// worker tasks (bounded by `grace`) before checkpointing SQLite. A worker
+    /// that overruns `grace` is left to be killed on process exit — best effort.
+    pub async fn shutdown(&self, grace: Duration) {
+        // Take the workers out under the lock (drops the senders → channels close),
+        // then await their handles outside the lock.
+        let handles: Vec<tokio::task::JoinHandle<()>> = {
+            let mut queues = self
+                .user_queues
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            queues.drain().map(|(_, worker)| worker.handle).collect()
+        };
+
+        if !handles.is_empty() {
+            tracing::info!(
+                workers = handles.len(),
+                grace_secs = grace.as_secs(),
+                "draining in-flight turns"
+            );
+            let drain = futures_util::future::join_all(handles);
+            if tokio::time::timeout(grace, drain).await.is_err() {
+                tracing::warn!("shutdown grace elapsed — some turns did not finish");
+            }
+        }
+
+        // Flush the WAL into the main DB file (best-effort).
+        if let Err(err) = self.db.checkpoint() {
+            tracing::warn!(error = %err, "WAL checkpoint on shutdown failed");
+        }
     }
 
     /// The names of every live slot in the registry (short read guard, dropped
@@ -451,13 +494,16 @@ enum Command {
 /// Friendly message shown to the user when a turn fails; details go to the log.
 const ERROR_REPLY: &str = "⚠️ Sorry — I couldn't reach opencode to answer that. Please try again.";
 
-/// Run the long-poll dispatcher until Ctrl-C. `bot` and `state` are injected as
-/// handler dependencies.
+/// Run the long-poll dispatcher until a shutdown signal. Returns when the
+/// dispatcher has stopped polling (SIGINT via the built-in Ctrl-C handler, or
+/// SIGTERM via [`shutdown_on_sigterm`]); the caller then drains workers and
+/// flushes the store ([`AppState::shutdown`], #21). `bot` and `state` are
+/// injected as handler dependencies.
 pub async fn run(bot: Bot, state: Arc<AppState>) {
-    // Advertise exactly the bot's own commands (just `/whoami`). This replaces
-    // any stale menu previously registered via @BotFather, keeping Telegram's
-    // "/" command list in sync with the code. Best-effort — a failure here must
-    // not stop the dispatcher.
+    // Advertise exactly the bot's own commands (`/whoami`, `/stop`). This
+    // replaces any stale menu previously registered via @BotFather, keeping
+    // Telegram's "/" command list in sync with the code. Best-effort — a failure
+    // here must not stop the dispatcher.
     if let Err(err) = bot.set_my_commands(Command::bot_commands()).await {
         tracing::warn!(error = %err, "could not set the bot command menu");
     }
@@ -466,13 +512,37 @@ pub async fn run(bot: Bot, state: Arc<AppState>) {
         .branch(teloxide::filter_command::<Command, _>().endpoint(handle_command))
         .branch(dptree::endpoint(handle_text));
 
-    Dispatcher::builder(bot, handler)
+    let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])
-        .enable_ctrlc_handler()
-        .build()
-        .dispatch()
-        .await;
+        .enable_ctrlc_handler() // SIGINT / Ctrl-C
+        .build();
+
+    // Also stop gracefully on SIGTERM (e.g. `systemctl stop`), by triggering the
+    // same dispatcher shutdown the Ctrl-C handler uses.
+    shutdown_on_sigterm(dispatcher.shutdown_token());
+
+    dispatcher.dispatch().await;
 }
+
+/// Spawn a task that triggers the dispatcher's graceful shutdown on the first
+/// `SIGTERM`. Unix-only; on other targets it's a no-op (Ctrl-C still applies).
+#[cfg(unix)]
+fn shutdown_on_sigterm(token: teloxide::dispatching::ShutdownToken) {
+    tokio::spawn(async move {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+                tracing::info!("received SIGTERM — shutting down");
+                // Errors only if already idle/shutting down — nothing to do then.
+                let _ = token.shutdown();
+            }
+            Err(err) => tracing::warn!(error = %err, "could not install SIGTERM handler"),
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn shutdown_on_sigterm(_token: teloxide::dispatching::ShutdownToken) {}
 
 /// Handle a slash command. `/whoami` is deliberately NOT gated by auth — an
 /// unwhitelisted user needs their chat id to get whitelisted. `/stop` resolves

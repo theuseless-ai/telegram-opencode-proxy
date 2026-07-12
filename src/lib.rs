@@ -30,6 +30,11 @@ use opencode::client::{self, OpencodeClient};
 use opencode::health;
 use state::SlotConn;
 
+/// How long graceful shutdown waits for in-flight turns to finish before giving
+/// up (#21). Generous — a turn can span a full model generation — but well under
+/// systemd's default `TimeoutStopSec` (90s).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
 /// Bring up the daemon: for each slot, connect to its (externally-managed)
 /// opencode instance, wait until it's reachable, validate the configured
 /// provider/model against its live catalogue, build a client — then run the
@@ -86,12 +91,16 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     });
 
-    tracing::info!("starting Telegram long-poll dispatcher (Ctrl-C to stop)");
-    telegram::bot::run(bot, state).await;
-    tracing::info!("dispatcher stopped — shutting down");
-    admin_task.abort();
+    tracing::info!("starting Telegram long-poll dispatcher (Ctrl-C / SIGTERM to stop)");
+    telegram::bot::run(bot, state.clone()).await;
+    tracing::info!("dispatcher stopped — shutting down gracefully");
 
-    // Best-effort unlink so a restart binds cleanly (and no stale socket lingers).
+    // Graceful shutdown (#21): let in-flight per-user turns finish (bounded),
+    // then flush SQLite. Connect-only, so there are no opencode children to reap.
+    state.shutdown(SHUTDOWN_GRACE).await;
+
+    // Stop the admin socket task and unlink the socket so a restart binds cleanly.
+    admin_task.abort();
     match std::fs::remove_file(&admin_socket) {
         Ok(()) => tracing::debug!(socket = %admin_socket.display(), "removed admin socket"),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -100,8 +109,7 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     }
 
-    // TODO(#N2): clean shutdown — drain in-flight turns, close SSE/HTTP, flush
-    // SQLite. No opencode children to reap (connect-only).
+    tracing::info!("shutdown complete");
     Ok(())
 }
 
