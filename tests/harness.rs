@@ -31,7 +31,7 @@ use teloxide::types::Message;
 use telegram_opencode_proxy::admin::{self, AdminRequest, AdminResponse, AdminState};
 use telegram_opencode_proxy::config::{Config, Model, Pairing, Permissions, Slot};
 use telegram_opencode_proxy::persistence::Db;
-use telegram_opencode_proxy::telegram::bot::{AppState, handle_text};
+use telegram_opencode_proxy::telegram::bot::{AppState, handle_stop, handle_text};
 use telegram_opencode_proxy::{connect_slots, spawn_slot_bringup};
 
 use support::mock_opencode::MockOpencode;
@@ -108,11 +108,27 @@ async fn authorized_text_relays_model_reply() {
         .await
         .expect("handle_text succeeds");
 
+    // The reply is produced by the user's serial worker (#9), so await it.
+    let got = wait_for(
+        || {
+            tg.sent_messages()
+                .iter()
+                .any(|m| m.text == "echo: hello there")
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        got,
+        "expected the model reply, got {:?}",
+        tg.sent_messages()
+    );
     let sent = tg.sent_messages();
-    assert_eq!(sent.len(), 1, "exactly one reply expected, got {sent:?}");
-    assert_eq!(sent[0].chat_id, SLOT_ID);
-    // The mock echoes the prompt, so the reply must carry the prompt text.
-    assert_eq!(sent[0].text, "echo: hello there");
+    let reply = sent
+        .iter()
+        .find(|m| m.text == "echo: hello there")
+        .expect("reply present");
+    assert_eq!(reply.chat_id, SLOT_ID);
 }
 
 /// 2. Unauthorized sender → a single "Not authorized…" reply, no opencode turn.
@@ -152,6 +168,16 @@ async fn long_reply_is_split_into_chunks() {
         .await
         .expect("handle_text succeeds");
 
+    // Await all chunks (sent by the worker's finalize step).
+    let total_chars = || {
+        tg.sent_messages()
+            .iter()
+            .map(|m| m.text.chars().count())
+            .sum::<usize>()
+    };
+    let done = wait_for(|| total_chars() == 9000, Duration::from_secs(5)).await;
+    assert!(done, "full reply must arrive, got {} chars", total_chars());
+
     let sent = tg.sent_messages();
     assert!(
         sent.len() > 1,
@@ -166,8 +192,6 @@ async fn long_reply_is_split_into_chunks() {
             chunk.text.chars().count()
         );
     }
-    let total: usize = sent.iter().map(|m| m.text.chars().count()).sum();
-    assert_eq!(total, 9000, "chunks must reconstruct the full reply length");
 }
 
 /// 4. A slot that fails bring-up (here: model absent from the catalogue) is
@@ -329,7 +353,7 @@ async fn pairing_round_trip_issues_approves_notifies_and_authorizes() {
     }
     server.abort();
 
-    // 4. The same sender is now authorized → routes to opencode.
+    // 4. The same sender is now authorized → routes to opencode (via the worker).
     handle_text(
         bot.clone(),
         text_message(stranger, "hello there"),
@@ -337,10 +361,20 @@ async fn pairing_round_trip_issues_approves_notifies_and_authorizes() {
     )
     .await
     .expect("handle_text succeeds");
-    let sent = tg.sent_messages();
-    let last = sent.last().expect("at least one message");
-    assert_eq!(last.chat_id, stranger);
-    assert_eq!(last.text, "echo: hello there");
+    let routed = wait_for(
+        || {
+            tg.sent_messages()
+                .iter()
+                .any(|m| m.chat_id == stranger && m.text == "echo: hello there")
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        routed,
+        "authorized turn should route to opencode, got {:?}",
+        tg.sent_messages()
+    );
 }
 
 /// `pair approve` rejects an unknown code and an expired code with clear errors.
@@ -510,5 +544,144 @@ async fn dead_slot_bringup_does_not_block_or_populate() {
     assert!(
         state.registry.read().expect("registry lock").is_empty(),
         "an unreachable slot must not populate the registry"
+    );
+}
+
+// --- B3 per-user serialization + /stop (#9) -----------------------------------
+
+/// Two messages from one user run through the same serial worker: both complete,
+/// and in FIFO order (never interleaved).
+#[tokio::test]
+async fn same_user_turns_are_serialized_in_order() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let state = state_for(config_for(&oc.url)).await;
+    let bot = bot_pointed_at(&tg);
+
+    handle_text(bot.clone(), text_message(SLOT_ID, "one"), state.clone())
+        .await
+        .expect("enqueue one");
+    handle_text(bot.clone(), text_message(SLOT_ID, "two"), state.clone())
+        .await
+        .expect("enqueue two");
+
+    let both = wait_for(
+        || {
+            tg.sent_messages()
+                .iter()
+                .filter(|m| m.text.starts_with("echo:"))
+                .count()
+                >= 2
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        both,
+        "both turns should complete, got {:?}",
+        tg.sent_messages()
+    );
+
+    let echoes: Vec<String> = tg
+        .sent_messages()
+        .into_iter()
+        .map(|m| m.text)
+        .filter(|t| t.starts_with("echo:"))
+        .collect();
+    assert_eq!(
+        echoes,
+        vec!["echo: one".to_string(), "echo: two".to_string()],
+        "turns must run in FIFO order, not interleaved"
+    );
+}
+
+/// When a user's bounded queue is full (worker stuck on a slow turn), further
+/// messages are rejected with a busy reply — the dispatcher is never blocked.
+#[tokio::test]
+async fn a_full_queue_rejects_with_a_busy_message() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    // Hold the in-flight turn open so the queue stays full while we pile on.
+    oc.set_message_delay(Duration::from_secs(3));
+    let state = state_for(config_for(&oc.url)).await;
+    let bot = bot_pointed_at(&tg);
+
+    // Far more than the queue depth: the worker is stuck on the first turn, so
+    // the queue fills and the overflow is rejected synchronously by handle_text.
+    for i in 0..20 {
+        handle_text(
+            bot.clone(),
+            text_message(SLOT_ID, &format!("m{i}")),
+            state.clone(),
+        )
+        .await
+        .expect("handle_text succeeds");
+    }
+
+    let busy = tg
+        .sent_messages()
+        .into_iter()
+        .filter(|m| m.text.contains("still working"))
+        .count();
+    assert!(
+        busy >= 1,
+        "a full queue must reject with a busy reply, got {:?}",
+        tg.sent_messages()
+    );
+}
+
+/// `/stop` with a live session → `POST /session/:id/abort` and a confirmation.
+#[tokio::test]
+async fn stop_aborts_the_users_session() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let state = state_for(config_for(&oc.url)).await;
+    // Give the user a live session for /stop to abort.
+    state
+        .db
+        .set_session(SLOT_ID, "ses_live")
+        .expect("set_session");
+    let bot = bot_pointed_at(&tg);
+
+    handle_stop(bot, text_message(SLOT_ID, "/stop"), state)
+        .await
+        .expect("handle_stop succeeds");
+
+    assert_eq!(
+        oc.aborted_sessions(),
+        vec!["ses_live".to_string()],
+        "the user's session must be aborted"
+    );
+    assert!(
+        tg.sent_messages()
+            .iter()
+            .any(|m| m.chat_id == SLOT_ID && m.text.contains("Stopped")),
+        "expected a stop confirmation, got {:?}",
+        tg.sent_messages()
+    );
+}
+
+/// `/stop` with no session → "Nothing to stop." and no abort call.
+#[tokio::test]
+async fn stop_with_no_session_is_a_no_op() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let state = state_for(config_for(&oc.url)).await;
+    let bot = bot_pointed_at(&tg);
+
+    handle_stop(bot, text_message(SLOT_ID, "/stop"), state)
+        .await
+        .expect("handle_stop succeeds");
+
+    assert!(
+        oc.aborted_sessions().is_empty(),
+        "no session → no abort call"
+    );
+    assert!(
+        tg.sent_messages()
+            .iter()
+            .any(|m| m.text.contains("Nothing to stop")),
+        "expected a nothing-to-stop reply, got {:?}",
+        tg.sent_messages()
     );
 }

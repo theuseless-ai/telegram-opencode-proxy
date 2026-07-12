@@ -10,13 +10,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use teloxide::prelude::*;
 use teloxide::types::ChatId;
 use teloxide::utils::command::BotCommands;
+use tokio::sync::mpsc;
 
 use crate::admin::{
     ApproveInfo, BoxFuture, ConnectOutcome, ConnectParams, PairingEntry, SlotInfo,
@@ -36,6 +37,30 @@ use crate::telegram::stream;
 /// command fails fast on an unreachable slot (unlike the 60 s startup budget).
 const CONNECT_READY_ATTEMPTS: u32 = 5;
 const CONNECT_READY_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Depth of a user's turn queue (#9). Turns run one at a time; up to this many
+/// may wait behind the in-flight one before further messages are rejected with
+/// [`BUSY_REPLY`] (bounded backpressure — the dispatcher never blocks).
+const USER_QUEUE_DEPTH: usize = 8;
+
+/// Reply when a user's turn queue is full (reject-with-message, §6).
+const BUSY_REPLY: &str =
+    "⏳ I'm still working through your messages — please hold on a moment before sending more.";
+
+/// One queued turn for a user's [serial worker](user_worker): the routed slot and
+/// the prompt text. The `chat_id` is fixed per worker, so it isn't carried here.
+struct TurnJob {
+    slot: Slot,
+    text: String,
+}
+
+/// Outcome of [`AppState::enqueue_turn`].
+enum Enqueue {
+    /// Accepted onto the user's queue (a worker was spawned if needed).
+    Queued,
+    /// The user's queue is full — the caller should reply [`BUSY_REPLY`].
+    Full,
+}
 
 /// Shared dispatcher state: config, the runtime-mutable slot registry, and the
 /// SQLite-backed `chat_id → session_id` routing store.
@@ -64,6 +89,11 @@ pub struct AppState {
     /// approval ping (#4b), sent from the admin-socket handler (which has no
     /// `Message` to reply to). `Bot` is `Arc`-backed, so this clone is cheap.
     pub bot: Bot,
+    /// Per-user turn queues (#9): `chat_id → bounded sender` into that user's
+    /// serial [worker](user_worker). A `std::sync::Mutex` — locked only briefly to
+    /// look up / insert a sender, never held across an await. Turns for one user
+    /// run strictly one at a time; a full queue is rejected, not blocked (§6).
+    user_queues: Mutex<HashMap<i64, mpsc::Sender<TurnJob>>>,
 }
 
 impl AppState {
@@ -103,7 +133,42 @@ impl AppState {
             registry: RwLock::new(registry),
             db,
             bot,
+            user_queues: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Enqueue `job` onto `chat_id`'s serial turn worker, spawning the worker on
+    /// first use. Returns [`Enqueue::Full`] when the user's bounded queue is
+    /// full (the dispatcher then rejects with [`BUSY_REPLY`] rather than
+    /// blocking, §6). `bot` is the dispatcher's handle — the worker replies
+    /// through it, so a worker outlives the single update that spawned it.
+    fn enqueue_turn(self: &Arc<Self>, bot: &Bot, chat_id: i64, job: TurnJob) -> Enqueue {
+        let mut queues = self
+            .user_queues
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
+        // Fast path: a live worker exists. Recover the job if its channel is
+        // full (reject) or closed (worker gone — respawn below).
+        let job = match queues.get(&chat_id) {
+            Some(tx) => match tx.try_send(job) {
+                Ok(()) => return Enqueue::Queued,
+                Err(mpsc::error::TrySendError::Full(_)) => return Enqueue::Full,
+                Err(mpsc::error::TrySendError::Closed(job)) => {
+                    queues.remove(&chat_id);
+                    job
+                }
+            },
+            None => job,
+        };
+
+        // No (live) worker — create the channel, seat the first job, and spawn.
+        let (tx, rx) = mpsc::channel(USER_QUEUE_DEPTH);
+        // A fresh channel has capacity ≥ 1, so this send cannot fail.
+        let _ = tx.try_send(job);
+        queues.insert(chat_id, tx);
+        tokio::spawn(user_worker(Arc::clone(self), bot.clone(), chat_id, rx));
+        Enqueue::Queued
     }
 
     /// The names of every live slot in the registry (short read guard, dropped
@@ -372,13 +437,15 @@ impl crate::admin::AdminState for AppState {
     }
 }
 
-/// Bot commands. Kept minimal for #6 — `/whoami` aids bootstrap (the operator
-/// learns their chat id to whitelist). `/new` `/get` `/stop` land later.
+/// Bot commands. `/whoami` aids bootstrap (the operator learns their chat id to
+/// whitelist); `/stop` interrupts the in-flight turn (#9). `/new` `/get` land later.
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
 enum Command {
     /// Show your numeric chat id (use it to whitelist yourself in config.toml).
     Whoami,
+    /// Stop the turn I'm currently working on.
+    Stop,
 }
 
 /// Friendly message shown to the user when a turn fails; details go to the log.
@@ -407,13 +474,77 @@ pub async fn run(bot: Bot, state: Arc<AppState>) {
         .await;
 }
 
-/// Handle `/whoami` (and any future commands). Deliberately NOT gated by auth —
-/// an unwhitelisted user needs their chat id to get whitelisted.
-async fn handle_command(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
+/// Handle a slash command. `/whoami` is deliberately NOT gated by auth — an
+/// unwhitelisted user needs their chat id to get whitelisted. `/stop` resolves
+/// the user's session and aborts its in-flight turn.
+async fn handle_command(
+    bot: Bot,
+    msg: Message,
+    cmd: Command,
+    state: Arc<AppState>,
+) -> ResponseResult<()> {
     match cmd {
         Command::Whoami => {
             let text = format!("Your chat id is `{}`.", msg.chat.id.0);
             bot.send_message(msg.chat.id, text).await?;
+            Ok(())
+        }
+        Command::Stop => handle_stop(bot, msg, state).await,
+    }
+}
+
+/// `/stop` (#9): abort the user's in-flight opencode turn via
+/// `POST /session/:id/abort`, which unblocks its running `prompt`. A sender with
+/// no slot binding or no live session is simply told there's nothing to stop.
+///
+/// `pub` so the harness can drive it directly (like [`handle_text`]).
+pub async fn handle_stop(bot: Bot, msg: Message, state: Arc<AppState>) -> ResponseResult<()> {
+    const NOTHING: &str = "Nothing to stop.";
+    let chat_id = msg.chat.id.0;
+
+    // Resolve the user's slot (short registry snapshot; auth is DB-backed).
+    let slots = state.slot_snapshot();
+    let slot = match auth::resolve(&state.db, &slots, chat_id) {
+        Ok(Some(slot)) => slot,
+        Ok(None) => {
+            bot.send_message(msg.chat.id, NOTHING).await?;
+            return Ok(());
+        }
+        Err(err) => {
+            tracing::error!(chat_id, error = %err, "auth lookup failed on /stop");
+            bot.send_message(msg.chat.id, NOTHING).await?;
+            return Ok(());
+        }
+    };
+
+    // TODO(#13): also reject any permission request this user has pending.
+
+    let session_id = match state.db.get_session(chat_id) {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            bot.send_message(msg.chat.id, NOTHING).await?;
+            return Ok(());
+        }
+        Err(err) => {
+            tracing::error!(chat_id, error = %err, "reading session on /stop");
+            bot.send_message(msg.chat.id, ERROR_REPLY).await?;
+            return Ok(());
+        }
+    };
+
+    let Some(client) = state.client_for(&slot.name) else {
+        bot.send_message(msg.chat.id, NOTHING).await?;
+        return Ok(());
+    };
+
+    match client.abort_session(&session_id).await {
+        Ok(_) => {
+            bot.send_message(msg.chat.id, "🛑 Stopped.").await?;
+        }
+        Err(err) => {
+            tracing::error!(chat_id, session_id, error = %err, "aborting session failed");
+            bot.send_message(msg.chat.id, "⚠️ Couldn't stop the current turn.")
+                .await?;
         }
     }
     Ok(())
@@ -448,11 +579,39 @@ pub async fn handle_text(bot: Bot, msg: Message, state: Arc<AppState>) -> Respon
         return Ok(());
     };
 
-    if let Err(err) = run_turn(&bot, &state, &slot, chat_id, text).await {
-        tracing::error!(chat_id, slot = %slot.name, error = %err, "turn failed");
-        bot.send_message(msg.chat.id, ERROR_REPLY).await?;
+    // Hand the turn to the user's serial worker (#9): turns for one user run one
+    // at a time, and a full queue is rejected here rather than blocking the
+    // dispatcher. The reply is produced by the worker, through `bot`.
+    let job = TurnJob {
+        slot,
+        text: text.to_string(),
+    };
+    match state.enqueue_turn(&bot, chat_id, job) {
+        Enqueue::Queued => {}
+        Enqueue::Full => {
+            bot.send_message(msg.chat.id, BUSY_REPLY).await?;
+        }
     }
     Ok(())
+}
+
+/// A user's serial turn worker (#9): drains the bounded queue, running each turn
+/// to completion before the next so a single user's turns never interleave.
+/// Errors become the friendly [`ERROR_REPLY`] plus a `tracing::error!`; the loop
+/// ends (and the worker is dropped) only if the queue is closed.
+async fn user_worker(
+    state: Arc<AppState>,
+    bot: Bot,
+    chat_id: i64,
+    mut rx: mpsc::Receiver<TurnJob>,
+) {
+    while let Some(job) = rx.recv().await {
+        if let Err(err) = run_turn(&bot, &state, &job.slot, chat_id, &job.text).await {
+            tracing::error!(chat_id, slot = %job.slot.name, error = %err, "turn failed");
+            let _ = bot.send_message(ChatId(chat_id), ERROR_REPLY).await;
+        }
+    }
+    tracing::debug!(chat_id, "user turn worker stopped (queue closed)");
 }
 
 /// The unauthorized branch of [`handle_text`] (#4b): issue a single-use pairing

@@ -158,6 +158,21 @@ impl OpencodeClient {
         }
     }
 
+    /// `POST /session/:id/abort` — interrupt the session's in-flight turn (the
+    /// `/stop` command, #9). Returns opencode's boolean result (`true` = aborted).
+    /// No request body; the blocking `prompt` for that session then unblocks.
+    pub async fn abort_session(&self, session_id: &str) -> Result<bool> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/session/{session_id}/abort")))
+            .send()
+            .await
+            .context("POST /session/:id/abort")?
+            .error_for_status()
+            .context("POST /session/:id/abort returned an error status")?;
+        resp.json::<bool>().await.context("decoding abort response")
+    }
+
     /// `PATCH /session/:id` with a permission ruleset. Used by `session.rs` to
     /// install the deliberate `deny` posture on create (§2.6). #13 will reuse
     /// this to flip rules to `ask` once an interactive responder exists.
