@@ -122,6 +122,9 @@ impl MockTelegram {
 
         let app = Router::new()
             .route("/bot{token}/{method}", any(handler))
+            // File download endpoint teloxide hits after `getFile` (#11): serves
+            // canned bytes for any path.
+            .route("/file/bot{token}/{*path}", any(download_file))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -317,9 +320,27 @@ async fn handler(
                 .push(action);
             Value::Bool(true)
         }
+        "GetFile" => {
+            // Echo the requested file id and point at a downloadable path (#11).
+            let file_id = req["file_id"].as_str().unwrap_or("file").to_string();
+            json!({
+                "file_id": file_id,
+                "file_unique_id": "uniq",
+                "file_size": MOCK_FILE_BYTES.len(),
+                "file_path": "downloads/file.bin"
+            })
+        }
         // DeleteWebhook and any other method: a bare `true` result is valid.
         _ => Value::Bool(true),
     };
 
     Json(json!({ "ok": true, "result": result }))
+}
+
+/// Canned bytes served by the file-download endpoint (#11).
+const MOCK_FILE_BYTES: &[u8] = b"MOCKFILE";
+
+/// `GET /file/bot{token}/{path}` — teloxide's file download; returns fixed bytes.
+async fn download_file(Path((_token, _path)): Path<(String, String)>) -> Vec<u8> {
+    MOCK_FILE_BYTES.to_vec()
 }

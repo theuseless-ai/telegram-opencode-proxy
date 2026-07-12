@@ -35,7 +35,7 @@ use telegram_opencode_proxy::opencode::client::OpencodeClient;
 use telegram_opencode_proxy::persistence::Db;
 use telegram_opencode_proxy::state::SlotConn;
 use telegram_opencode_proxy::telegram::bot::{
-    AppState, handle_new, handle_stop, handle_text, handle_verbosity,
+    AppState, handle_media, handle_new, handle_stop, handle_text, handle_verbosity,
 };
 use telegram_opencode_proxy::telegram::render::Verbosity;
 use telegram_opencode_proxy::{connect_slots, spawn_slot_bringup};
@@ -865,4 +865,43 @@ async fn quiet_command_toggles_verbosity() {
         Verbosity::Normal,
         "a second /quiet returns to Normal"
     );
+}
+
+// --- inbound files (#11) ------------------------------------------------------
+
+/// A private-chat photo `Message` with a caption, from the Bot API wire shape.
+fn photo_message(chat_id: i64, caption: &str) -> Message {
+    serde_json::from_value(json!({
+        "message_id": 1,
+        "date": 0,
+        "chat": { "id": chat_id, "type": "private", "first_name": "Tester" },
+        "from": { "id": chat_id, "is_bot": false, "first_name": "Tester" },
+        "photo": [
+            { "file_id": "f1", "file_unique_id": "u1", "file_size": 8, "width": 90, "height": 90 }
+        ],
+        "caption": caption
+    }))
+    .expect("constructing a photo Message from wire JSON")
+}
+
+/// An inbound photo is downloaded and attached to the prompt as a data-URI file
+/// part; opencode receives a `type:"file"` part with the photo's MIME.
+#[tokio::test]
+async fn inbound_photo_is_sent_as_a_file_part() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let state = state_for(config_for(&oc.url)).await;
+    let bot = bot_pointed_at(&tg);
+
+    handle_media(bot, photo_message(SLOT_ID, "what is this?"), state.clone())
+        .await
+        .expect("handle_media succeeds");
+
+    let got = wait_for(|| !oc.file_part_mimes().is_empty(), Duration::from_secs(5)).await;
+    assert!(
+        got,
+        "opencode should receive a file part, got {:?}",
+        oc.file_part_mimes()
+    );
+    assert_eq!(oc.file_part_mimes(), vec!["image/jpeg".to_string()]);
 }

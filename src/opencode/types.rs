@@ -79,12 +79,22 @@ pub struct PromptRequest {
     pub parts: Vec<PartInput>,
 }
 
-/// Input parts for a prompt. Only `text` is needed now; file/agent/subtask
-/// parts (`FilePartInput`, …) land with inbound files (#8).
+/// Input parts for a prompt: visible text and inbound files (#11). A file's
+/// content rides in `url` as a base64 **data URI** (`data:<mime>;base64,…`),
+/// which is what `FilePartInput` accepts (`{type:"file", mime, url, filename?}`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum PartInput {
-    Text { text: String },
+    Text {
+        text: String,
+    },
+    File {
+        mime: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+        /// Data URI carrying the file bytes: `data:<mime>;base64,<base64>`.
+        url: String,
+    },
 }
 
 /// Body for `PATCH /session/:id` — only the permission ruleset is used here.
@@ -316,6 +326,34 @@ mod tests {
                 "model": {"providerID":"llm-lan","modelID":"m"},
                 "parts": [{"type":"text","text":"ping"}]
             })
+        );
+    }
+
+    #[test]
+    fn file_part_input_wire_shape() {
+        let with_name = PartInput::File {
+            mime: "image/png".into(),
+            filename: Some("shot.png".into()),
+            url: "data:image/png;base64,AAAA".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&with_name).unwrap(),
+            serde_json::json!({
+                "type": "file",
+                "mime": "image/png",
+                "filename": "shot.png",
+                "url": "data:image/png;base64,AAAA"
+            })
+        );
+        // `filename` is omitted when absent.
+        let no_name = PartInput::File {
+            mime: "text/plain".into(),
+            filename: None,
+            url: "data:,x".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&no_name).unwrap(),
+            serde_json::json!({ "type": "file", "mime": "text/plain", "url": "data:,x" })
         );
     }
 
