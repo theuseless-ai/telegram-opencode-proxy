@@ -14,6 +14,47 @@ use crate::opencode::events::{PartKind, ToolStatus};
 /// Telegram's hard per-message limit (characters).
 pub const TELEGRAM_LIMIT: usize = 4096;
 
+/// Per-user output verbosity (`/quiet` · `/verbose`, §13, #10). Persisted per
+/// chat; the streaming renderer reads it to decide how much to surface. `Normal`
+/// is the default. For now the concrete effect is the tool-status line (shown at
+/// Normal/Verbose, hidden at Quiet); tool **failures** are always shown at every
+/// level. Reasoning notes / cost footers are reserved for a fast-follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Verbosity {
+    /// Answer (and failures) only — no live tool-status line.
+    Quiet,
+    /// Answer stream + flat tool-status line (the B2 behaviour).
+    #[default]
+    Normal,
+    /// Like `Normal` today; reserved for extra detail (args, cost) later.
+    Verbose,
+}
+
+impl Verbosity {
+    /// The persisted string form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verbosity::Quiet => "quiet",
+            Verbosity::Normal => "normal",
+            Verbosity::Verbose => "verbose",
+        }
+    }
+
+    /// Parse the persisted form; anything unrecognised falls back to `Normal`.
+    pub fn from_stored(s: &str) -> Self {
+        match s {
+            "quiet" => Verbosity::Quiet,
+            "verbose" => Verbosity::Verbose,
+            _ => Verbosity::Normal,
+        }
+    }
+
+    /// Whether the live tool-status line should be shown at this level.
+    fn shows_tool_line(self) -> bool {
+        !matches!(self, Verbosity::Quiet)
+    }
+}
+
 /// The streaming render state for one turn (Option A: answer-first, transient
 /// tool line, failures always shown).
 ///
@@ -34,11 +75,17 @@ pub struct LiveState {
     active_tool: Option<String>,
     /// Tool failures, shown at every stage and preserved into the final render.
     failures: Vec<String>,
+    /// The user's output verbosity (#10) — gates the tool-status line.
+    verbosity: Verbosity,
 }
 
 impl LiveState {
-    pub fn new() -> Self {
-        Self::default()
+    /// A render state at the given output verbosity (#10).
+    pub fn new(verbosity: Verbosity) -> Self {
+        Self {
+            verbosity,
+            ..Self::default()
+        }
     }
 
     /// Append a streamed text chunk to the answer buffer. A non-empty answer
@@ -71,26 +118,30 @@ impl LiveState {
         }
     }
 
-    /// Whether any visible content exists yet (answer, a tool line, or a
+    /// Whether the tool-status line is visible at the current verbosity and a
+    /// tool is active (hidden entirely in Quiet, #10).
+    fn tool_line_visible(&self) -> bool {
+        self.verbosity.shows_tool_line() && self.active_tool.is_some()
+    }
+
+    /// Whether any visible content exists yet (answer, a shown tool line, or a
     /// failure) — the driver uses this to defer creating the Telegram message
     /// until there is something to show.
     pub fn has_content(&self) -> bool {
-        !self.answer.is_empty() || self.active_tool.is_some() || !self.failures.is_empty()
+        !self.answer.is_empty() || self.tool_line_visible() || !self.failures.is_empty()
     }
 
     /// The full text the live message should show now — answer (or the transient
-    /// tool line before any answer) plus any failure lines. May exceed
-    /// [`TELEGRAM_LIMIT`]; the driver clamps to the first chunk via
+    /// tool line before any answer, unless Quiet) plus any failure lines. May
+    /// exceed [`TELEGRAM_LIMIT`]; the driver clamps to the first chunk via
     /// [`split_message`] while streaming and chunks the rest on finalize.
     pub fn render(&self) -> String {
         let mut out = String::new();
-        if self.answer.is_empty() {
-            if let Some(tool) = &self.active_tool {
-                out.push_str("⚙️ ");
-                out.push_str(tool);
-            }
-        } else {
+        if !self.answer.is_empty() {
             out.push_str(&self.answer);
+        } else if self.tool_line_visible() {
+            out.push_str("⚙️ ");
+            out.push_str(self.active_tool.as_deref().unwrap_or_default());
         }
         for failure in &self.failures {
             if !out.is_empty() {
@@ -229,7 +280,7 @@ mod tests {
 
     #[test]
     fn live_state_shows_tool_line_before_any_answer() {
-        let mut s = LiveState::new();
+        let mut s = LiveState::new(Verbosity::Normal);
         assert!(!s.has_content());
         s.apply_part(&tool("bash", ToolStatus::Running));
         assert!(s.has_content());
@@ -237,8 +288,32 @@ mod tests {
     }
 
     #[test]
+    fn quiet_hides_the_tool_line_but_not_failures_or_answer() {
+        let mut s = LiveState::new(Verbosity::Quiet);
+        // A running tool produces no visible content in Quiet mode.
+        s.apply_part(&tool("bash", ToolStatus::Running));
+        assert!(!s.has_content(), "quiet mode hides the tool-status line");
+        assert_eq!(s.render(), "");
+        // Failures are still always shown.
+        s.apply_part(&tool("bash", ToolStatus::Error));
+        assert_eq!(s.render(), "✗ bash: failed");
+        // And the answer streams as usual.
+        s.push_text("done");
+        assert_eq!(s.render(), "done\n✗ bash: failed");
+    }
+
+    #[test]
+    fn verbosity_round_trips_through_its_stored_form() {
+        for v in [Verbosity::Quiet, Verbosity::Normal, Verbosity::Verbose] {
+            assert_eq!(Verbosity::from_stored(v.as_str()), v);
+        }
+        assert_eq!(Verbosity::from_stored("bogus"), Verbosity::Normal);
+        assert_eq!(Verbosity::default(), Verbosity::Normal);
+    }
+
+    #[test]
     fn live_state_answer_supersedes_tool_line() {
-        let mut s = LiveState::new();
+        let mut s = LiveState::new(Verbosity::Normal);
         s.apply_part(&tool("bash", ToolStatus::Running));
         s.push_text("The output ");
         s.push_text("is hi.");
@@ -248,7 +323,7 @@ mod tests {
 
     #[test]
     fn live_state_completed_tool_clears_line() {
-        let mut s = LiveState::new();
+        let mut s = LiveState::new(Verbosity::Normal);
         s.apply_part(&tool("bash", ToolStatus::Pending));
         assert_eq!(s.render(), "⚙️ bash");
         s.apply_part(&tool("bash", ToolStatus::Completed));
@@ -259,7 +334,7 @@ mod tests {
 
     #[test]
     fn live_state_failures_always_shown() {
-        let mut s = LiveState::new();
+        let mut s = LiveState::new(Verbosity::Normal);
         s.apply_part(&tool("bash", ToolStatus::Error));
         // A failure surfaces even with no answer text.
         assert_eq!(s.render(), "✗ bash: failed");
@@ -272,7 +347,7 @@ mod tests {
 
     #[test]
     fn live_state_finalize_appends_failures_to_authoritative_text() {
-        let mut s = LiveState::new();
+        let mut s = LiveState::new(Verbosity::Normal);
         s.push_text("partial…"); // streamed buffer is ignored by finalize
         s.apply_part(&tool("bash", ToolStatus::Error));
         assert_eq!(

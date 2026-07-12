@@ -32,13 +32,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::telegram::render::Verbosity;
+
 /// Current schema version, tracked via SQLite's `PRAGMA user_version`. Bump this
 /// and add a matching arm in [`migrate`] when the schema changes.
 ///
 /// v2 added a `slots` table (#39). v3 (#45) **drops** it: `config.toml` is now
 /// the single source of truth for slots (`proxy connect` writes the config file,
-/// format-preserving), so the DB no longer persists slot definitions.
-const SCHEMA_VERSION: i64 = 3;
+/// format-preserving), so the DB no longer persists slot definitions. v4 (#10)
+/// adds `user_settings` for per-user output verbosity.
+const SCHEMA_VERSION: i64 = 4;
 
 /// How long a query waits on a locked database before erroring (WAL still
 /// serialises writers). Generous — local, low-contention, two users.
@@ -161,6 +164,35 @@ impl Db {
     pub fn clear_session(&self, chat_id: i64) -> Result<()> {
         self.with_conn(|c| {
             c.execute("DELETE FROM routing WHERE chat_id = ?1", params![chat_id])?;
+            Ok(())
+        })
+    }
+
+    // --- user_settings: per-user output verbosity (#10) ------------------
+
+    /// The stored output [`Verbosity`] for `chat_id`, or the default (`Normal`)
+    /// if the user has never set one.
+    pub fn get_verbosity(&self, chat_id: i64) -> Result<Verbosity> {
+        self.with_conn(|c| {
+            let stored: Option<String> = c
+                .query_row(
+                    "SELECT verbosity FROM user_settings WHERE chat_id = ?1",
+                    params![chat_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(stored.map_or(Verbosity::default(), |s| Verbosity::from_stored(&s)))
+        })
+    }
+
+    /// Persist the output [`Verbosity`] for `chat_id` (upsert).
+    pub fn set_verbosity(&self, chat_id: i64, verbosity: Verbosity) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO user_settings(chat_id, verbosity) VALUES(?1, ?2)
+                 ON CONFLICT(chat_id) DO UPDATE SET verbosity = excluded.verbosity",
+                params![chat_id, verbosity.as_str()],
+            )?;
             Ok(())
         })
     }
@@ -458,6 +490,15 @@ fn migrate(conn: &Connection) -> Result<()> {
         // `IF EXISTS` makes this a no-op on a v1-created database.
         conn.execute_batch("DROP TABLE IF EXISTS slots;")?;
     }
+    if version < 4 {
+        // #10: per-user output verbosity (`/quiet` · `/verbose`).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS user_settings(
+                 chat_id   INTEGER PRIMARY KEY,
+                 verbosity TEXT NOT NULL DEFAULT 'normal'
+             );",
+        )?;
+    }
     // Stamp the version regardless (a fresh :memory: db starts at 0).
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -696,6 +737,20 @@ mod tests {
         let db = Db::open(&path).expect("reopen db");
         assert_eq!(db.get_session(101).unwrap().as_deref(), Some("ses_persist"));
         assert_eq!(db.allowed_slot(101).unwrap().as_deref(), Some("you"));
+    }
+
+    #[test]
+    fn verbosity_defaults_to_normal_and_round_trips() {
+        let db = db();
+        // Unset → default.
+        assert_eq!(db.get_verbosity(42).unwrap(), Verbosity::Normal);
+        // Set → read back; upsert overwrites.
+        db.set_verbosity(42, Verbosity::Quiet).unwrap();
+        assert_eq!(db.get_verbosity(42).unwrap(), Verbosity::Quiet);
+        db.set_verbosity(42, Verbosity::Verbose).unwrap();
+        assert_eq!(db.get_verbosity(42).unwrap(), Verbosity::Verbose);
+        // Independent per user.
+        assert_eq!(db.get_verbosity(43).unwrap(), Verbosity::Normal);
     }
 
     #[test]

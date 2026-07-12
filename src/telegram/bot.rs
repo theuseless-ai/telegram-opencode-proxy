@@ -31,6 +31,7 @@ use crate::pairing;
 use crate::persistence::Db;
 use crate::session;
 use crate::state::SlotConn;
+use crate::telegram::render::Verbosity;
 use crate::telegram::{retry, stream};
 
 /// Readiness budget for the interactive `proxy connect` bring-up — short so the
@@ -524,7 +525,8 @@ impl crate::admin::AdminState for AppState {
 }
 
 /// Bot commands. `/whoami` aids bootstrap (the operator learns their chat id to
-/// whitelist); `/stop` interrupts the in-flight turn (#9). `/new` `/get` land later.
+/// whitelist); `/stop` interrupts the in-flight turn (#9); `/new` resets the
+/// session and `/quiet` `/verbose` toggle output verbosity (#10). `/get` later.
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
 enum Command {
@@ -532,6 +534,12 @@ enum Command {
     Whoami,
     /// Stop the turn I'm currently working on.
     Stop,
+    /// Start a fresh session (forget the current conversation).
+    New,
+    /// Toggle quiet mode (answer only, no tool status).
+    Quiet,
+    /// Toggle verbose mode (extra detail).
+    Verbose,
 }
 
 /// Friendly message shown to the user when a turn fails; details go to the log.
@@ -619,7 +627,68 @@ async fn handle_command(
             Ok(())
         }
         Command::Stop => handle_stop(bot, msg, state).await,
+        Command::New => handle_new(bot, msg, state).await,
+        Command::Quiet => handle_verbosity(bot, msg, state, Verbosity::Quiet).await,
+        Command::Verbose => handle_verbosity(bot, msg, state, Verbosity::Verbose).await,
     }
+}
+
+/// `/new` (#10): forget the user's current opencode session so the next message
+/// starts fresh. Clearing a routing row that isn't there is harmless, so this
+/// isn't auth-gated.
+pub async fn handle_new(bot: Bot, msg: Message, state: Arc<AppState>) -> ResponseResult<()> {
+    let chat_id = msg.chat.id.0;
+    match state.db.clear_session(chat_id) {
+        Ok(()) => {
+            bot.send_message(msg.chat.id, "🆕 Started a fresh session.")
+                .await?;
+        }
+        Err(err) => {
+            tracing::error!(chat_id, error = %err, "clearing session on /new failed");
+            bot.send_message(
+                msg.chat.id,
+                "⚠️ Couldn't start a new session — please try again.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// `/quiet` · `/verbose` (#10): toggle the requested verbosity. Requesting the
+/// level you're already at returns to `Normal`, so each command is its own
+/// on/off switch (and there's always a way back to the default).
+pub async fn handle_verbosity(
+    bot: Bot,
+    msg: Message,
+    state: Arc<AppState>,
+    requested: Verbosity,
+) -> ResponseResult<()> {
+    let chat_id = msg.chat.id.0;
+    let current = state.db.get_verbosity(chat_id).unwrap_or_default();
+    let next = if current == requested {
+        Verbosity::Normal
+    } else {
+        requested
+    };
+
+    if let Err(err) = state.db.set_verbosity(chat_id, next) {
+        tracing::error!(chat_id, error = %err, "setting verbosity failed");
+        bot.send_message(
+            msg.chat.id,
+            "⚠️ Couldn't change verbosity — please try again.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let note = match next {
+        Verbosity::Quiet => "🔕 Quiet mode: I'll show just the answer.",
+        Verbosity::Normal => "🔔 Normal mode: answer plus a tool-status line.",
+        Verbosity::Verbose => "🔊 Verbose mode on.",
+    };
+    bot.send_message(msg.chat.id, note).await?;
+    Ok(())
 }
 
 /// `/stop` (#9): abort the user's in-flight opencode turn via
@@ -836,6 +905,10 @@ async fn run_turn(
     // Persist the resolved id so it survives a restart (and a possible recreate).
     state.db.set_session(chat_id, &session_id)?;
 
+    // The user's output verbosity (#10) — defaults to Normal; a DB hiccup here
+    // must not fail the turn, so fall back to the default.
+    let verbosity = state.db.get_verbosity(chat_id).unwrap_or_default();
+
     // A short-lived HTTP client for this turn's `/global/event` subscription.
     let http = reqwest::Client::new();
     stream::run_streaming_turn(
@@ -847,6 +920,7 @@ async fn run_turn(
         &session_id,
         PromptModel::from(&state.cfg.model),
         text,
+        verbosity,
         stream::StreamTiming::default(),
     )
     .await
