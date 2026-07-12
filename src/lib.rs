@@ -48,10 +48,6 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
         "starting proxy (connect-only)"
     );
 
-    // The registry is seeded from config `[[slots]]` only (#45): config is the
-    // single source of truth for slots, so there is no DB slot table to fold in.
-    let registry = connect_slots(&cfg).await?;
-
     // Open persistence for routing + whitelist + pending pairings/approvals (#3).
     let db = persistence::Db::open(&cfg.db_path)
         .with_context(|| format!("opening SQLite store at {}", cfg.db_path.display()))?;
@@ -61,7 +57,18 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
     // can both serve on it and clean it up on shutdown.
     let admin_socket = cfg.admin_socket.clone();
     let bot = teloxide::Bot::new(cfg.bot_token.clone());
-    let state = telegram::bot::AppState::new(cfg, config_path, registry, db, bot.clone());
+    // Start with an EMPTY registry and bring the configured slots up
+    // **concurrently, in the background** (#51). The dispatcher comes online
+    // immediately instead of waiting out each slot's readiness budget, so one
+    // unreachable opencode never delays replies for the healthy slots. The
+    // whitelist is seeded from `cfg.slots` inside `AppState::new`, independent of
+    // connection state, so bound users are authorized right away.
+    let state = telegram::bot::AppState::new(cfg, config_path, HashMap::new(), db, bot.clone());
+    spawn_slot_bringup(
+        Arc::clone(&state),
+        health::READY_ATTEMPTS,
+        health::READY_INTERVAL,
+    );
     // The admin server shares the same `Arc<AppState>` — read-only is enough for
     // #38 (runtime-mutable slots are #39).
     let admin_state: Arc<dyn admin::AdminState> = state.clone();
@@ -98,14 +105,16 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Connect to and validate every configured slot's opencode instance, returning
-/// a ready [`SlotConn`] per slot (keyed by slot name).
+/// Connect to and validate every configured slot's opencode instance
+/// **synchronously**, returning a ready [`SlotConn`] per slot (keyed by slot
+/// name) once all have resolved.
 ///
-/// This is the whole startup seeding path (#45): `config.toml` is the single
-/// source of truth for slots, so the registry is built from `cfg.slots` alone —
-/// there is no DB slot table to fold in. Factored out of [`serve`] so the
-/// harness can exercise the exact bring-up sequence (readiness → provider
-/// catalogue → model validation) without starting the forever-running dispatcher.
+/// `config.toml` is the single source of truth for slots (#45), so the registry
+/// is built from `cfg.slots` alone. [`serve`] does **not** use this — it brings
+/// slots up in the background via [`spawn_slot_bringup`] so the dispatcher never
+/// blocks on readiness (#51). This blocking, fully-resolved variant is what the
+/// hermetic harness drives to exercise the exact bring-up sequence (readiness →
+/// provider catalogue → model validation) without the forever-running dispatcher.
 pub async fn connect_slots(cfg: &Config) -> Result<HashMap<String, SlotConn>> {
     let http = reqwest::Client::builder()
         .build()
@@ -144,6 +153,59 @@ pub async fn connect_slots(cfg: &Config) -> Result<HashMap<String, SlotConn>> {
         );
     }
     Ok(registry)
+}
+
+/// Bring every configured slot up **concurrently, in the background** (#51),
+/// inserting each into the live registry the moment it becomes ready. Returns
+/// immediately, so the caller (`serve`) can start the dispatcher at once instead
+/// of waiting out each slot's readiness budget.
+///
+/// Each slot gets its own task: a reachable opencode is validated (provider /
+/// model) and inserted; an unreachable one retries for the full `attempts`
+/// budget in its own task and logs on give-up (recover with `proxy connect
+/// <name>`), never blocking its siblings or the bot. The registry is the same
+/// runtime-mutable map `proxy connect` mutates, so a user who messages before
+/// their slot is up simply hits the normal "no client yet" path until it lands.
+pub fn spawn_slot_bringup(state: Arc<telegram::bot::AppState>, attempts: u32, interval: Duration) {
+    let slots = state.cfg.slots.clone();
+    if slots.is_empty() {
+        return;
+    }
+    tracing::info!(slots = slots.len(), "connecting slots in the background");
+
+    let http = match reqwest::Client::builder().build() {
+        Ok(http) => http,
+        Err(err) => {
+            tracing::error!(error = %err, "could not build readiness http client — no slots will connect");
+            return;
+        }
+    };
+
+    for slot in slots {
+        let state = Arc::clone(&state);
+        let http = http.clone();
+        tokio::spawn(async move {
+            match bring_up_slot(&http, &slot, &state.cfg.model, attempts, interval).await {
+                Ok(conn) => {
+                    {
+                        let mut guard = state
+                            .registry
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        guard.insert(slot.name.clone(), conn);
+                    }
+                    tracing::info!(slot = %slot.name, url = %slot.opencode_url, "slot connected");
+                }
+                Err(err) => tracing::error!(
+                    slot = %slot.name,
+                    url = %slot.opencode_url,
+                    error = format!("{err:#}"),
+                    "slot failed to connect at startup — skipping it (retry with `proxy connect {}`)",
+                    slot.name,
+                ),
+            }
+        });
+    }
 }
 
 /// The single-slot bring-up sequence shared by startup and the `connect` admin

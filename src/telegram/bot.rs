@@ -71,11 +71,13 @@ impl AppState {
     /// writes; #45), the seeded per-slot registry, an open SQLite handle, and a
     /// bot handle for out-of-band notifications.
     ///
-    /// Also **seeds the whitelist** (#4b): every slot in the registry that
-    /// declares a `telegram_id` is idempotently written into `allowed_users`, so
-    /// config, `proxy connect --telegram-id`, and A4b pairing all share one
-    /// lookup path — and a `connect`-added binding survives a restart. Seeding is
-    /// best-effort — a DB hiccup is logged, never fatal.
+    /// Also **seeds the whitelist** (#4b): every **configured** slot that declares
+    /// a `telegram_id` is idempotently written into `allowed_users`, so config,
+    /// `proxy connect --telegram-id`, and A4b pairing all share one lookup path —
+    /// and a `connect`-added binding survives a restart. Seeding keys off
+    /// `cfg.slots`, **not** the registry, so a bound user is authorized whether or
+    /// not their opencode has connected yet (slots come up in the background,
+    /// #51). Best-effort — a DB hiccup is logged, never fatal.
     pub fn new(
         cfg: Config,
         config_path: PathBuf,
@@ -83,8 +85,7 @@ impl AppState {
         db: Db,
         bot: Bot,
     ) -> Arc<Self> {
-        for conn in registry.values() {
-            let slot = &conn.slot;
+        for slot in &cfg.slots {
             if let Some(id) = slot.telegram_id
                 && let Err(err) = db.add_allowed(id, &slot.name)
             {
