@@ -77,6 +77,8 @@ struct OcState {
     /// Delay (ms) before `POST /session/:id/message` returns, so the paced SSE
     /// stream and its throttled edits happen before the blocking turn resolves.
     message_delay_ms: Arc<AtomicU64>,
+    /// Session ids passed to `POST /session/:id/abort` (the `/stop` path, #9).
+    aborts: Arc<Mutex<Vec<String>>>,
 }
 
 /// A running in-process mock opencode instance. Dropping it leaves the spawned
@@ -90,6 +92,7 @@ pub struct MockOpencode {
     message_list: Arc<Mutex<Option<String>>>,
     event_frames: EventFrames,
     message_delay_ms: Arc<AtomicU64>,
+    aborts: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockOpencode {
@@ -162,6 +165,16 @@ impl MockOpencode {
             .store(delay.as_millis() as u64, Ordering::SeqCst);
     }
 
+    /// Session ids the proxy has aborted via `POST /session/:id/abort` (the
+    /// `/stop` path, #9), in order.
+    #[allow(dead_code)]
+    pub fn aborted_sessions(&self) -> Vec<String> {
+        self.aborts
+            .lock()
+            .expect("mock_opencode aborts lock")
+            .clone()
+    }
+
     async fn start_inner(include_model: bool, config_fails: u64) -> Self {
         let reply: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let event_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -169,6 +182,7 @@ impl MockOpencode {
         let message_list: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let event_frames: EventFrames = Arc::new(Mutex::new(None));
         let message_delay_ms = Arc::new(AtomicU64::new(0));
+        let aborts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let state = OcState {
             include_model,
             reply: Arc::clone(&reply),
@@ -180,6 +194,7 @@ impl MockOpencode {
             message_list: Arc::clone(&message_list),
             event_frames: Arc::clone(&event_frames),
             message_delay_ms: Arc::clone(&message_delay_ms),
+            aborts: Arc::clone(&aborts),
         };
 
         let app = Router::new()
@@ -191,6 +206,7 @@ impl MockOpencode {
                 "/session/{id}/message",
                 post(message).get(get_session_messages),
             )
+            .route("/session/{id}/abort", post(abort_session))
             .route("/global/event", get(global_event))
             .with_state(state);
 
@@ -210,8 +226,19 @@ impl MockOpencode {
             message_list,
             event_frames,
             message_delay_ms,
+            aborts,
         }
     }
+}
+
+/// `POST /session/:id/abort` — record the aborted session id and return `true`,
+/// matching the A0 wire (`{200: boolean}`, no body). Drives the `/stop` path (#9).
+async fn abort_session(State(st): State<OcState>, Path(id): Path<String>) -> impl IntoResponse {
+    st.aborts
+        .lock()
+        .expect("mock_opencode aborts lock")
+        .push(id);
+    Json(json!(true))
 }
 
 /// `GET /config` — readiness probe. Answers `503` for the first `config_fails`
