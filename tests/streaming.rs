@@ -150,6 +150,68 @@ async fn streaming_turn_live_edits_typing_and_finalizes() {
 }
 
 #[tokio::test]
+async fn leading_whitespace_delta_does_not_trigger_empty_send() {
+    // Regression: a model whose first streamed token is whitespace briefly makes
+    // the live buffer whitespace-only, which Telegram rejects ("text must be
+    // non-empty"). The driver must hold off until there is a visible character.
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    oc.set_reply("Hi there");
+    oc.set_message_delay(Duration::from_millis(250));
+    oc.set_event_frames(
+        vec![
+            frame(serde_json::json!({"type":"server.connected","properties":{}})),
+            frame(part_updated(SESSION, "prt_ans", "text")),
+            // First token is whitespace only — must NOT create a message.
+            frame(delta(SESSION, "prt_ans", "   ")),
+            // Then real text arrives.
+            frame(delta(SESSION, "prt_ans", "Hi there")),
+        ],
+        Duration::from_millis(20),
+    );
+
+    let bot = Bot::new("test-token").set_api_url(tg.url.parse().expect("mock url"));
+    let http = reqwest::Client::new();
+    let client = OpencodeClient::new(&oc.url).expect("client");
+    let model = PromptModel {
+        provider_id: "llm-lan".into(),
+        model_id: "Qwen3.6-35B-A3B-bf16".into(),
+    };
+
+    run_streaming_turn(
+        &bot,
+        &http,
+        &client,
+        &oc.url,
+        CHAT_ID,
+        SESSION,
+        model,
+        "hi",
+        StreamTiming {
+            flush_interval: Duration::from_millis(10),
+            typing_interval: Duration::from_millis(20),
+            retry: Duration::from_secs(5),
+        },
+    )
+    .await
+    .expect("streaming turn");
+
+    // The driver never attempted a whitespace-only send/edit.
+    assert_eq!(
+        tg.empty_rejections(),
+        0,
+        "driver sent a whitespace-only body; Telegram would reject it"
+    );
+    // No recorded write is whitespace-only, and the reply still arrives.
+    let texts = all_text(&tg);
+    assert!(texts.iter().all(|t| !t.trim().is_empty()));
+    assert!(
+        texts.iter().any(|t| t.contains("Hi there")),
+        "final reply must be delivered, got {texts:?}"
+    );
+}
+
+#[tokio::test]
 async fn streaming_turn_with_no_stream_still_posts_final_reply() {
     // No event frames set → `/global/event` just emits `server.connected` and
     // closes; the turn should still deliver the blocking reply as one message.

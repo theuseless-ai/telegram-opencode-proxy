@@ -67,6 +67,9 @@ struct TgState {
     sent: Arc<Mutex<Vec<SentMessage>>>,
     edits: Arc<Mutex<Vec<EditMessage>>>,
     chat_actions: Arc<Mutex<Vec<String>>>,
+    /// Count of send/edit attempts rejected for whitespace-only text — the
+    /// driver's non-empty guard (#8) should keep this at 0.
+    empty_rejections: Arc<AtomicI64>,
     updates: Arc<Mutex<VecDeque<Value>>>,
     next_msg_id: Arc<AtomicI64>,
     bot_id: i64,
@@ -79,6 +82,7 @@ pub struct MockTelegram {
     sent: Arc<Mutex<Vec<SentMessage>>>,
     edits: Arc<Mutex<Vec<EditMessage>>>,
     chat_actions: Arc<Mutex<Vec<String>>>,
+    empty_rejections: Arc<AtomicI64>,
     updates: Arc<Mutex<VecDeque<Value>>>,
 }
 
@@ -88,11 +92,13 @@ impl MockTelegram {
         let sent: Arc<Mutex<Vec<SentMessage>>> = Arc::new(Mutex::new(Vec::new()));
         let edits: Arc<Mutex<Vec<EditMessage>>> = Arc::new(Mutex::new(Vec::new()));
         let chat_actions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let empty_rejections = Arc::new(AtomicI64::new(0));
         let updates: Arc<Mutex<VecDeque<Value>>> = Arc::new(Mutex::new(VecDeque::new()));
         let state = TgState {
             sent: Arc::clone(&sent),
             edits: Arc::clone(&edits),
             chat_actions: Arc::clone(&chat_actions),
+            empty_rejections: Arc::clone(&empty_rejections),
             updates: Arc::clone(&updates),
             next_msg_id: Arc::new(AtomicI64::new(1)),
             bot_id: 424242,
@@ -115,6 +121,7 @@ impl MockTelegram {
             sent,
             edits,
             chat_actions,
+            empty_rejections,
             updates,
         }
     }
@@ -139,6 +146,13 @@ impl MockTelegram {
             .clone()
     }
 
+    /// How many send/edit attempts were rejected for whitespace-only text. The
+    /// streaming driver's non-empty guard (#8) should keep this at 0.
+    #[allow(dead_code)]
+    pub fn empty_rejections(&self) -> i64 {
+        self.empty_rejections.load(Ordering::SeqCst)
+    }
+
     /// Queue an incoming `Update` JSON to be served by the next `getUpdates`.
     /// (Used by a dispatcher-driven test / Layer 2; the direct-handler tests do
     /// not need it.)
@@ -158,6 +172,19 @@ async fn handler(
     body: Bytes,
 ) -> Json<Value> {
     let req: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+
+    // Mirror Telegram: a whitespace-only text body is rejected, so the streaming
+    // driver's non-empty guard (#8) is actually exercised here.
+    if matches!(method.as_str(), "SendMessage" | "EditMessageText")
+        && req["text"].as_str().unwrap_or_default().trim().is_empty()
+    {
+        st.empty_rejections.fetch_add(1, Ordering::SeqCst);
+        return Json(json!({
+            "ok": false,
+            "error_code": 400,
+            "description": "Bad Request: text must be non-empty"
+        }));
+    }
 
     let result = match method.as_str() {
         "GetMe" => json!({

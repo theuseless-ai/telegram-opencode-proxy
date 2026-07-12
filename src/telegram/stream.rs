@@ -176,7 +176,10 @@ impl<'a> LiveSink<'a> {
         // on finalize. This keeps every edit within the per-message limit.
         let content = state.render();
         let chunk = first_chunk(&content);
-        if chunk == self.last_sent {
+        // Telegram rejects a whitespace-only body ("text must be non-empty"), so
+        // hold off until there is a visible character — e.g. a leading-whitespace
+        // first token shouldn't create the message yet.
+        if chunk.trim().is_empty() || chunk == self.last_sent {
             return;
         }
         match self.message_id {
@@ -199,7 +202,13 @@ impl<'a> LiveSink<'a> {
     /// (edited if it exists, else sent), and any overflow is sent as new messages.
     async fn finalize(&mut self, state: &LiveState, authoritative: &str) -> Result<()> {
         let final_text = state.finalize(authoritative);
-        let chunks = split_message(&final_text, TELEGRAM_LIMIT);
+        // A whitespace-only (or empty) reply has nothing Telegram will accept —
+        // route it to the empty-reply note rather than a rejected send.
+        let chunks = if final_text.trim().is_empty() {
+            Vec::new()
+        } else {
+            split_message(&final_text, TELEGRAM_LIMIT)
+        };
 
         let Some((first, rest)) = chunks.split_first() else {
             // Nothing to say. If we opened a message, leave a marker; else post one.
