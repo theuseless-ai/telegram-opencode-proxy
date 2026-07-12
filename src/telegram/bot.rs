@@ -18,6 +18,7 @@ use teloxide::prelude::*;
 use teloxide::types::ChatId;
 use teloxide::utils::command::BotCommands;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 use crate::admin::{
     ApproveInfo, BoxFuture, ConnectOutcome, ConnectParams, PairingEntry, SlotInfo,
@@ -798,10 +799,24 @@ pub async fn handle_text(bot: Bot, msg: Message, state: Arc<AppState>) -> Respon
     Ok(())
 }
 
+/// The per-turn tracing span (#26): correlates every log line emitted while a
+/// turn runs by `chat_id` and `slot`; the resolved opencode `session` is recorded
+/// onto it once known (see [`run_turn`]). Deliberately carries **no** message
+/// content — user text is never logged (redaction; the token is a `Secret`, #23).
+fn turn_span(chat_id: i64, slot: &str) -> tracing::Span {
+    tracing::info_span!(
+        "turn",
+        chat_id,
+        slot = %slot,
+        session = tracing::field::Empty,
+    )
+}
+
 /// A user's serial turn worker (#9): drains the bounded queue, running each turn
 /// to completion before the next so a single user's turns never interleave.
 /// Errors become the friendly [`ERROR_REPLY`] plus a `tracing::error!`; the loop
-/// ends (and the worker is dropped) only if the queue is closed.
+/// ends (and the worker is dropped) only if the queue is closed. Each turn runs
+/// inside a [`turn_span`] so its logs are correlated (#26).
 async fn user_worker(
     state: Arc<AppState>,
     bot: Bot,
@@ -809,7 +824,11 @@ async fn user_worker(
     mut rx: mpsc::Receiver<TurnJob>,
 ) {
     while let Some(job) = rx.recv().await {
-        if let Err(err) = run_turn(&bot, &state, &job.slot, chat_id, &job.text).await {
+        let span = turn_span(chat_id, &job.slot.name);
+        let result = run_turn(&bot, &state, &job.slot, chat_id, &job.text)
+            .instrument(span)
+            .await;
+        if let Err(err) = result {
             // Distinguish "your opencode is unreachable" (actionable, and worth a
             // background reconnect) from a generic failure (#22).
             let reply = if is_opencode_unreachable(&err) {
@@ -904,6 +923,8 @@ async fn run_turn(
     .await?;
     // Persist the resolved id so it survives a restart (and a possible recreate).
     state.db.set_session(chat_id, &session_id)?;
+    // Correlate the rest of this turn's logs with the resolved session (#26).
+    tracing::Span::current().record("session", session_id.as_str());
 
     // The user's output verbosity (#10) — defaults to Normal; a DB hiccup here
     // must not fail the turn, so fall back to the default.
@@ -957,5 +978,48 @@ mod tests {
             !is_opencode_unreachable(&err),
             "a non-network error must not be treated as unreachable"
         );
+    }
+
+    /// The per-turn span (#26) surfaces the structured `chat_id`/`slot` fields on
+    /// events emitted within it — and never any message content.
+    #[test]
+    fn turn_span_carries_structured_fields() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl tracing_subscriber::fmt::MakeWriter<'_> for Capture {
+            type Writer = Capture;
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Capture(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = turn_span(4242, "you");
+            let _entered = span.enter();
+            tracing::info!("turn started");
+        });
+
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("turn"), "span name present: {out}");
+        assert!(out.contains("chat_id=4242"), "chat_id field present: {out}");
+        assert!(out.contains("slot=you"), "slot field present: {out}");
     }
 }
