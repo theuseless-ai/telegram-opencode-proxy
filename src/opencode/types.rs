@@ -191,11 +191,23 @@ impl MessageEnvelope {
     pub fn text(&self) -> String {
         let mut out = String::new();
         for part in &self.parts {
-            if let Part::Text { text } = part {
+            if let Part::Text { text, .. } = part {
                 out.push_str(text);
             }
         }
         out
+    }
+
+    /// The visible text parts as `(part_id, text)`, in order. Used by the SSE
+    /// reconnect backfill (`events::backfill`, #7) to reconcile missed deltas
+    /// against a [`SeenParts`] dedup set keyed on the part id.
+    ///
+    /// [`SeenParts`]: crate::opencode::events::SeenParts
+    pub fn text_parts(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.parts.iter().filter_map(|part| match part {
+            Part::Text { id, text } => Some((id.as_str(), text.as_str())),
+            _ => None,
+        })
     }
 }
 
@@ -219,14 +231,21 @@ pub struct MessageInfo {
 }
 
 /// A message part. Only text/reasoning carry data we read; everything else
-/// (`step-start`, `step-finish`, `tool`, …) collapses to `Other`.
+/// (`step-start`, `step-finish`, `tool`, …) collapses to `Other`. The part `id`
+/// (present on both the message list and the `/global/event` stream) is kept on
+/// the data-bearing variants so the SSE reconnect backfill can dedup by it (#7);
+/// it defaults so a part that omits it still deserializes (forward-compatible).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum Part {
     Text {
+        #[serde(default)]
+        id: String,
         text: String,
     },
     Reasoning {
+        #[serde(default)]
+        id: String,
         text: String,
     },
     #[serde(other)]

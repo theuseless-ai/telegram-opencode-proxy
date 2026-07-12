@@ -14,7 +14,9 @@
 //! | `PATCH /session/:id`          | `200 {}` — the deny-posture PATCH.                 |
 //! | `POST /session/:id/message`   | canned completed [`MessageEnvelope`]; echoes the   |
 //! |                               | prompt, or a fixed reply set via [`set_reply`].    |
-//! | `GET  /global/event`          | minimal SSE stub emitting `server.connected`.      |
+//! | `GET  /session/:id/message`   | canned assistant message list (backfill, #7).      |
+//! | `GET  /global/event`          | replays a canned SSE body, then closes so the      |
+//! |                               | client reconnects; connection count is observable. |
 //!
 //! The `/config/providers` catalogue has two variants so tests can exercise both
 //! model-validation outcomes: [`MockOpencode::start`] returns a catalogue that
@@ -53,6 +55,14 @@ struct OcState {
     /// test drive the `connect` reconnect path: the first probe sees the slot
     /// down, the reconnect bring-up then finds it up.
     config_fails: Arc<AtomicU64>,
+    /// SSE body served by `GET /global/event`; `None` → the minimal
+    /// `server.connected`-only stub. Set via [`MockOpencode::set_event_stream`].
+    event_body: Arc<Mutex<Option<String>>>,
+    /// Count of `GET /global/event` connections accepted — a reconnect bumps
+    /// this, so a test can assert the client re-subscribed.
+    event_connections: Arc<AtomicU64>,
+    /// Canned body for `GET /session/:id/message` (backfill, #7); `None` → `[]`.
+    message_list: Arc<Mutex<Option<String>>>,
 }
 
 /// A running in-process mock opencode instance. Dropping it leaves the spawned
@@ -61,6 +71,9 @@ pub struct MockOpencode {
     /// Base URL to point `OpencodeClient` / `Slot.opencode_url` at.
     pub url: String,
     reply: Arc<Mutex<Option<String>>>,
+    event_body: Arc<Mutex<Option<String>>>,
+    event_connections: Arc<AtomicU64>,
+    message_list: Arc<Mutex<Option<String>>>,
 }
 
 impl MockOpencode {
@@ -90,14 +103,46 @@ impl MockOpencode {
         *self.reply.lock().expect("mock_opencode reply lock") = Some(text.into());
     }
 
+    /// Pin the SSE body served by `GET /global/event`. Each connection replays
+    /// this whole body then closes, so a reconnecting client re-fetches it.
+    /// `body` should be raw SSE (`data: {…}\n\n` frames). Only #7's event tests
+    /// use this, hence `allow(dead_code)` for the harness crate.
+    #[allow(dead_code)]
+    pub fn set_event_stream(&self, body: impl Into<String>) {
+        *self.event_body.lock().expect("mock_opencode event lock") = Some(body.into());
+    }
+
+    /// Pin the JSON body served by `GET /session/:id/message` (a message-list
+    /// array) for the backfill path. Only #7's event tests use this.
+    #[allow(dead_code)]
+    pub fn set_message_list(&self, json_body: impl Into<String>) {
+        *self
+            .message_list
+            .lock()
+            .expect("mock_opencode msglist lock") = Some(json_body.into());
+    }
+
+    /// How many `GET /global/event` connections have been accepted so far. A
+    /// value ≥ 2 proves the client reconnected. Only #7's event tests use this.
+    #[allow(dead_code)]
+    pub fn event_connections(&self) -> u64 {
+        self.event_connections.load(Ordering::SeqCst)
+    }
+
     async fn start_inner(include_model: bool, config_fails: u64) -> Self {
         let reply: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let event_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let event_connections = Arc::new(AtomicU64::new(0));
+        let message_list: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let state = OcState {
             include_model,
             reply: Arc::clone(&reply),
             sessions: Arc::new(Mutex::new(HashSet::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             config_fails: Arc::new(AtomicU64::new(config_fails)),
+            event_body: Arc::clone(&event_body),
+            event_connections: Arc::clone(&event_connections),
+            message_list: Arc::clone(&message_list),
         };
 
         let app = Router::new()
@@ -105,7 +150,10 @@ impl MockOpencode {
             .route("/config/providers", get(config_providers))
             .route("/session", post(create_session))
             .route("/session/{id}", get(get_session).patch(patch_session))
-            .route("/session/{id}/message", post(message))
+            .route(
+                "/session/{id}/message",
+                post(message).get(get_session_messages),
+            )
             .route("/global/event", get(global_event))
             .with_state(state);
 
@@ -120,6 +168,9 @@ impl MockOpencode {
         Self {
             url: format!("http://{addr}"),
             reply,
+            event_body,
+            event_connections,
+            message_list,
         }
     }
 }
@@ -213,11 +264,35 @@ async fn message(
     }))
 }
 
-/// `GET /global/event` — minimal SSE stub. Emits a single `server.connected`
-/// frame then closes; full event-stream testing is issue #7.
-async fn global_event() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/event-stream")],
-        "data: {\"id\":\"evt_mock\",\"type\":\"server.connected\",\"properties\":{}}\n\n",
-    )
+/// `GET /global/event` — SSE stub. Serves the [`set_event_stream`] body (or a
+/// minimal `server.connected`-only frame), then the response ends and the
+/// connection closes, so a reconnecting client re-fetches it. Each accepted
+/// connection bumps [`event_connections`], so a test can assert the reconnect.
+///
+/// [`set_event_stream`]: MockOpencode::set_event_stream
+/// [`event_connections`]: MockOpencode::event_connections
+async fn global_event(State(st): State<OcState>) -> Response {
+    st.event_connections.fetch_add(1, Ordering::SeqCst);
+    let body = st
+        .event_body
+        .lock()
+        .expect("mock_opencode event lock")
+        .clone()
+        .unwrap_or_else(|| {
+            "data: {\"id\":\"evt_mock\",\"type\":\"server.connected\",\"properties\":{}}\n\n"
+                .to_string()
+        });
+    ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+}
+
+/// `GET /session/:id/message` — the message list the backfill path reads. Serves
+/// the [`set_message_list`](MockOpencode::set_message_list) body, or `[]`.
+async fn get_session_messages(State(st): State<OcState>, Path(_id): Path<String>) -> Response {
+    let body = st
+        .message_list
+        .lock()
+        .expect("mock_opencode msglist lock")
+        .clone()
+        .unwrap_or_else(|| "[]".to_string());
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
