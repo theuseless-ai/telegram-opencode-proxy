@@ -386,6 +386,14 @@ const ERROR_REPLY: &str = "⚠️ Sorry — I couldn't reach opencode to answer 
 /// Run the long-poll dispatcher until Ctrl-C. `bot` and `state` are injected as
 /// handler dependencies.
 pub async fn run(bot: Bot, state: Arc<AppState>) {
+    // Advertise exactly the bot's own commands (just `/whoami`). This replaces
+    // any stale menu previously registered via @BotFather, keeping Telegram's
+    // "/" command list in sync with the code. Best-effort — a failure here must
+    // not stop the dispatcher.
+    if let Err(err) = bot.set_my_commands(Command::bot_commands()).await {
+        tracing::warn!(error = %err, "could not set the bot command menu");
+    }
+
     let handler = Update::filter_message()
         .branch(teloxide::filter_command::<Command, _>().endpoint(handle_command))
         .branch(dptree::endpoint(handle_text));
