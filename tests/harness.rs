@@ -19,6 +19,7 @@
 
 mod support;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,9 +30,9 @@ use teloxide::types::Message;
 
 use telegram_opencode_proxy::admin::{self, AdminRequest, AdminResponse, AdminState};
 use telegram_opencode_proxy::config::{Config, Model, Pairing, Permissions, Slot};
-use telegram_opencode_proxy::connect_slots;
 use telegram_opencode_proxy::persistence::Db;
 use telegram_opencode_proxy::telegram::bot::{AppState, handle_text};
+use telegram_opencode_proxy::{connect_slots, spawn_slot_bringup};
 
 use support::mock_opencode::MockOpencode;
 use support::mock_telegram::MockTelegram;
@@ -424,4 +425,90 @@ async fn pair_deny_drops_a_pending_request() {
         other => panic!("expected PairDeny, got {other:?}"),
     }
     server.abort();
+}
+
+/// Poll `pred` every 10ms until it holds or `budget` elapses; returns whether it
+/// held. Used to await the background slot bring-up without a fixed sleep.
+async fn wait_for(mut pred: impl FnMut() -> bool, budget: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < budget {
+        if pred() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    pred()
+}
+
+/// Non-blocking startup (#51): `spawn_slot_bringup` returns immediately with an
+/// empty registry, and a reachable slot connects into it in the background.
+#[tokio::test]
+async fn slots_connect_in_the_background() {
+    let oc = MockOpencode::start().await;
+    let cfg = config_for(&oc.url); // slot "you" bound to SLOT_ID
+    let db = Db::open_in_memory().expect("in-memory persistence store opens");
+    let bot = Bot::new("12345:test-token");
+
+    // Exactly what `serve` now constructs: an empty registry.
+    let state = AppState::new(cfg, "unused.toml".into(), HashMap::new(), db, bot);
+
+    // The whitelist is seeded from `cfg.slots`, so the bound user is authorized
+    // immediately — before any slot has connected.
+    assert!(
+        state
+            .db
+            .list_allowed()
+            .expect("list_allowed")
+            .contains(&(SLOT_ID, "you".to_string())),
+        "bound user must be whitelisted regardless of connection state"
+    );
+    // Registry starts empty — the dispatcher would already be live here.
+    assert!(state.registry.read().expect("registry lock").is_empty());
+
+    spawn_slot_bringup(Arc::clone(&state), 120, Duration::from_millis(20));
+
+    let connected = wait_for(
+        || {
+            state
+                .registry
+                .read()
+                .expect("registry lock")
+                .contains_key("you")
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(connected, "reachable slot should connect in the background");
+}
+
+/// An unreachable slot's bring-up runs in its own task: it never blocks (spawn
+/// returns at once) and never populates the registry — but the bound user is
+/// still whitelisted so they can be served the moment the slot recovers.
+#[tokio::test]
+async fn dead_slot_bringup_does_not_block_or_populate() {
+    // Port 1 is unreachable → readiness fails fast (connection refused).
+    let cfg = config_for("http://127.0.0.1:1");
+    let db = Db::open_in_memory().expect("in-memory persistence store opens");
+    let bot = Bot::new("12345:test-token");
+    let state = AppState::new(cfg, "unused.toml".into(), HashMap::new(), db, bot);
+
+    assert!(
+        state
+            .db
+            .list_allowed()
+            .expect("list_allowed")
+            .contains(&(SLOT_ID, "you".to_string())),
+        "bound user is whitelisted even though the slot never connects"
+    );
+
+    // A tiny readiness budget so the failing task gives up quickly.
+    spawn_slot_bringup(Arc::clone(&state), 2, Duration::from_millis(5));
+
+    // spawn_slot_bringup returned immediately (it is not `async`); give the
+    // background task time to exhaust its budget, then confirm it stayed absent.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        state.registry.read().expect("registry lock").is_empty(),
+        "an unreachable slot must not populate the registry"
+    );
 }
