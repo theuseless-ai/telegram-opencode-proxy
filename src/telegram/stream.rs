@@ -30,6 +30,8 @@ use teloxide::types::{ChatAction, ChatId, Message, MessageId};
 use crate::opencode::client::OpencodeClient;
 use crate::opencode::events::{Event, PartKind, Subscription};
 use crate::opencode::types::{PartInput, PromptModel};
+use crate::permission;
+use crate::persistence::Db;
 use crate::telegram::render::{LiveState, TELEGRAM_LIMIT, Verbosity, split_message};
 use crate::telegram::retry;
 
@@ -63,6 +65,7 @@ pub async fn run_streaming_turn(
     bot: &Bot,
     http: &reqwest::Client,
     client: &OpencodeClient,
+    db: &Db,
     slot_url: &str,
     chat_id: i64,
     session_id: &str,
@@ -100,8 +103,16 @@ pub async fn run_streaming_turn(
             _ = flush_tick.tick() => sink.flush(&state).await,
             _ = typing_tick.tick() => sink.send_typing().await,
             event = subscription.recv(), if stream_open => match event {
-                Some(ev) => apply_event(&mut state, &mut reasoning_parts, session_id, ev),
                 None => stream_open = false, // terminal — stop polling this arm.
+                // A permission gate for this turn (#13): post the approval buttons.
+                // opencode holds the prompt blocked until the user taps one, which
+                // the dispatcher answers via `reply_permission`.
+                Some(Event::Permission(p)) if p.session_id == session_id => {
+                    if let Err(err) = permission::prompt(bot, db, chat_id, &p).await {
+                        tracing::warn!(error = %err, "posting permission prompt failed");
+                    }
+                }
+                Some(ev) => apply_event(&mut state, &mut reasoning_parts, session_id, ev),
             },
         }
     };
@@ -244,8 +255,10 @@ impl<'a> LiveSink<'a> {
         };
 
         let Some((first, rest)) = chunks.split_first() else {
-            // Nothing to say. If we opened a message, leave a marker; else post one.
-            let note = "(opencode returned no text)";
+            // Nothing to say — the model finished without a text answer (e.g. it
+            // only reasoned or used a tool). Say so actionably rather than cryptic.
+            let note = "⚠️ The model finished without a text answer (it may have only \
+                        reasoned or used a tool). Try rephrasing, or /new to reset.";
             match self.message_id {
                 Some(id) => {
                     let _ = self.edit(id, note).await;

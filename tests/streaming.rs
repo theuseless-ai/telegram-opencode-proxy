@@ -101,6 +101,7 @@ async fn streaming_turn_live_edits_typing_and_finalizes() {
     let bot = Bot::new("test-token").set_api_url(tg.url.parse().expect("mock url"));
     let http = reqwest::Client::new();
     let client = OpencodeClient::new(&oc.url).expect("client");
+    let db = telegram_opencode_proxy::persistence::Db::open_in_memory().expect("db");
     let model = PromptModel {
         provider_id: "llm-lan".into(),
         model_id: "Qwen3.6-35B-A3B-bf16".into(),
@@ -115,6 +116,7 @@ async fn streaming_turn_live_edits_typing_and_finalizes() {
         &bot,
         &http,
         &client,
+        &db,
         &oc.url,
         CHAT_ID,
         SESSION,
@@ -189,6 +191,7 @@ async fn leading_whitespace_delta_does_not_trigger_empty_send() {
     let bot = Bot::new("test-token").set_api_url(tg.url.parse().expect("mock url"));
     let http = reqwest::Client::new();
     let client = OpencodeClient::new(&oc.url).expect("client");
+    let db = telegram_opencode_proxy::persistence::Db::open_in_memory().expect("db");
     let model = PromptModel {
         provider_id: "llm-lan".into(),
         model_id: "Qwen3.6-35B-A3B-bf16".into(),
@@ -198,6 +201,7 @@ async fn leading_whitespace_delta_does_not_trigger_empty_send() {
         &bot,
         &http,
         &client,
+        &db,
         &oc.url,
         CHAT_ID,
         SESSION,
@@ -239,6 +243,7 @@ async fn streaming_turn_with_no_stream_still_posts_final_reply() {
     let bot = Bot::new("test-token").set_api_url(tg.url.parse().expect("mock url"));
     let http = reqwest::Client::new();
     let client = OpencodeClient::new(&oc.url).expect("client");
+    let db = telegram_opencode_proxy::persistence::Db::open_in_memory().expect("db");
     let model = PromptModel {
         provider_id: "llm-lan".into(),
         model_id: "Qwen3.6-35B-A3B-bf16".into(),
@@ -248,6 +253,7 @@ async fn streaming_turn_with_no_stream_still_posts_final_reply() {
         &bot,
         &http,
         &client,
+        &db,
         &oc.url,
         CHAT_ID,
         SESSION,
@@ -267,5 +273,81 @@ async fn streaming_turn_with_no_stream_still_posts_final_reply() {
     assert!(
         texts.iter().any(|t| t == "PONG"),
         "final reply must be delivered, got {texts:?}"
+    );
+}
+
+/// A `permission.asked` frame during a turn posts the approval buttons and
+/// stores a pending-approval row (#13).
+#[tokio::test]
+async fn permission_asked_posts_approval_buttons() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    oc.set_reply("done");
+    // Hold the blocking POST so the permission frame streams first.
+    oc.set_message_delay(Duration::from_millis(300));
+    oc.set_event_frames(
+        vec![
+            frame(serde_json::json!({"type":"server.connected","properties":{}})),
+            frame(serde_json::json!({
+                "type": "permission.asked",
+                "properties": {
+                    "id": "per_stream",
+                    "sessionID": SESSION,
+                    "permission": "bash",
+                    "patterns": ["git commit -m x"],
+                    "metadata": { "command": "git commit -m x" },
+                    "tool": { "messageID": "msg_a", "callID": "call_1" }
+                }
+            })),
+        ],
+        Duration::from_millis(20),
+    );
+
+    let bot = Bot::new("test-token").set_api_url(tg.url.parse().expect("mock url"));
+    let http = reqwest::Client::new();
+    let client = OpencodeClient::new(&oc.url).expect("client");
+    let db = telegram_opencode_proxy::persistence::Db::open_in_memory().expect("db");
+    let model = PromptModel {
+        provider_id: "llm-lan".into(),
+        model_id: "Qwen3.6-35B-A3B-bf16".into(),
+    };
+
+    run_streaming_turn(
+        &bot,
+        &http,
+        &client,
+        &db,
+        &oc.url,
+        CHAT_ID,
+        SESSION,
+        model,
+        text_parts("commit please"),
+        Verbosity::Normal,
+        StreamTiming {
+            flush_interval: Duration::from_millis(10),
+            typing_interval: Duration::from_millis(20),
+            retry: Duration::from_secs(5),
+        },
+    )
+    .await
+    .expect("streaming turn");
+
+    // A permission prompt with an inline keyboard was posted.
+    assert!(
+        tg.sent_messages().iter().any(|m| m.text.contains("🔐")),
+        "expected a permission prompt, got {:?}",
+        tg.sent_messages()
+    );
+    assert!(
+        tg.markup_messages() >= 1,
+        "the prompt should carry an inline keyboard"
+    );
+    // And the gate was recorded for the callback to answer.
+    assert!(
+        db.list_approvals()
+            .unwrap()
+            .iter()
+            .any(|a| a.session_id == SESSION && a.token == "per_stream"),
+        "an approval row should be stored"
     );
 }

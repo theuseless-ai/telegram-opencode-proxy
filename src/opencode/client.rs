@@ -193,15 +193,23 @@ impl OpencodeClient {
         Ok(())
     }
 
-    /// `POST /permission/:id/reply` — stubbed until the permission responder
-    /// lands in #13.
-    #[allow(dead_code)]
+    /// `POST /permission/:id/reply` — answer a `permission.asked` gate (#13),
+    /// unblocking the agent turn opencode holds while it waits. `reply` is
+    /// `once` / `always` / `reject` (with an optional message).
     pub async fn reply_permission(
         &self,
-        _request_id: &str,
-        _reply: PermissionReplyRequest,
-    ) -> Result<bool> {
-        bail!("not implemented (#13)")
+        request_id: &str,
+        reply: PermissionReplyRequest,
+    ) -> Result<()> {
+        self.http
+            .post(self.url(&format!("/permission/{request_id}/reply")))
+            .json(&reply)
+            .send()
+            .await
+            .context("POST /permission/:id/reply")?
+            .error_for_status()
+            .context("POST /permission/:id/reply returned an error status")?;
+        Ok(())
     }
 
     /// `GET /file/content` — read a file from the instance workdir. Stubbed
@@ -315,20 +323,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stubs_bail_with_issue_reference() {
+    async fn read_file_is_still_stubbed() {
+        // Outbound file reads land with #12; keep the explicit not-implemented.
         let c = OpencodeClient::new("http://127.0.0.1:4096").unwrap();
-        let e = c
-            .reply_permission(
-                "per_x",
-                PermissionReplyRequest {
-                    reply: super::super::types::PermissionReply::Reject,
-                    message: None,
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(e.to_string().contains("#13"));
         let e = c.read_file("/etc/hosts").await.unwrap_err();
-        assert!(e.to_string().contains("#13"));
+        assert!(e.to_string().contains("#12") || e.to_string().contains("#13"));
     }
 }
