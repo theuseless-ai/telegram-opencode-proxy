@@ -23,13 +23,15 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use teloxide::RequestError;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, ChatId, MessageId};
+use teloxide::types::{ChatAction, ChatId, Message, MessageId};
 
 use crate::opencode::client::OpencodeClient;
 use crate::opencode::events::{Event, PartKind, Subscription};
 use crate::opencode::types::PromptModel;
 use crate::telegram::render::{LiveState, TELEGRAM_LIMIT, split_message};
+use crate::telegram::retry;
 
 /// Timing knobs for [`run_streaming_turn`], injectable so tests can run fast.
 #[derive(Debug, Clone, Copy)]
@@ -153,13 +155,43 @@ impl<'a> LiveSink<'a> {
         }
     }
 
-    /// Best-effort `typing` chat action; a failure here is cosmetic.
+    /// `sendMessage`, retrying flood/transient failures (#25).
+    async fn send(&self, text: &str) -> Result<Message, RequestError> {
+        let bot = self.bot.clone();
+        let chat = self.chat;
+        let text = text.to_string();
+        retry::with_retry("send_message", move || {
+            let bot = bot.clone();
+            let text = text.clone();
+            async move { bot.send_message(chat, text).await }
+        })
+        .await
+    }
+
+    /// `editMessageText`, retrying flood/transient failures (#25).
+    async fn edit(&self, id: MessageId, text: &str) -> Result<Message, RequestError> {
+        let bot = self.bot.clone();
+        let chat = self.chat;
+        let text = text.to_string();
+        retry::with_retry("edit_message_text", move || {
+            let bot = bot.clone();
+            let text = text.clone();
+            async move { bot.edit_message_text(chat, id, text).await }
+        })
+        .await
+    }
+
+    /// Best-effort `typing` chat action (retried on flood/transient); a failure
+    /// here is cosmetic.
     async fn send_typing(&self) {
-        if let Err(err) = self
-            .bot
-            .send_chat_action(self.chat, ChatAction::Typing)
-            .await
-        {
+        let bot = self.bot.clone();
+        let chat = self.chat;
+        let sent = retry::with_retry("send_chat_action", move || {
+            let bot = bot.clone();
+            async move { bot.send_chat_action(chat, ChatAction::Typing).await }
+        })
+        .await;
+        if let Err(err) = sent {
             tracing::debug!(error = %err, "send_chat_action(typing) failed");
         }
     }
@@ -183,14 +215,14 @@ impl<'a> LiveSink<'a> {
             return;
         }
         match self.message_id {
-            None => match self.bot.send_message(self.chat, &chunk).await {
+            None => match self.send(&chunk).await {
                 Ok(msg) => {
                     self.message_id = Some(msg.id);
                     self.last_sent = chunk;
                 }
                 Err(err) => tracing::warn!(error = %err, "creating live message failed"),
             },
-            Some(id) => match self.bot.edit_message_text(self.chat, id, &chunk).await {
+            Some(id) => match self.edit(id, &chunk).await {
                 Ok(_) => self.last_sent = chunk,
                 Err(err) => tracing::debug!(error = %err, "live edit failed (will finalize)"),
             },
@@ -215,13 +247,10 @@ impl<'a> LiveSink<'a> {
             let note = "(opencode returned no text)";
             match self.message_id {
                 Some(id) => {
-                    let _ = self.bot.edit_message_text(self.chat, id, note).await;
+                    let _ = self.edit(id, note).await;
                 }
                 None => {
-                    self.bot
-                        .send_message(self.chat, note)
-                        .await
-                        .context("sending empty-reply note")?;
+                    self.send(note).await.context("sending empty-reply note")?;
                 }
             }
             return Ok(());
@@ -229,24 +258,17 @@ impl<'a> LiveSink<'a> {
 
         match self.message_id {
             Some(id) if *first != self.last_sent => {
-                self.bot
-                    .edit_message_text(self.chat, id, first)
+                self.edit(id, first)
                     .await
                     .context("finalizing live message")?;
             }
             Some(_) => {} // already showing the final first chunk.
             None => {
-                self.bot
-                    .send_message(self.chat, first)
-                    .await
-                    .context("sending final reply")?;
+                self.send(first).await.context("sending final reply")?;
             }
         }
         for chunk in rest {
-            self.bot
-                .send_message(self.chat, chunk)
-                .await
-                .context("sending overflow chunk")?;
+            self.send(chunk).await.context("sending overflow chunk")?;
         }
         Ok(())
     }
