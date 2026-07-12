@@ -8,7 +8,7 @@
 //! reports the numeric chat id (a bootstrap aid). Streaming, files, `/new`,
 //! `/get`, `/stop`, and per-user mpsc serialization land in later issues.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
@@ -102,6 +102,9 @@ pub struct AppState {
     /// one user run strictly one at a time; a full queue is rejected, not blocked
     /// (§6). [`shutdown`](Self::shutdown) drains these on exit (#21).
     user_queues: Mutex<HashMap<i64, Worker>>,
+    /// Slot names with a background reconnect in flight (#22), so a burst of
+    /// turns hitting an unreachable opencode spawns at most one reconnect per slot.
+    reconnecting: Mutex<HashSet<String>>,
 }
 
 impl AppState {
@@ -142,6 +145,7 @@ impl AppState {
             db,
             bot,
             user_queues: Mutex::new(HashMap::new()),
+            reconnecting: Mutex::new(HashSet::new()),
         })
     }
 
@@ -212,6 +216,45 @@ impl AppState {
         if let Err(err) = self.db.checkpoint() {
             tracing::warn!(error = %err, "WAL checkpoint on shutdown failed");
         }
+    }
+
+    /// Best-effort background reconnect of a slot whose opencode a turn just found
+    /// unreachable (#22). Idempotent per slot: at most one reconnect runs at a
+    /// time (the `reconnecting` guard), so a burst of failed turns doesn't
+    /// stampede. A restarted opencode is picked up (and re-validated) for the next
+    /// turn; if it's still down the attempt simply logs and clears the guard.
+    fn spawn_reconnect(self: &Arc<Self>, slot_name: String) {
+        {
+            let mut inflight = self
+                .reconnecting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !inflight.insert(slot_name.clone()) {
+                return; // already reconnecting this slot
+            }
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let params = ConnectParams {
+                name: slot_name.clone(),
+                url: None,
+                workdir: None,
+                telegram_id: None,
+            };
+            match state.ensure_connected_impl(params).await {
+                Ok(outcome) => {
+                    tracing::info!(slot = %slot_name, ?outcome, "reconnected slot after unreachable turn")
+                }
+                Err(err) => {
+                    tracing::warn!(slot = %slot_name, error = format!("{err:#}"), "slot reconnect attempt failed")
+                }
+            }
+            state
+                .reconnecting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&slot_name);
+        });
     }
 
     /// The names of every live slot in the registry (short read guard, dropped
@@ -492,7 +535,23 @@ enum Command {
 }
 
 /// Friendly message shown to the user when a turn fails; details go to the log.
-const ERROR_REPLY: &str = "⚠️ Sorry — I couldn't reach opencode to answer that. Please try again.";
+const ERROR_REPLY: &str = "⚠️ Sorry — something went wrong answering that. Please try again.";
+
+/// Shown when the turn failed specifically because the user's opencode instance
+/// was unreachable (#22) — distinct from a generic failure, and actionable.
+const OPENCODE_UNREACHABLE_REPLY: &str = "🔌 Your opencode instance looks unreachable right now. I'm trying to reconnect — \
+     please resend your message in a moment.";
+
+/// Whether `err`'s cause chain contains a connection/timeout failure — i.e. the
+/// opencode instance was unreachable, rather than an application-level error
+/// (#22). Drives the user-facing message and the background reconnect.
+fn is_opencode_unreachable(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|re| re.is_connect() || re.is_timeout())
+    })
+}
 
 /// Run the long-poll dispatcher until a shutdown signal. Returns when the
 /// dispatcher has stopped polling (SIGINT via the built-in Ctrl-C handler, or
@@ -682,11 +741,20 @@ async fn user_worker(
 ) {
     while let Some(job) = rx.recv().await {
         if let Err(err) = run_turn(&bot, &state, &job.slot, chat_id, &job.text).await {
-            tracing::error!(chat_id, slot = %job.slot.name, error = %err, "turn failed");
+            // Distinguish "your opencode is unreachable" (actionable, and worth a
+            // background reconnect) from a generic failure (#22).
+            let reply = if is_opencode_unreachable(&err) {
+                tracing::warn!(chat_id, slot = %job.slot.name, error = format!("{err:#}"), "turn failed — opencode unreachable");
+                state.spawn_reconnect(job.slot.name.clone());
+                OPENCODE_UNREACHABLE_REPLY
+            } else {
+                tracing::error!(chat_id, slot = %job.slot.name, error = format!("{err:#}"), "turn failed");
+                ERROR_REPLY
+            };
             let chat = ChatId(chat_id);
             let _ = retry::with_retry("error_reply", || {
                 let bot = bot.clone();
-                async move { bot.send_message(chat, ERROR_REPLY).await }
+                async move { bot.send_message(chat, reply).await }
             })
             .await;
         }
@@ -782,4 +850,38 @@ async fn run_turn(
         stream::StreamTiming::default(),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connection_refused_classifies_as_opencode_unreachable() {
+        // Port 1 refuses immediately → a reqwest connect error, wrapped the same
+        // way the turn path wraps it (`.context(...)`).
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(200))
+            .build()
+            .expect("client");
+        let err = http
+            .get("http://127.0.0.1:1/config")
+            .send()
+            .await
+            .expect_err("connection to :1 must fail");
+        let wrapped = anyhow::Error::new(err).context("GET /config");
+        assert!(
+            is_opencode_unreachable(&wrapped),
+            "a connect failure must be classified as unreachable"
+        );
+    }
+
+    #[test]
+    fn application_errors_are_not_unreachable() {
+        let err = anyhow::anyhow!("model 'ghost' is not configured under provider 'x'");
+        assert!(
+            !is_opencode_unreachable(&err),
+            "a non-network error must not be treated as unreachable"
+        );
+    }
 }

@@ -31,7 +31,9 @@ use teloxide::types::{ChatId, Message};
 
 use telegram_opencode_proxy::admin::{self, AdminRequest, AdminResponse, AdminState};
 use telegram_opencode_proxy::config::{Config, Model, Pairing, Permissions, Slot};
+use telegram_opencode_proxy::opencode::client::OpencodeClient;
 use telegram_opencode_proxy::persistence::Db;
+use telegram_opencode_proxy::state::SlotConn;
 use telegram_opencode_proxy::telegram::bot::{AppState, handle_stop, handle_text};
 use telegram_opencode_proxy::{connect_slots, spawn_slot_bringup};
 
@@ -750,6 +752,50 @@ async fn shutdown_drains_in_flight_turns() {
     assert!(
         tg.sent_messages().iter().any(|m| m.text == "echo: hello"),
         "in-flight turn should finish during graceful shutdown, got {:?}",
+        tg.sent_messages()
+    );
+}
+
+// --- opencode reachability (#22) ----------------------------------------------
+
+/// A turn whose slot's opencode is unreachable gets the clear "unreachable"
+/// message, not the generic error.
+#[tokio::test]
+async fn unreachable_opencode_gets_a_clear_message() {
+    let tg = MockTelegram::start().await;
+    // A slot that is live in the registry but whose opencode URL refuses
+    // connections (port 1) — i.e. it went down after startup.
+    let dead = "http://127.0.0.1:1";
+    let cfg = config_for(dead);
+    let client = OpencodeClient::new(dead).expect("client");
+    let mut registry = HashMap::new();
+    registry.insert(
+        "you".to_string(),
+        SlotConn {
+            slot: cfg.slots[0].clone(),
+            client,
+        },
+    );
+    let db = Db::open_in_memory().expect("db");
+    let bot = bot_pointed_at(&tg);
+    let state = AppState::new(cfg, "unused.toml".into(), registry, db, bot.clone());
+
+    handle_text(bot, text_message(SLOT_ID, "hi"), state.clone())
+        .await
+        .expect("handle_text succeeds");
+
+    let got = wait_for(
+        || {
+            tg.sent_messages()
+                .iter()
+                .any(|m| m.text.contains("unreachable"))
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        got,
+        "expected an 'opencode unreachable' reply, got {:?}",
         tg.sent_messages()
     );
 }
