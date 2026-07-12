@@ -26,7 +26,8 @@ use std::time::Duration;
 
 use serde_json::json;
 use teloxide::Bot;
-use teloxide::types::Message;
+use teloxide::prelude::Requester;
+use teloxide::types::{ChatId, Message};
 
 use telegram_opencode_proxy::admin::{self, AdminRequest, AdminResponse, AdminState};
 use telegram_opencode_proxy::config::{Config, Model, Pairing, Permissions, Slot};
@@ -683,5 +684,47 @@ async fn stop_with_no_session_is_a_no_op() {
             .any(|m| m.text.contains("Nothing to stop")),
         "expected a nothing-to-stop reply, got {:?}",
         tg.sent_messages()
+    );
+}
+
+// --- Telegram error / rate-limit / backoff (#25) ------------------------------
+
+/// A 429 flood-control response is retried after the server's `retry_after`,
+/// and the call ultimately succeeds.
+#[tokio::test]
+async fn telegram_send_recovers_from_flood_control() {
+    let tg = MockTelegram::start().await;
+    tg.fail_next_429(1); // first attempt floods, second succeeds
+    let bot = bot_pointed_at(&tg);
+
+    let res = telegram_opencode_proxy::telegram::retry::with_retry("send", || {
+        let bot = bot.clone();
+        async move { bot.send_message(ChatId(7), "hi").await }
+    })
+    .await;
+
+    assert!(res.is_ok(), "retry should recover from a 429, got {res:?}");
+    assert_eq!(tg.send_attempts(), 2, "one 429 then one success");
+    assert!(tg.sent_messages().iter().any(|m| m.text == "hi"));
+}
+
+/// A non-transient 400 is NOT retried — the wrapper returns after one attempt.
+#[tokio::test]
+async fn telegram_send_does_not_retry_bad_request() {
+    let tg = MockTelegram::start().await;
+    tg.fail_next_400(3); // would fail three times, but we must only try once
+    let bot = bot_pointed_at(&tg);
+
+    let res = telegram_opencode_proxy::telegram::retry::with_retry("send", || {
+        let bot = bot.clone();
+        async move { bot.send_message(ChatId(7), "hi").await }
+    })
+    .await;
+
+    assert!(res.is_err(), "a 400 must not be retried");
+    assert_eq!(
+        tg.send_attempts(),
+        1,
+        "a non-transient error must not be retried"
     );
 }

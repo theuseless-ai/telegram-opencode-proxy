@@ -31,7 +31,7 @@ use crate::pairing;
 use crate::persistence::Db;
 use crate::session;
 use crate::state::SlotConn;
-use crate::telegram::stream;
+use crate::telegram::{retry, stream};
 
 /// Readiness budget for the interactive `proxy connect` bring-up — short so the
 /// command fails fast on an unreachable slot (unlike the 60 s startup budget).
@@ -589,7 +589,12 @@ pub async fn handle_text(bot: Bot, msg: Message, state: Arc<AppState>) -> Respon
     match state.enqueue_turn(&bot, chat_id, job) {
         Enqueue::Queued => {}
         Enqueue::Full => {
-            bot.send_message(msg.chat.id, BUSY_REPLY).await?;
+            let chat = msg.chat.id;
+            retry::with_retry("busy_reply", || {
+                let bot = bot.clone();
+                async move { bot.send_message(chat, BUSY_REPLY).await }
+            })
+            .await?;
         }
     }
     Ok(())
@@ -608,7 +613,12 @@ async fn user_worker(
     while let Some(job) = rx.recv().await {
         if let Err(err) = run_turn(&bot, &state, &job.slot, chat_id, &job.text).await {
             tracing::error!(chat_id, slot = %job.slot.name, error = %err, "turn failed");
-            let _ = bot.send_message(ChatId(chat_id), ERROR_REPLY).await;
+            let chat = ChatId(chat_id);
+            let _ = retry::with_retry("error_reply", || {
+                let bot = bot.clone();
+                async move { bot.send_message(chat, ERROR_REPLY).await }
+            })
+            .await;
         }
     }
     tracing::debug!(chat_id, "user turn worker stopped (queue closed)");

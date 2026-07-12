@@ -70,6 +70,13 @@ struct TgState {
     /// Count of send/edit attempts rejected for whitespace-only text — the
     /// driver's non-empty guard (#8) should keep this at 0.
     empty_rejections: Arc<AtomicI64>,
+    /// Total `SendMessage` + `EditMessageText` attempts (incl. injected
+    /// failures) — lets a retry test count how many tries it took (#25).
+    send_attempts: Arc<AtomicI64>,
+    /// Remaining send/edit calls to answer with `429 retry_after: 0` (flood).
+    fail_429: Arc<AtomicI64>,
+    /// Remaining send/edit calls to answer with `400 Bad Request`.
+    fail_400: Arc<AtomicI64>,
     updates: Arc<Mutex<VecDeque<Value>>>,
     next_msg_id: Arc<AtomicI64>,
     bot_id: i64,
@@ -83,6 +90,9 @@ pub struct MockTelegram {
     edits: Arc<Mutex<Vec<EditMessage>>>,
     chat_actions: Arc<Mutex<Vec<String>>>,
     empty_rejections: Arc<AtomicI64>,
+    send_attempts: Arc<AtomicI64>,
+    fail_429: Arc<AtomicI64>,
+    fail_400: Arc<AtomicI64>,
     updates: Arc<Mutex<VecDeque<Value>>>,
 }
 
@@ -93,12 +103,18 @@ impl MockTelegram {
         let edits: Arc<Mutex<Vec<EditMessage>>> = Arc::new(Mutex::new(Vec::new()));
         let chat_actions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let empty_rejections = Arc::new(AtomicI64::new(0));
+        let send_attempts = Arc::new(AtomicI64::new(0));
+        let fail_429 = Arc::new(AtomicI64::new(0));
+        let fail_400 = Arc::new(AtomicI64::new(0));
         let updates: Arc<Mutex<VecDeque<Value>>> = Arc::new(Mutex::new(VecDeque::new()));
         let state = TgState {
             sent: Arc::clone(&sent),
             edits: Arc::clone(&edits),
             chat_actions: Arc::clone(&chat_actions),
             empty_rejections: Arc::clone(&empty_rejections),
+            send_attempts: Arc::clone(&send_attempts),
+            fail_429: Arc::clone(&fail_429),
+            fail_400: Arc::clone(&fail_400),
             updates: Arc::clone(&updates),
             next_msg_id: Arc::new(AtomicI64::new(1)),
             bot_id: 424242,
@@ -122,8 +138,32 @@ impl MockTelegram {
             edits,
             chat_actions,
             empty_rejections,
+            send_attempts,
+            fail_429,
+            fail_400,
             updates,
         }
+    }
+
+    /// Answer the next `n` send/edit calls with `429 retry_after: 0` (flood
+    /// control), then behave normally — drives the retry/backoff path (#25).
+    #[allow(dead_code)]
+    pub fn fail_next_429(&self, n: i64) {
+        self.fail_429.store(n, Ordering::SeqCst);
+    }
+
+    /// Answer the next `n` send/edit calls with `400 Bad Request` (a
+    /// non-transient error the retry path must NOT retry). (#25)
+    #[allow(dead_code)]
+    pub fn fail_next_400(&self, n: i64) {
+        self.fail_400.store(n, Ordering::SeqCst);
+    }
+
+    /// Total `sendMessage` + `editMessageText` attempts, including injected
+    /// failures — a retry test asserts how many tries a call took.
+    #[allow(dead_code)]
+    pub fn send_attempts(&self) -> i64 {
+        self.send_attempts.load(Ordering::SeqCst)
     }
 
     /// Snapshot of every recorded `sendMessage` call, in order.
@@ -173,17 +213,40 @@ async fn handler(
 ) -> Json<Value> {
     let req: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
 
-    // Mirror Telegram: a whitespace-only text body is rejected, so the streaming
-    // driver's non-empty guard (#8) is actually exercised here.
-    if matches!(method.as_str(), "SendMessage" | "EditMessageText")
-        && req["text"].as_str().unwrap_or_default().trim().is_empty()
-    {
-        st.empty_rejections.fetch_add(1, Ordering::SeqCst);
-        return Json(json!({
-            "ok": false,
-            "error_code": 400,
-            "description": "Bad Request: text must be non-empty"
-        }));
+    if matches!(method.as_str(), "SendMessage" | "EditMessageText") {
+        st.send_attempts.fetch_add(1, Ordering::SeqCst);
+
+        // Injected flood control (#25): 429 + `retry_after: 0` so the retry
+        // wrapper backs off (instantly) and tries again.
+        if st.fail_429.load(Ordering::SeqCst) > 0 {
+            st.fail_429.fetch_sub(1, Ordering::SeqCst);
+            return Json(json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 0",
+                "parameters": { "retry_after": 0 }
+            }));
+        }
+        // Injected non-transient error (#25): the retry wrapper must NOT retry.
+        if st.fail_400.load(Ordering::SeqCst) > 0 {
+            st.fail_400.fetch_sub(1, Ordering::SeqCst);
+            return Json(json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: something is wrong"
+            }));
+        }
+
+        // Mirror Telegram: a whitespace-only text body is rejected, so the
+        // streaming driver's non-empty guard (#8) is exercised here.
+        if req["text"].as_str().unwrap_or_default().trim().is_empty() {
+            st.empty_rejections.fetch_add(1, Ordering::SeqCst);
+            return Json(json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: text must be non-empty"
+            }));
+        }
     }
 
     let result = match method.as_str() {
