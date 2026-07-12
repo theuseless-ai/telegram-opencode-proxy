@@ -118,6 +118,17 @@ impl Db {
         f(&guard)
     }
 
+    /// Checkpoint the WAL into the main database file and truncate it — flushes
+    /// the store to a clean on-disk state at shutdown (#21). Best-effort: WAL
+    /// recovers on the next open regardless, so callers treat an error as a
+    /// warning, not fatal.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            Ok(())
+        })
+    }
+
     // --- routing: chat_id → opencode session -----------------------------
 
     /// The session id currently routed for `chat_id`, if any.
@@ -685,5 +696,17 @@ mod tests {
         let db = Db::open(&path).expect("reopen db");
         assert_eq!(db.get_session(101).unwrap().as_deref(), Some("ses_persist"));
         assert_eq!(db.allowed_slot(101).unwrap().as_deref(), Some("you"));
+    }
+
+    #[test]
+    fn checkpoint_flushes_a_file_backed_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("proxy.db");
+        let db = Db::open(&path).expect("open fresh db");
+        db.set_session(7, "ses_flush").unwrap();
+
+        // Checkpoint succeeds and the data is still readable afterwards.
+        db.checkpoint().expect("wal checkpoint succeeds");
+        assert_eq!(db.get_session(7).unwrap().as_deref(), Some("ses_flush"));
     }
 }

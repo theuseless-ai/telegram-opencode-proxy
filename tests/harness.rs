@@ -728,3 +728,28 @@ async fn telegram_send_does_not_retry_bad_request() {
         "a non-transient error must not be retried"
     );
 }
+
+// --- Graceful shutdown (#21) --------------------------------------------------
+
+/// An in-flight turn finishes during graceful shutdown: `AppState::shutdown`
+/// drains the user's worker, so the reply is delivered before it returns (no
+/// polling — the drain awaited the worker).
+#[tokio::test]
+async fn shutdown_drains_in_flight_turns() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let state = state_for(config_for(&oc.url)).await;
+    let bot = bot_pointed_at(&tg);
+
+    // Enqueue a turn (spawns the user's worker), then shut down immediately.
+    handle_text(bot, text_message(SLOT_ID, "hello"), state.clone())
+        .await
+        .expect("handle_text succeeds");
+    state.shutdown(Duration::from_secs(5)).await;
+
+    assert!(
+        tg.sent_messages().iter().any(|m| m.text == "echo: hello"),
+        "in-flight turn should finish during graceful shutdown, got {:?}",
+        tg.sent_messages()
+    );
+}
