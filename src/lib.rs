@@ -56,7 +56,7 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
     // Capture the admin socket path before `cfg` is moved into `AppState`, so we
     // can both serve on it and clean it up on shutdown.
     let admin_socket = cfg.admin_socket.clone();
-    let bot = teloxide::Bot::new(cfg.bot_token.clone());
+    let bot = teloxide::Bot::new(cfg.bot_token.expose());
     // Start with an EMPTY registry and bring the configured slots up
     // **concurrently, in the background** (#51). The dispatcher comes online
     // immediately instead of waiting out each slot's readiness budget, so one

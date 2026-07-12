@@ -71,7 +71,7 @@ async fn send_retry(socket: &Path, req: &AdminRequest) -> AdminResponse {
 /// advertises; slots come from the runtime registry, not config, in these tests.
 fn cfg_with_model() -> Config {
     Config {
-        bot_token: "t".to_string(),
+        bot_token: "t".into(),
         admin_socket: "/tmp/unused.sock".into(),
         slots: Vec::new(),
         model: Model {

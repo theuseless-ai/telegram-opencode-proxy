@@ -4,12 +4,55 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
+
+/// A secret string (the bot token) that is **redacted** in `Debug` and has no
+/// `Display`, so it can never leak into a log line, error, or `{:?}` dump (#23).
+/// Deserializes transparently from a TOML string.
+#[derive(Clone, Default, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// The underlying secret. Use only where the raw value is genuinely needed
+    /// (e.g. constructing the Telegram client) — never log the result.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether the secret is empty (unset).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<String> for Secret {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_empty() {
+            "Secret(<empty>)"
+        } else {
+            "Secret(<redacted>)"
+        })
+    }
+}
 
 /// CLI entry point: `serve` (daemon) or `pair` (admin enrollment client).
 #[derive(Debug, Parser)]
@@ -105,9 +148,10 @@ pub enum PairAction {
 /// Proxy configuration, loaded from `config.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// Telegram bot token. The `TELOXIDE_TOKEN` env var overrides this.
+    /// Telegram bot token (redacted in logs, see [`Secret`]). The
+    /// `TELOXIDE_TOKEN` env var overrides this.
     #[serde(default)]
-    pub bot_token: String,
+    pub bot_token: Secret,
     /// Local admin control socket — the CLI ↔ daemon channel (#38). Bound by
     /// `serve` and dialed by `proxy status`; kept local-only, perms 0600.
     pub admin_socket: PathBuf,
@@ -134,6 +178,39 @@ pub struct Config {
 fn default_db_path() -> PathBuf {
     PathBuf::from("proxy.db")
 }
+
+/// Whether a Unix file `mode` grants any access to group or other — i.e. the
+/// token in the file could be read by another user (#23).
+#[cfg(unix)]
+fn perms_expose_secret(mode: u32) -> bool {
+    mode & 0o077 != 0
+}
+
+/// Best-effort warning: the config file holds a bot token yet is readable by
+/// group/other. Unix-only; a stat failure is ignored (the load already read the
+/// file). Non-fatal by design — we don't want an upgrade to brick a running
+/// deployment — but loud, with the fix.
+#[cfg(unix)]
+fn warn_if_config_perms_leak(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    if perms_expose_secret(mode) {
+        tracing::warn!(
+            config = %path.display(),
+            mode = format!("{mode:o}"),
+            "config file holds a bot token but is readable by group/other — \
+             tighten it: chmod 600 {}",
+            path.display()
+        );
+    }
+}
+
+/// No file modes on non-Unix targets — nothing to check.
+#[cfg(not(unix))]
+fn warn_if_config_perms_leak(_path: &Path) {}
 
 /// A user seat: one opencode instance bound to one working directory.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -188,14 +265,20 @@ fn default_code_ttl_secs() -> i64 {
 }
 
 impl Config {
-    /// Load config from `path`, apply the `TELOXIDE_TOKEN` env override, and validate.
+    /// Load config from `path`, warn on loose file permissions, apply the
+    /// `TELOXIDE_TOKEN` env override, and validate.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         let mut cfg: Config =
             toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+        // If the FILE itself supplies the token, its permissions matter — warn
+        // before the env override, which may or may not replace it (#23).
+        if !cfg.bot_token.is_empty() {
+            warn_if_config_perms_leak(path);
+        }
         if let Ok(token) = std::env::var("TELOXIDE_TOKEN") {
-            cfg.bot_token = token;
+            cfg.bot_token = Secret::from(token);
         }
         cfg.validate()?;
         Ok(cfg)
@@ -414,5 +497,54 @@ model_id = \"m\"
         assert_eq!(cfg.slots.len(), 1, "update must not duplicate the entry");
         assert_eq!(cfg.slots[0].opencode_url, "http://127.0.0.1:5000");
         assert_eq!(cfg.slots[0].telegram_id, Some(999));
+    }
+
+    // --- Secrets handling (#23) -----------------------------------------------
+
+    #[test]
+    fn secret_redacts_in_debug() {
+        let dumped = format!("{:?}", Secret::from("super-secret-token-123"));
+        assert!(
+            !dumped.contains("super-secret-token-123"),
+            "leaked: {dumped}"
+        );
+        assert!(dumped.contains("redacted"));
+        assert!(format!("{:?}", Secret::default()).contains("empty"));
+    }
+
+    #[test]
+    fn config_debug_never_contains_the_token() {
+        let cfg: Config = toml::from_str(
+            r#"
+            bot_token = "leaky-token-abc123"
+            admin_socket = "/tmp/admin.sock"
+            [[slots]]
+            name = "you"
+            opencode_url = "http://127.0.0.1:4096"
+            workdir = "."
+            [model]
+            provider_id = "llm-lan"
+            model_id = "m"
+        "#,
+        )
+        .unwrap();
+        // The value is still usable...
+        assert_eq!(cfg.bot_token.expose(), "leaky-token-abc123");
+        // ...but a whole-Config debug dump must not print it.
+        let dumped = format!("{cfg:?}");
+        assert!(
+            !dumped.contains("leaky-token-abc123"),
+            "token leaked in Config Debug: {dumped}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn perms_expose_secret_flags_group_or_other_access() {
+        assert!(!perms_expose_secret(0o600), "owner-only is safe");
+        assert!(!perms_expose_secret(0o700), "owner rwx is safe");
+        assert!(perms_expose_secret(0o640), "group-read leaks");
+        assert!(perms_expose_secret(0o604), "other-read leaks");
+        assert!(perms_expose_secret(0o644), "group+other read leaks");
     }
 }
