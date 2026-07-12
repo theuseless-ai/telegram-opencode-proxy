@@ -2054,6 +2054,7 @@ dependencies = [
  "axum",
  "base64",
  "clap",
+ "futures-util",
  "notify",
  "rand",
  "reqwest",

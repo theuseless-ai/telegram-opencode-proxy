@@ -125,8 +125,8 @@ impl OpencodeClient {
     }
 
     /// `GET /session/:id/message` — list the session's messages. Not needed by
-    /// the blocking turn loop; used by the SSE reconnect/backfill path (#7).
-    #[allow(dead_code)]
+    /// the blocking turn loop; used by the SSE reconnect/backfill path
+    /// ([`events::backfill`](crate::opencode::events::backfill), #7).
     pub async fn get_messages(&self, session_id: &str) -> Result<Vec<MessageEnvelope>> {
         let resp = self
             .http
