@@ -77,6 +77,8 @@ struct TgState {
     fail_429: Arc<AtomicI64>,
     /// Remaining send/edit calls to answer with `400 Bad Request`.
     fail_400: Arc<AtomicI64>,
+    /// Count of `SendMessage` calls that carried a `reply_markup` (#13 buttons).
+    markups: Arc<AtomicI64>,
     updates: Arc<Mutex<VecDeque<Value>>>,
     next_msg_id: Arc<AtomicI64>,
     bot_id: i64,
@@ -93,6 +95,7 @@ pub struct MockTelegram {
     send_attempts: Arc<AtomicI64>,
     fail_429: Arc<AtomicI64>,
     fail_400: Arc<AtomicI64>,
+    markups: Arc<AtomicI64>,
     updates: Arc<Mutex<VecDeque<Value>>>,
 }
 
@@ -106,6 +109,7 @@ impl MockTelegram {
         let send_attempts = Arc::new(AtomicI64::new(0));
         let fail_429 = Arc::new(AtomicI64::new(0));
         let fail_400 = Arc::new(AtomicI64::new(0));
+        let markups = Arc::new(AtomicI64::new(0));
         let updates: Arc<Mutex<VecDeque<Value>>> = Arc::new(Mutex::new(VecDeque::new()));
         let state = TgState {
             sent: Arc::clone(&sent),
@@ -115,6 +119,7 @@ impl MockTelegram {
             send_attempts: Arc::clone(&send_attempts),
             fail_429: Arc::clone(&fail_429),
             fail_400: Arc::clone(&fail_400),
+            markups: Arc::clone(&markups),
             updates: Arc::clone(&updates),
             next_msg_id: Arc::new(AtomicI64::new(1)),
             bot_id: 424242,
@@ -144,6 +149,7 @@ impl MockTelegram {
             send_attempts,
             fail_429,
             fail_400,
+            markups,
             updates,
         }
     }
@@ -194,6 +200,13 @@ impl MockTelegram {
     #[allow(dead_code)]
     pub fn empty_rejections(&self) -> i64 {
         self.empty_rejections.load(Ordering::SeqCst)
+    }
+
+    /// How many `SendMessage` calls carried an inline keyboard (`reply_markup`) —
+    /// the permission-approval buttons (#13).
+    #[allow(dead_code)]
+    pub fn markup_messages(&self) -> i64 {
+        self.markups.load(Ordering::SeqCst)
     }
 
     /// Queue an incoming `Update` JSON to be served by the next `getUpdates`.
@@ -276,6 +289,9 @@ async fn handler(
         "SendMessage" => {
             let chat_id = req["chat_id"].as_i64().unwrap_or_default();
             let text = req["text"].as_str().unwrap_or_default().to_string();
+            if req.get("reply_markup").is_some() {
+                st.markups.fetch_add(1, Ordering::SeqCst);
+            }
             st.sent
                 .lock()
                 .expect("mock_telegram sent lock")

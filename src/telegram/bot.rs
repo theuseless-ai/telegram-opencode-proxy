@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use teloxide::prelude::*;
-use teloxide::types::ChatId;
+use teloxide::types::{CallbackQuery, ChatId};
 use teloxide::utils::command::BotCommands;
 use tokio::sync::mpsc;
 use tracing::Instrument;
@@ -25,8 +25,9 @@ use crate::admin::{
 use crate::auth;
 use crate::config::{Config, Slot};
 use crate::opencode::client::OpencodeClient;
-use crate::opencode::types::{PartInput, PromptModel};
+use crate::opencode::types::{PartInput, PermissionReplyRequest, PromptModel};
 use crate::pairing;
+use crate::permission;
 use crate::persistence::Db;
 use crate::session;
 use crate::state::SlotConn;
@@ -267,14 +268,14 @@ impl AppState {
 
     /// A cloned snapshot of every live slot definition. Takes a short read guard
     /// and releases it before returning — never held across an await.
-    fn slot_snapshot(&self) -> Vec<Slot> {
+    pub(crate) fn slot_snapshot(&self) -> Vec<Slot> {
         let guard = self.registry.read().unwrap_or_else(PoisonError::into_inner);
         guard.values().map(|c| c.slot.clone()).collect()
     }
 
     /// Clone the ready client for `name` out of the registry (guard dropped
     /// before the caller awaits), or `None` if the slot is unknown.
-    fn client_for(&self, name: &str) -> Option<OpencodeClient> {
+    pub(crate) fn client_for(&self, name: &str) -> Option<OpencodeClient> {
         let guard = self.registry.read().unwrap_or_else(PoisonError::into_inner);
         guard.get(name).map(|c| c.client.clone())
     }
@@ -575,12 +576,17 @@ pub async fn run(bot: Bot, state: Arc<AppState>) {
         tracing::warn!(error = %err, "could not set the bot command menu");
     }
 
-    let handler = Update::filter_message()
-        .branch(teloxide::filter_command::<Command, _>().endpoint(handle_command))
-        // Text (non-command) → the text turn; everything else (photo/document)
-        // → the media handler, which downloads inbound files (#11).
-        .branch(dptree::filter(|msg: Message| msg.text().is_some()).endpoint(handle_text))
-        .branch(dptree::endpoint(handle_media));
+    let handler = dptree::entry()
+        .branch(
+            Update::filter_message()
+                .branch(teloxide::filter_command::<Command, _>().endpoint(handle_command))
+                // Text (non-command) → the text turn; everything else
+                // (photo/document) → media, which downloads inbound files (#11).
+                .branch(dptree::filter(|msg: Message| msg.text().is_some()).endpoint(handle_text))
+                .branch(dptree::endpoint(handle_media)),
+        )
+        // Inline-button taps → the permission relay (#13).
+        .branch(Update::filter_callback_query().endpoint(handle_callback));
 
     let mut dispatcher = Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])
@@ -634,6 +640,92 @@ async fn handle_command(
         Command::Quiet => handle_verbosity(bot, msg, state, Verbosity::Quiet).await,
         Command::Verbose => handle_verbosity(bot, msg, state, Verbosity::Verbose).await,
     }
+}
+
+/// Handle an inline-button tap — the permission relay (#13). Parses the callback
+/// data, looks up the stored gate, replies to opencode (`reply_permission`,
+/// which unblocks the held turn), deletes the gate, and replaces the buttons
+/// with the decision. Always answers the callback so the client stops spinning.
+///
+/// `pub` so the harness can drive it directly (like [`handle_text`]).
+pub async fn handle_callback(
+    bot: Bot,
+    query: CallbackQuery,
+    state: Arc<AppState>,
+) -> ResponseResult<()> {
+    let data = query.data.clone().unwrap_or_default();
+    let Some((token, reply)) = permission::parse_callback(&data) else {
+        bot.answer_callback_query(query.id).await?; // not ours — just ack.
+        return Ok(());
+    };
+
+    let approval = match state.db.approval(&token) {
+        Ok(Some(approval)) => approval,
+        Ok(None) => {
+            bot.answer_callback_query(query.id)
+                .text("This request has expired.")
+                .await?;
+            return Ok(());
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "reading approval failed");
+            bot.answer_callback_query(query.id)
+                .text("Something went wrong.")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // Resolve the slot + client that owns the gate.
+    let slots = state.slot_snapshot();
+    let client = auth::resolve(&state.db, &slots, approval.chat_id)
+        .ok()
+        .flatten()
+        .and_then(|slot| state.client_for(&slot.name));
+    let Some(client) = client else {
+        bot.answer_callback_query(query.id)
+            .text("Can't reach opencode.")
+            .await?;
+        return Ok(());
+    };
+
+    let permission_id = approval
+        .permission_id
+        .clone()
+        .unwrap_or_else(|| token.clone());
+    let result = client
+        .reply_permission(
+            &permission_id,
+            PermissionReplyRequest {
+                reply,
+                message: None,
+            },
+        )
+        .await;
+    let _ = state.db.delete_approval(&token);
+
+    match result {
+        Ok(()) => {
+            // Replace the buttons with the decision (best-effort).
+            if let Some(msg) = &query.message {
+                let _ = bot
+                    .edit_message_text(
+                        ChatId(approval.chat_id),
+                        msg.id(),
+                        permission::decision_text(reply),
+                    )
+                    .await;
+            }
+            bot.answer_callback_query(query.id).await?;
+        }
+        Err(err) => {
+            tracing::error!(chat_id = approval.chat_id, error = %err, "reply_permission failed");
+            bot.answer_callback_query(query.id)
+                .text("Failed to send your decision.")
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 /// `/new` (#10): forget the user's current opencode session so the next message
@@ -984,6 +1076,7 @@ async fn run_turn(
         bot,
         &http,
         &client,
+        &state.db,
         &slot.opencode_url,
         chat_id,
         &session_id,

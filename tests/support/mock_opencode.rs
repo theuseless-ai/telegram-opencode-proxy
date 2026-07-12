@@ -82,6 +82,8 @@ struct OcState {
     /// MIME types of `type:"file"` parts seen on `POST /session/:id/message`
     /// (inbound files, #11).
     file_part_mimes: Arc<Mutex<Vec<String>>>,
+    /// `(permission_id, reply)` from `POST /permission/:id/reply` (the relay, #13).
+    permission_replies: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 /// A running in-process mock opencode instance. Dropping it leaves the spawned
@@ -97,6 +99,7 @@ pub struct MockOpencode {
     message_delay_ms: Arc<AtomicU64>,
     aborts: Arc<Mutex<Vec<String>>>,
     file_part_mimes: Arc<Mutex<Vec<String>>>,
+    permission_replies: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl MockOpencode {
@@ -188,6 +191,15 @@ impl MockOpencode {
             .clone()
     }
 
+    /// `(permission_id, reply)` pairs sent to `POST /permission/:id/reply` (#13).
+    #[allow(dead_code)]
+    pub fn permission_replies(&self) -> Vec<(String, String)> {
+        self.permission_replies
+            .lock()
+            .expect("mock_opencode permission lock")
+            .clone()
+    }
+
     async fn start_inner(include_model: bool, config_fails: u64) -> Self {
         let reply: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let event_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -197,6 +209,8 @@ impl MockOpencode {
         let message_delay_ms = Arc::new(AtomicU64::new(0));
         let aborts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let file_part_mimes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let permission_replies: Arc<Mutex<Vec<(String, String)>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let state = OcState {
             include_model,
             reply: Arc::clone(&reply),
@@ -210,6 +224,7 @@ impl MockOpencode {
             message_delay_ms: Arc::clone(&message_delay_ms),
             aborts: Arc::clone(&aborts),
             file_part_mimes: Arc::clone(&file_part_mimes),
+            permission_replies: Arc::clone(&permission_replies),
         };
 
         let app = Router::new()
@@ -222,6 +237,7 @@ impl MockOpencode {
                 post(message).get(get_session_messages),
             )
             .route("/session/{id}/abort", post(abort_session))
+            .route("/permission/{id}/reply", post(reply_permission))
             .route("/global/event", get(global_event))
             .with_state(state);
 
@@ -243,6 +259,7 @@ impl MockOpencode {
             message_delay_ms,
             aborts,
             file_part_mimes,
+            permission_replies,
         }
     }
 }
@@ -254,6 +271,22 @@ async fn abort_session(State(st): State<OcState>, Path(id): Path<String>) -> imp
         .lock()
         .expect("mock_opencode aborts lock")
         .push(id);
+    Json(json!(true))
+}
+
+/// `POST /permission/:id/reply` — record `(permission_id, reply)` and return
+/// `true`. Drives the permission relay (#13).
+async fn reply_permission(
+    State(st): State<OcState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let req: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+    let reply = req["reply"].as_str().unwrap_or_default().to_string();
+    st.permission_replies
+        .lock()
+        .expect("mock_opencode permission lock")
+        .push((id, reply));
     Json(json!(true))
 }
 

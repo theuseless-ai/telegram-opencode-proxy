@@ -32,10 +32,10 @@ use teloxide::types::{ChatId, Message};
 use telegram_opencode_proxy::admin::{self, AdminRequest, AdminResponse, AdminState};
 use telegram_opencode_proxy::config::{Config, Model, Pairing, Permissions, Slot};
 use telegram_opencode_proxy::opencode::client::OpencodeClient;
-use telegram_opencode_proxy::persistence::Db;
+use telegram_opencode_proxy::persistence::{Db, PendingApproval};
 use telegram_opencode_proxy::state::SlotConn;
 use telegram_opencode_proxy::telegram::bot::{
-    AppState, handle_media, handle_new, handle_stop, handle_text, handle_verbosity,
+    AppState, handle_callback, handle_media, handle_new, handle_stop, handle_text, handle_verbosity,
 };
 use telegram_opencode_proxy::telegram::render::Verbosity;
 use telegram_opencode_proxy::{connect_slots, spawn_slot_bringup};
@@ -904,4 +904,77 @@ async fn inbound_photo_is_sent_as_a_file_part() {
         oc.file_part_mimes()
     );
     assert_eq!(oc.file_part_mimes(), vec!["image/jpeg".to_string()]);
+}
+
+// --- permission relay (#13) ---------------------------------------------------
+
+/// A minimal `CallbackQuery` (inline-button tap) from the wire shape.
+fn callback_query(chat_id: i64, data: &str) -> teloxide::types::CallbackQuery {
+    serde_json::from_value(json!({
+        "id": "cbq_1",
+        "from": { "id": chat_id, "is_bot": false, "first_name": "Tester" },
+        "chat_instance": "ci",
+        "data": data
+    }))
+    .expect("constructing a CallbackQuery from wire JSON")
+}
+
+/// Tapping an approval button answers the gate in opencode and clears it.
+#[tokio::test]
+async fn permission_callback_replies_and_clears_the_gate() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let state = state_for(config_for(&oc.url)).await;
+    // A pending gate for the user.
+    state
+        .db
+        .insert_approval(&PendingApproval {
+            token: "per_test".into(),
+            chat_id: SLOT_ID,
+            session_id: "ses_x".into(),
+            permission_id: Some("per_test".into()),
+            created_at: 0,
+        })
+        .expect("insert approval");
+    let bot = bot_pointed_at(&tg);
+
+    handle_callback(
+        bot,
+        callback_query(SLOT_ID, "perm:per_test:once"),
+        state.clone(),
+    )
+    .await
+    .expect("handle_callback succeeds");
+
+    assert_eq!(
+        oc.permission_replies(),
+        vec![("per_test".to_string(), "once".to_string())],
+        "opencode should get the allow-once reply"
+    );
+    assert!(
+        state.db.approval("per_test").unwrap().is_none(),
+        "the gate must be cleared after answering"
+    );
+}
+
+/// A stale callback (no stored gate) is answered gracefully, sends no reply.
+#[tokio::test]
+async fn permission_callback_for_unknown_gate_is_a_no_op() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let state = state_for(config_for(&oc.url)).await;
+    let bot = bot_pointed_at(&tg);
+
+    handle_callback(
+        bot,
+        callback_query(SLOT_ID, "perm:gone:once"),
+        state.clone(),
+    )
+    .await
+    .expect("handle_callback succeeds");
+
+    assert!(
+        oc.permission_replies().is_empty(),
+        "no reply for an unknown/expired gate"
+    );
 }
