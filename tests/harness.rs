@@ -34,7 +34,10 @@ use telegram_opencode_proxy::config::{Config, Model, Pairing, Permissions, Slot}
 use telegram_opencode_proxy::opencode::client::OpencodeClient;
 use telegram_opencode_proxy::persistence::Db;
 use telegram_opencode_proxy::state::SlotConn;
-use telegram_opencode_proxy::telegram::bot::{AppState, handle_stop, handle_text};
+use telegram_opencode_proxy::telegram::bot::{
+    AppState, handle_new, handle_stop, handle_text, handle_verbosity,
+};
+use telegram_opencode_proxy::telegram::render::Verbosity;
 use telegram_opencode_proxy::{connect_slots, spawn_slot_bringup};
 
 use support::mock_opencode::MockOpencode;
@@ -797,5 +800,69 @@ async fn unreachable_opencode_gets_a_clear_message() {
         got,
         "expected an 'opencode unreachable' reply, got {:?}",
         tg.sent_messages()
+    );
+}
+
+// --- B4 commands: /new + verbosity (#10) --------------------------------------
+
+/// `/new` clears the user's stored session so the next turn starts fresh.
+#[tokio::test]
+async fn new_command_resets_the_session() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let state = state_for(config_for(&oc.url)).await;
+    state
+        .db
+        .set_session(SLOT_ID, "ses_old")
+        .expect("seed a session");
+    let bot = bot_pointed_at(&tg);
+
+    handle_new(bot, text_message(SLOT_ID, "/new"), state.clone())
+        .await
+        .expect("handle_new succeeds");
+
+    assert!(
+        state.db.get_session(SLOT_ID).unwrap().is_none(),
+        "the session must be cleared"
+    );
+    assert!(
+        tg.sent_messages()
+            .iter()
+            .any(|m| m.text.contains("fresh session")),
+        "expected a fresh-session confirmation, got {:?}",
+        tg.sent_messages()
+    );
+}
+
+/// `/quiet` toggles: first sets Quiet, a second returns to Normal.
+#[tokio::test]
+async fn quiet_command_toggles_verbosity() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let state = state_for(config_for(&oc.url)).await;
+    let bot = bot_pointed_at(&tg);
+
+    handle_verbosity(
+        bot.clone(),
+        text_message(SLOT_ID, "/quiet"),
+        state.clone(),
+        Verbosity::Quiet,
+    )
+    .await
+    .expect("handle_verbosity");
+    assert_eq!(state.db.get_verbosity(SLOT_ID).unwrap(), Verbosity::Quiet);
+
+    handle_verbosity(
+        bot,
+        text_message(SLOT_ID, "/quiet"),
+        state.clone(),
+        Verbosity::Quiet,
+    )
+    .await
+    .expect("handle_verbosity");
+    assert_eq!(
+        state.db.get_verbosity(SLOT_ID).unwrap(),
+        Verbosity::Normal,
+        "a second /quiet returns to Normal"
     );
 }

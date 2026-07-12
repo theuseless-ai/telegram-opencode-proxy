@@ -30,7 +30,7 @@ use teloxide::types::{ChatAction, ChatId, Message, MessageId};
 use crate::opencode::client::OpencodeClient;
 use crate::opencode::events::{Event, PartKind, Subscription};
 use crate::opencode::types::PromptModel;
-use crate::telegram::render::{LiveState, TELEGRAM_LIMIT, split_message};
+use crate::telegram::render::{LiveState, TELEGRAM_LIMIT, Verbosity, split_message};
 use crate::telegram::retry;
 
 /// Timing knobs for [`run_streaming_turn`], injectable so tests can run fast.
@@ -68,13 +68,14 @@ pub async fn run_streaming_turn(
     session_id: &str,
     model: PromptModel,
     text: &str,
+    verbosity: Verbosity,
     timing: StreamTiming,
 ) -> Result<()> {
     // Subscribe BEFORE firing the prompt so no delta of this turn is missed.
     let mut subscription = Subscription::connect(http, slot_url, timing.retry)
         .context("subscribing to /global/event for the streaming turn")?;
 
-    let mut state = LiveState::new();
+    let mut state = LiveState::new(verbosity);
     // Part ids known to be reasoning — their deltas drive `typing`, not the answer.
     let mut reasoning_parts: HashSet<String> = HashSet::new();
     let mut sink = LiveSink::new(bot, chat_id);

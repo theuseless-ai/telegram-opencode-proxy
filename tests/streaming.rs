@@ -23,6 +23,7 @@ use teloxide::Bot;
 
 use telegram_opencode_proxy::opencode::client::OpencodeClient;
 use telegram_opencode_proxy::opencode::types::PromptModel;
+use telegram_opencode_proxy::telegram::render::Verbosity;
 use telegram_opencode_proxy::telegram::stream::{StreamTiming, run_streaming_turn};
 
 use mock_opencode::MockOpencode;
@@ -105,7 +106,16 @@ async fn streaming_turn_live_edits_typing_and_finalizes() {
     };
 
     run_streaming_turn(
-        &bot, &http, &client, &oc.url, CHAT_ID, SESSION, model, "hi", timing,
+        &bot,
+        &http,
+        &client,
+        &oc.url,
+        CHAT_ID,
+        SESSION,
+        model,
+        "hi",
+        Verbosity::Normal,
+        timing,
     )
     .await
     .expect("streaming turn");
@@ -187,6 +197,7 @@ async fn leading_whitespace_delta_does_not_trigger_empty_send() {
         SESSION,
         model,
         "hi",
+        Verbosity::Normal,
         StreamTiming {
             flush_interval: Duration::from_millis(10),
             typing_interval: Duration::from_millis(20),
@@ -236,6 +247,7 @@ async fn streaming_turn_with_no_stream_still_posts_final_reply() {
         SESSION,
         model,
         "ping",
+        Verbosity::Normal,
         StreamTiming {
             flush_interval: Duration::from_millis(10),
             typing_interval: Duration::from_millis(20),
