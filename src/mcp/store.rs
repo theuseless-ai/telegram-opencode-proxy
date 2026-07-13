@@ -1,6 +1,6 @@
-//! Concurrency-safe, single-use file store backing the MCP file-transfer tools
-//! (`send_file_to_user` / `fetch_user_file`). See `docs/design/architecture.md`
-//! §11. Issue #65.
+//! Concurrency-safe, single-use file store backing the MCP file-transfer feature
+//! (the outbound `send_file_to_user` tool and the inbound `GET /files/{id}`
+//! download endpoint). See `docs/design/architecture.md` §11. Issue #65.
 //!
 //! A [`FileStore`] mediates every file that crosses the proxy on behalf of the
 //! opencode agent. It is deliberately **thin on memory and fat on disk**: the
@@ -8,40 +8,40 @@
 //! small [`FileMeta`] record — slot, filename, mime, size, TTL deadline, and the
 //! temp-file handle itself — sits in the in-memory `Mutex<HashMap<Uuid,
 //! FileMeta>>`. Keys are random v4 UUIDs, so an id is unguessable and carries no
-//! ambient authority; the owning slot is recorded alongside and re-checked on
-//! every read.
+//! ambient authority; the producing slot is recorded alongside for logging.
 //!
 //! # Lock discipline (mirrors `state.rs`)
 //!
 //! The expensive work — streaming bytes to disk in [`FileStore::put`], reading
-//! them back in [`FileStore::take`] — happens **outside** the lock. The mutex is
-//! only ever taken for the O(1) map mutation and released (guard dropped) before
-//! the next `.await`. No guard is ever held across a suspension point. Because
-//! `std::sync::Mutex` can be poisoned by a panic while held, every acquisition
-//! recovers with `unwrap_or_else(PoisonError::into_inner)` — the map is plain
-//! data, so a poisoned lock is still safe to use.
+//! them back in [`FileStore::take_by_id`] — happens **outside** the lock. The
+//! mutex is only ever taken for the O(1) map mutation and released (guard
+//! dropped) before the next `.await`. No guard is ever held across a suspension
+//! point. Because `std::sync::Mutex` can be poisoned by a panic while held, every
+//! acquisition recovers with `unwrap_or_else(PoisonError::into_inner)` — the map
+//! is plain data, so a poisoned lock is still safe to use.
 //!
 //! # Single-use + delete-vs-read safety
 //!
-//! [`FileStore::take`] is the only reader, and it **removes** the entry from the
-//! map under the lock before it reads the disk. That single move is the whole
+//! [`FileStore::take_by_id`] is the only reader, and it **removes** the entry from
+//! the map under the lock before it reads the disk. That single move is the whole
 //! safety story: it transfers ownership of the `NamedTempFile` to the caller, so
 //! (a) a file is delivered **at most once** — a concurrent or later second
-//! `take` finds the id gone and returns a clean [`TakeError::NotFound`]; and (b)
-//! there is no delete-vs-read window, because the sweeper and any rival `take`
-//! can only observe an id that is still in the map, and removal is atomic under
-//! the lock. When the returned `NamedTempFile` (held inside [`FileMeta`], moved
-//! out on take, or dropped by the sweeper) is dropped, the on-disk file is
-//! unlinked automatically.
+//! `take_by_id` finds the id gone and returns a clean [`TakeError::NotFound`]; and
+//! (b) there is no delete-vs-read window, because the sweeper and any rival
+//! `take_by_id` can only observe an id that is still in the map, and removal is
+//! atomic under the lock. When the returned `NamedTempFile` (held inside
+//! [`FileMeta`], moved out on take, or dropped by the sweeper) is dropped, the
+//! on-disk file is unlinked automatically.
 //!
-//! # Cross-slot isolation
+//! # Retrieval by capability id, not slot
 //!
-//! Every `take` verifies the caller's slot equals the slot that produced the id.
-//! A mismatch, a missing id, and an already-consumed id all collapse to the
-//! **same** opaque [`TakeError::NotFound`] — a caller can never distinguish "no
-//! such id" from "that id belongs to another slot", so the store is not an oracle
-//! for the existence of another slot's files. A cross-slot probe also never
-//! consumes the real owner's file: the entry is only removed on a slot match.
+//! An inbound file is retrieved by its **UUID alone** — the unguessable, v4-random
+//! id *is* the capability. There is no slot check on read: the inbound download
+//! endpoint (`GET /files/{id}`) is a plain `curl` that cannot carry an
+//! un-spoofable slot, so the guard is the capability id itself plus single-use
+//! consumption, TTL expiry, and the loopback-only bind. A missing id, an
+//! already-consumed id, and an expired id all collapse to the same opaque
+//! [`TakeError::NotFound`], so the store is not an oracle for which ids exist.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -62,7 +62,8 @@ const COPY_CHUNK: usize = 64 * 1024;
 /// owns the temp path and unlinks it on drop, so removing a `FileMeta` from the
 /// map (via `take` or the TTL sweep) is all it takes to reclaim the file.
 struct FileMeta {
-    /// The slot that produced this file; a `take` must present the same slot.
+    /// The slot that produced this file. Retrieval is by capability id, not slot,
+    /// so this is recorded only for logging/observability on `take_by_id`.
     slot: String,
     /// Display name as the user/agent knows it (used when re-sending / labelling).
     filename: String,
@@ -104,12 +105,12 @@ pub enum PutError {
     Io(#[source] std::io::Error),
 }
 
-/// Why a [`FileStore::take`] failed.
+/// Why a [`FileStore::take_by_id`] failed.
 #[derive(Debug, Error)]
 pub enum TakeError {
-    /// The id is unknown, was already consumed, has expired, or belongs to a
-    /// different slot. **Deliberately opaque** — all four collapse here so the
-    /// store cannot be probed for another slot's files.
+    /// The id is unknown, was already consumed, or has expired. **Deliberately
+    /// opaque** — all three collapse here so the store cannot be probed for which
+    /// ids exist.
     #[error("no such file, or it was already fetched or expired")]
     NotFound,
     /// An I/O error while reading the temp file back off disk.
@@ -210,26 +211,29 @@ impl FileStore {
         Ok(id)
     }
 
-    /// Consume the file `id` on behalf of `slot`, returning its bytes.
+    /// Consume the file `id` — the capability id **is** the authorization — and
+    /// return its bytes.
     ///
-    /// Under the lock: the id is looked up, its slot is checked against `slot`,
-    /// and on a match the entry is **removed** (transferring ownership of the temp
+    /// Under the lock the entry is **removed** (transferring ownership of the temp
     /// file out of the map) — this single move gives both single-use delivery and
     /// delete-vs-read safety. The guard is then dropped and the bytes are read off
-    /// disk asynchronously. Missing, already-consumed, expired, and wrong-slot ids
-    /// all return the same opaque [`TakeError::NotFound`]; a wrong-slot probe
-    /// leaves the real owner's entry untouched.
-    pub async fn take(&self, slot: &str, id: Uuid) -> Result<Taken, TakeError> {
+    /// disk asynchronously. There is deliberately **no slot check**: the inbound
+    /// `GET /files/{id}` download endpoint is a plain `curl` that cannot carry an
+    /// un-spoofable slot, so the guard is the unguessable v4 id plus single-use +
+    /// TTL + the loopback bind (see the module docs). Missing, already-consumed,
+    /// and expired ids all return the same opaque [`TakeError::NotFound`].
+    pub async fn take_by_id(&self, id: Uuid) -> Result<Taken, TakeError> {
         let meta = {
             let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-            // Only remove on a slot match, so a cross-slot probe cannot consume
-            // (or even confirm the existence of) another slot's file.
-            let owned = matches!(guard.get(&id), Some(m) if m.slot == slot);
-            if !owned {
-                return Err(TakeError::NotFound);
+            match guard.remove(&id) {
+                Some(meta) => meta,
+                None => return Err(TakeError::NotFound),
             }
-            guard.remove(&id).expect("entry present under the lock")
         }; // drop guard before the disk read.
+
+        // The producing slot rides along only for observability — retrieval is by
+        // capability id, so this is a log line, not an access check.
+        tracing::debug!(id = %id, slot = %meta.slot, "inbound file taken by capability id");
 
         let mut reader = tokio::fs::File::from_std(meta.file.reopen().map_err(TakeError::Io)?);
         let mut bytes = Vec::with_capacity(meta.size as usize);
@@ -308,7 +312,7 @@ mod tests {
             .await
             .expect("put succeeds");
 
-        let taken = store.take("frank", id).await.expect("take succeeds");
+        let taken = store.take_by_id(id).await.expect("take succeeds");
         assert_eq!(taken.filename, "note.txt");
         assert_eq!(taken.mime, "text/plain");
         assert_eq!(taken.bytes, b"hello world");
@@ -323,31 +327,21 @@ mod tests {
             .await
             .unwrap();
 
-        store.take("frank", id).await.expect("first take");
-        let err = store.take("frank", id).await.expect_err("second take");
+        store.take_by_id(id).await.expect("first take");
+        let err = store.take_by_id(id).await.expect_err("second take");
         assert!(matches!(err, TakeError::NotFound), "single-use");
     }
 
     #[tokio::test]
-    async fn wrong_slot_is_not_found_and_does_not_consume() {
+    async fn unknown_id_is_not_found() {
         let store = roomy();
-        let id = store
-            .put("frank", "secret.txt", "text/plain", &b"top secret"[..])
+        // A random id that was never `put` reads as an opaque NotFound.
+        let err = store
+            .take_by_id(Uuid::new_v4())
             .await
-            .unwrap();
-
-        // A holly request must see a clean NotFound and NOT consume frank's file.
-        let err = store.take("holly", id).await.expect_err("cross-slot take");
-        assert!(matches!(err, TakeError::NotFound), "cross-slot isolation");
-        assert_eq!(
-            store.len(),
-            1,
-            "probe must not consume the real owner's file"
-        );
-
-        // The rightful owner can still read it.
-        let taken = store.take("frank", id).await.expect("owner take");
-        assert_eq!(taken.bytes, b"top secret");
+            .expect_err("unknown id");
+        assert!(matches!(err, TakeError::NotFound));
+        assert_eq!(store.len(), 0);
     }
 
     #[tokio::test]
@@ -382,7 +376,7 @@ mod tests {
 
         assert_eq!(store.len(), 0, "expired entry swept from the map");
         assert!(!path.exists(), "sweep unlinks the temp file");
-        let err = store.take("frank", id).await.expect_err("take after sweep");
+        let err = store.take_by_id(id).await.expect_err("take after sweep");
         assert!(matches!(err, TakeError::NotFound));
     }
 
@@ -421,7 +415,7 @@ mod tests {
         for (id, i) in ids {
             let store = Arc::clone(&store);
             take_handles.push(tokio::spawn(async move {
-                let taken = store.take("frank", id).await.expect("concurrent take");
+                let taken = store.take_by_id(id).await.expect("concurrent take");
                 assert_eq!(taken.bytes, format!("payload-{i}").into_bytes());
             }));
         }

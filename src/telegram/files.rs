@@ -114,7 +114,7 @@ fn mime_from_extension(filename: Option<&str>) -> Option<String> {
 /// This is the **shared download half** of both inbound paths: [`inbound_parts`]
 /// builds the #11 base64 FilePart from the returned bytes, while `handle_media`'s
 /// MCP announce path (#65) streams the same bytes into the `FileStore` and injects
-/// a `fetch_user_file` announce instead — so the download logic (and the 20 MB
+/// a one-shot download-URL announce instead — so the download logic (and the 20 MB
 /// guard) lives in exactly one place.
 pub async fn download_inbound(
     bot: &Bot,

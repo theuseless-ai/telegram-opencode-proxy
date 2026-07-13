@@ -1,7 +1,8 @@
 //! MCP file-transfer server (issue #65): the proxy hosts **one stateless**
-//! `type:"remote"` MCP server that gives the opencode agent two self-describing
-//! tools — `send_file_to_user` and `fetch_user_file` — so moving a file is a
-//! tool call, not a filesystem convention it must be taught. See
+//! `type:"remote"` MCP server that gives the opencode agent the self-describing
+//! `send_file_to_user` tool (outbound), plus a plain `GET /files/{id}` download
+//! endpoint for inbound files — so moving a file is a tool call or an HTTP pull,
+//! not a filesystem convention it must be taught. See
 //! `docs/design/architecture.md` §11.
 //!
 //! # Topology — one shared server, per-request slot
@@ -19,31 +20,42 @@
 //!
 //! [`AppState::slot_snapshot`]: crate::telegram::bot::AppState::slot_snapshot
 //!
-//! # The two tools
+//! # Outbound: the `send_file_to_user` tool
 //!
-//! - **`send_file_to_user`** routes an outbound file (base64 `content`) to the
-//!   slot-owning Telegram user: resolve `X-Slot → chat_id`
-//!   ([`Db::chat_for_slot`](crate::persistence::Db::chat_for_slot)), then send the
-//!   bytes through [`files::send_outbound_bytes`], wrapped in the `#25`
-//!   flood-control/backoff retry ([`retry::with_retry`](crate::telegram::retry)).
-//! - **`fetch_user_file`** is the inbound pull: the media path stores a
-//!   downloaded file and announces its id to the model (#65 T6); the model calls
-//!   this tool with that id, and the server [`take`](store::FileStore::take)s it
-//!   from the store **scoped to the caller's slot** (cross-slot isolation lives in
-//!   the store). Text comes back as a text block, an image as an image block (the
-//!   vision path), and anything else as a short descriptive note.
+//! **`send_file_to_user`** routes an outbound file (base64 `content`) to the
+//! slot-owning Telegram user: resolve `X-Slot → chat_id`
+//! ([`Db::chat_for_slot`](crate::persistence::Db::chat_for_slot)), then send the
+//! bytes through [`files::send_outbound_bytes`], wrapped in the `#25`
+//! flood-control/backoff retry ([`retry::with_retry`](crate::telegram::retry)).
+//!
+//! # Inbound: the `GET /files/{id}` download endpoint
+//!
+//! When the user sends a file, the media path stores the bytes in the
+//! [`FileStore`](store::FileStore) and announces a one-shot download **URL** to the
+//! model (#65 T6). The agent `curl`s that URL into its workspace and reads the
+//! file with its **own** tools — so the proxy is format-agnostic (PDF, image,
+//! docx, …) and host-independent (an HTTP pull, no shared filesystem). The
+//! endpoint [`take_by_id`](store::FileStore::take_by_id)s the file and serves the
+//! raw bytes; the guard is the unguessable capability id plus single-use + TTL +
+//! the loopback bind — a plain `curl` carries no un-spoofable slot, so retrieval
+//! is by id, not slot. An unknown/consumed/expired id is a plain `404`.
 //!
 //! # Wiring
 //!
-//! [`build_router`] produces the single `/mcp` axum mount; `serve()` (#65 T7)
-//! binds it and spawns the store's TTL sweep. This module does not touch
-//! `serve()` itself.
+//! [`build_router`] produces the axum mount — the `/mcp` rmcp service plus the
+//! stateful `GET /files/{id}` route; `serve()` (#65 T7) binds it and spawns the
+//! store's TTL sweep. This module does not touch `serve()` itself.
 
 pub mod store;
 
 use std::sync::Arc;
 
+use axum::body::Body;
+use axum::extract::{Path, State};
 use axum::http::request::Parts;
+use axum::http::{StatusCode, header};
+use axum::response::Response;
+use axum::routing::get;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use rmcp::{
@@ -81,22 +93,14 @@ struct SendFileArgs {
     caption: Option<String>,
 }
 
-/// Arguments for the `fetch_user_file` tool.
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-struct FetchFileArgs {
-    /// The file id from the announcement the proxy injected when the user sent a
-    /// file. Each id is single-use and expires.
-    id: String,
-}
-
 /// The shared, stateless MCP file-transfer server. One instance serves every
 /// slot; the caller's slot is read per request from the `X-Slot` header (see the
 /// module docs), never baked in and never a tool argument.
 #[derive(Clone)]
 pub struct FilesMcp {
     /// Shared dispatcher state — the slot registry (for `X-Slot` validation), the
-    /// routing DB (`chat_for_slot`), the bot handle (outbound sends), and the file
-    /// store (`fetch_user_file`).
+    /// routing DB (`chat_for_slot`), and the bot handle (outbound sends). The file
+    /// store (inbound downloads) is reached through the same `AppState`.
     app: Arc<AppState>,
     /// The rmcp-generated tool dispatch table for this server.
     tool_router: ToolRouter<Self>,
@@ -199,64 +203,6 @@ impl FilesMcp {
 
         Ok(CallToolResult::success(vec![ContentBlock::text("sent")]))
     }
-
-    /// Fetch a file the user sent you, by the id from the proxy's announcement.
-    ///
-    /// When the user sends a file, the proxy adds a note to your prompt with the
-    /// file's id; call this tool with that id to read the file **now**. Text files
-    /// come back as text, images come back as the image itself (so you can see
-    /// it), and other binary types come back as a short description. Each id is
-    /// single-use and expires, so fetch it promptly.
-    #[tool(
-        name = "fetch_user_file",
-        description = "Fetch a file the user sent you. When the user sends a file, the proxy adds a note \
-            to your prompt containing the file's `id`; call this tool with that id to read the file's \
-            contents NOW. A text file is returned as text, an image is returned as the image itself so \
-            you can see it, and any other binary type is returned as a short description. Each id is \
-            single-use and expires — fetch it promptly and only once."
-    )]
-    async fn fetch_user_file(
-        &self,
-        Extension(parts): Extension<Parts>,
-        Parameters(args): Parameters<FetchFileArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let slot = self.slot_of(&parts)?;
-
-        let id = Uuid::parse_str(args.id.trim())
-            .map_err(|_| ErrorData::invalid_params("`id` is not a valid file id", None))?;
-
-        let taken = match self.app.file_store.take(&slot, id).await {
-            Ok(taken) => taken,
-            Err(store::TakeError::NotFound) => {
-                // Opaque on purpose — never reveal whether the id exists under
-                // another slot (cross-slot isolation is enforced in the store).
-                return Err(ErrorData::invalid_params(
-                    "no such file, or it was already fetched or expired",
-                    None,
-                ));
-            }
-            Err(store::TakeError::Io(err)) => {
-                tracing::error!(slot = %slot, error = %err, "reading fetched file failed");
-                return Err(ErrorData::internal_error("could not read the file", None));
-            }
-        };
-
-        let block = if taken.mime.starts_with("text/") {
-            ContentBlock::text(String::from_utf8_lossy(&taken.bytes).into_owned())
-        } else if taken.mime.starts_with("image/") {
-            // The vision path: hand the model the image bytes as base64 + mime.
-            ContentBlock::image(STANDARD.encode(&taken.bytes), taken.mime.clone())
-        } else {
-            ContentBlock::text(format!(
-                "binary file {} ({}, {} bytes)",
-                taken.filename,
-                taken.mime,
-                taken.bytes.len()
-            ))
-        };
-
-        Ok(CallToolResult::success(vec![block]))
-    }
 }
 
 // `router = self.tool_router` points the generated `call_tool`/`list_tools` at
@@ -281,23 +227,102 @@ fn decode_content(content: &str) -> Result<Vec<u8>, base64::DecodeError> {
     STANDARD.decode(b64.trim())
 }
 
-/// Build the axum router hosting the single stateless MCP server.
+/// Serve the bytes of a stored inbound file, single-use, by its capability id.
 ///
-/// One [`FilesMcp`] service is mounted at `/mcp` — **no** per-slot nesting; the
-/// slot travels in the `X-Slot` header. The service runs stateless
-/// (`with_stateful_mode(false)`, so there is no `MCP-Session-Id` bookkeeping) and
-/// answers with JSON (`with_json_response(true)`). `ct` is the caller's
-/// cancellation token, wired for graceful shutdown by `serve()` (#65 T7).
+/// The inbound announce (#65) hands the agent a `http://<bind>:<port>/files/<id>`
+/// URL built by [`Mcp::download_url`](crate::config::Mcp::download_url); this
+/// handler answers the agent's `curl`. There is deliberately **no slot check** — a
+/// plain `curl` cannot carry an un-spoofable `X-Slot`, so the guard is the
+/// unguessable v4 id plus single-use consumption, TTL expiry, and the loopback
+/// bind (see the module docs). Outcomes:
+///
+/// - a `{id}` that is not a UUID → **400** (never reaches the store);
+/// - [`take_by_id`](store::FileStore::take_by_id) `Ok` → **200** with
+///   `Content-Type: <mime>`, `Content-Disposition: attachment; filename="…"`, and
+///   the raw bytes as the body;
+/// - [`TakeError::NotFound`](store::TakeError::NotFound) (unknown, already
+///   consumed, or expired) → a plain **404** that leaks nothing;
+/// - [`TakeError::Io`](store::TakeError::Io) → **500**.
+///
+/// Wired to [`AppState`] via axum [`State`] in [`build_router`].
+async fn download_file(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let Ok(uuid) = Uuid::parse_str(id.trim()) else {
+        return plain(StatusCode::BAD_REQUEST, "bad file id");
+    };
+
+    match app.file_store.take_by_id(uuid).await {
+        Ok(store::Taken {
+            filename,
+            mime,
+            bytes,
+        }) => {
+            // The filename may contain characters that are invalid in an HTTP
+            // header value (quotes, controls); building the response by hand lets a
+            // bad header collapse to a 500 rather than panic.
+            let disposition = format!("attachment; filename=\"{filename}\"");
+            match Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime)
+                .header(header::CONTENT_DISPOSITION, disposition)
+                .body(Body::from(bytes))
+            {
+                Ok(resp) => resp,
+                Err(err) => {
+                    tracing::error!(id = %uuid, error = %err, "building file download response failed");
+                    plain(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                }
+            }
+        }
+        Err(store::TakeError::NotFound) => plain(StatusCode::NOT_FOUND, "not found"),
+        Err(store::TakeError::Io(err)) => {
+            tracing::error!(id = %uuid, error = %err, "reading inbound file for download failed");
+            plain(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
+    }
+}
+
+/// A minimal plain-text response — the only shape the download endpoint's error
+/// (and 400) paths need. Kept deliberately terse so a 404 leaks nothing.
+fn plain(status: StatusCode, body: &'static str) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(body))
+        .expect("static plain-text response is always valid")
+}
+
+/// Build the axum router hosting the MCP server and the inbound download endpoint.
+///
+/// Two mounts share one [`Router`]:
+///
+/// - `nest_service("/mcp", …)` — the stateless [`FilesMcp`] rmcp tower service,
+///   **no** per-slot nesting (the slot travels in the `X-Slot` header). It runs
+///   stateless (`with_stateful_mode(false)`, so no `MCP-Session-Id` bookkeeping)
+///   and answers with JSON (`with_json_response(true)`).
+/// - `route("/files/{id}", get(download_file))` — the single-use inbound download
+///   endpoint, an ordinary stateful axum route. Its handler needs [`AppState`], so
+///   the router is typed `Router<Arc<AppState>>` until [`Router::with_state`]
+///   supplies `app` and collapses it back to `Router<()>` — the type the
+///   `nest_service` mount already carries — so the two compose cleanly. (`app` is
+///   cloned: one clone is captured by the rmcp service factory, the original
+///   becomes the route state.)
+///
+/// `ct` is the caller's cancellation token, wired for graceful shutdown by
+/// `serve()` (#65 T7). axum 0.8 path params use the `{id}` brace syntax.
 pub fn build_router(app: Arc<AppState>, ct: CancellationToken) -> axum::Router {
+    let mcp_app = app.clone();
     let svc = StreamableHttpService::new(
-        move || Ok(FilesMcp::new(app.clone())),
+        move || Ok(FilesMcp::new(mcp_app.clone())),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
             .with_stateful_mode(false)
             .with_json_response(true)
             .with_cancellation_token(ct),
     );
-    axum::Router::new().nest_service("/mcp", svc)
+    axum::Router::new()
+        .nest_service("/mcp", svc)
+        .route("/files/{id}", get(download_file))
+        .with_state(app)
 }
 
 #[cfg(test)]

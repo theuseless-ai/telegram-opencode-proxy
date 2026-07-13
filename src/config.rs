@@ -12,6 +12,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
+use uuid::Uuid;
 
 /// A secret string (the bot token) that is **redacted** in `Debug` and has no
 /// `Display`, so it can never leak into a log line, error, or `{:?}` dump (#23).
@@ -174,9 +175,10 @@ pub struct Config {
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
     /// The `[mcp]` file-transfer server (#65): a single stateless
-    /// Streamable-HTTP MCP endpoint shared by every slot, giving opencode two
-    /// tools (`send_file_to_user` / `fetch_user_file`) instead of a filesystem
-    /// convention. Optional — a missing `[mcp]` block uses the defaults.
+    /// Streamable-HTTP MCP endpoint shared by every slot, giving opencode the
+    /// `send_file_to_user` tool (outbound) plus a `GET /files/{id}` download
+    /// endpoint for inbound files, instead of a filesystem convention. Optional —
+    /// a missing `[mcp]` block uses the defaults.
     #[serde(default)]
     pub mcp: Mcp,
 }
@@ -292,18 +294,18 @@ pub struct Mcp {
     #[serde(default = "default_mcp_port")]
     pub port: u16,
     /// Maximum size, in bytes, of a single file transferred through
-    /// `send_file_to_user` / `fetch_user_file`. Defaults to 20 MiB, mirroring
-    /// the inbound-file cap in `telegram::files::MAX_INBOUND_BYTES`.
+    /// `send_file_to_user` or the inbound download endpoint. Defaults to 20 MiB,
+    /// mirroring the inbound-file cap in `telegram::files::MAX_INBOUND_BYTES`.
     #[serde(default = "default_mcp_max_file_bytes")]
     pub max_file_bytes: u64,
     /// How long, in seconds, an inbound file announced to the model stays
-    /// fetchable via `fetch_user_file` before it is purged from the store.
+    /// downloadable via `GET /files/{id}` before it is purged from the store.
     /// Defaults to `300` (5 minutes).
     #[serde(default = "default_mcp_ttl_secs")]
     pub ttl_secs: u64,
-    /// When `true`, an inbound file is *also* attached as a base64 `FilePart`
-    /// (#11) alongside the MCP announcement, for models/tooling that don't
-    /// call `fetch_user_file`. Defaults to `false`.
+    /// When `true`, an inbound file is attached as a base64 `FilePart`
+    /// (#11) inline in the turn instead of the MCP download announcement, for
+    /// models/tooling that can't `curl` the download URL. Defaults to `false`.
     #[serde(default)]
     pub filepart_fallback: bool,
 }
@@ -354,6 +356,17 @@ impl Mcp {
     /// is identical for every slot.
     pub fn url(&self) -> String {
         format!("http://{}:{}/mcp", self.bind, self.port)
+    }
+
+    /// The one-shot download URL for an inbound file the proxy has stored under
+    /// `id` (`http://<bind>:<port>/files/<id>`). This is handed to the agent in the
+    /// inbound announce (#65): the agent `curl`s it into its workspace and reads
+    /// the file with its own tools, so the proxy stays format-agnostic (PDF, image,
+    /// docx, …) and host-independent (an HTTP pull, no shared filesystem). The
+    /// `GET /files/{id}` endpoint is single-use + TTL-bounded, so the URL works
+    /// exactly once. Mirrors [`Mcp::url`]; the loopback bind is the trust boundary.
+    pub fn download_url(&self, id: &Uuid) -> String {
+        format!("http://{}:{}/files/{}", self.bind, self.port, id)
     }
 }
 
@@ -643,6 +656,11 @@ model_id = \"m\"
         assert_eq!(cfg.mcp.ttl_secs, 300);
         assert!(!cfg.mcp.filepart_fallback);
         assert_eq!(cfg.mcp.url(), "http://127.0.0.1:4100/mcp");
+        let id = uuid::Uuid::nil();
+        assert_eq!(
+            cfg.mcp.download_url(&id),
+            "http://127.0.0.1:4100/files/00000000-0000-0000-0000-000000000000"
+        );
     }
 
     #[cfg(unix)]

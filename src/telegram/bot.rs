@@ -110,11 +110,11 @@ pub struct AppState {
     /// Slot names with a background reconnect in flight (#22), so a burst of
     /// turns hitting an unreachable opencode spawns at most one reconnect per slot.
     reconnecting: Mutex<HashSet<String>>,
-    /// The shared, disk-backed file store behind the MCP file-transfer tools
+    /// The shared, disk-backed file store behind the MCP file-transfer feature
     /// (#65). Both the inbound-media path (which `put`s a downloaded file and
-    /// announces its id to the model) and the `fetch_user_file` MCP tool (which
-    /// `take`s it by id) reach it through this `Arc`. Built once here from the
-    /// `[mcp]` config so every `AppState::new` caller shares one store; the TTL
+    /// announces its download URL to the model) and the `GET /files/{id}` endpoint
+    /// (which `take_by_id`s it) reach it through this `Arc`. Built once here from
+    /// the `[mcp]` config so every `AppState::new` caller shares one store; the TTL
     /// sweep is spawned separately in `serve()` (#65 T7).
     pub file_store: Arc<FileStore>,
 }
@@ -959,8 +959,9 @@ pub async fn handle_text(bot: Bot, msg: Message, state: Arc<AppState>) -> Respon
 /// file into the turn context):
 /// - **MCP announce (#65), the default** when `mcp.enabled && !mcp.filepart_fallback`:
 ///   stash the bytes in the [`FileStore`](crate::mcp::store::FileStore) under the
-///   sender's slot and inject an imperative announce text part that tells the model
-///   to pull the file via the `fetch_user_file` MCP tool. See [`handle_media_announce`].
+///   sender's slot and inject an imperative announce text part carrying a one-shot
+///   download URL the model `curl`s and reads with its own tools. See
+///   [`handle_media_announce`].
 /// - **FilePart fallback (#11)** when `mcp.filepart_fallback` is set **or** MCP is
 ///   disabled: base64-encode the file as a data-URI [`PartInput::File`] inline in
 ///   the turn, unchanged from #11. See [`handle_media_filepart`].
@@ -980,10 +981,10 @@ pub async fn handle_media(bot: Bot, msg: Message, state: Arc<AppState>) -> Respo
 
 /// The MCP announce inbound path (#65, default): download the file, stash it in
 /// the [`FileStore`](crate::mcp::store::FileStore) under `slot`, and enqueue an
-/// imperative announce text part carrying the store id (plus any caption as its
-/// own text part) so the model reads the bytes by calling `fetch_user_file(id)`.
-/// A download or store failure becomes the friendly [`reply_inbound_file_failed`]
-/// reply plus a `tracing::warn!`.
+/// imperative announce text part carrying a one-shot `GET /files/{id}` download
+/// URL (plus any caption as its own text part) so the model `curl`s the file into
+/// its workspace and reads it with its own tools. A download or store failure
+/// becomes the friendly [`reply_inbound_file_failed`] reply plus a `tracing::warn!`.
 async fn handle_media_announce(
     bot: Bot,
     msg: Message,
@@ -1012,11 +1013,12 @@ async fn handle_media_announce(
         }
     };
 
-    // Imperative, self-describing announce — the model must choose to call the
-    // `fetch_user_file` MCP tool with this id to actually read the bytes.
+    // Imperative, self-describing announce — the model downloads the file with a
+    // one-shot URL and reads it with its own tools (format-agnostic; PDF/image/…).
+    let url = state.cfg.mcp.download_url(&id);
     let mut parts = vec![PartInput::Text {
         text: format!(
-            "The user sent a file `{filename}` (id `{id}`). Read it now by calling the fetch_user_file tool with id `{id}`."
+            "The user sent a file `{filename}`. Download and read it now: run `curl -sf '{url}' -o '{filename}'` then read the file `{filename}`. (The link works once.)"
         ),
     }];
     // A caption rides along as its own text part.
