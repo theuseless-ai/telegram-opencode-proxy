@@ -305,6 +305,13 @@ impl AppState {
         guard.get(name).and_then(|c| c.context_limit)
     }
 
+    /// The model selector resolved for slot `name` at connect (#74), or `None`
+    /// when the slot is unknown. Cloned out under a short read guard.
+    pub(crate) fn model_for(&self, name: &str) -> Option<crate::config::Model> {
+        let guard = self.registry.read().unwrap_or_else(PoisonError::into_inner);
+        guard.get(name).map(|c| c.model.clone())
+    }
+
     /// The three-way idempotent `connect` behaviour (#39). All opencode
     /// round-trips happen outside the registry lock; the lock is only taken to
     /// snapshot the current slot and to swap the rebuilt client in.
@@ -339,7 +346,7 @@ impl AppState {
             let conn = crate::bring_up_slot(
                 &http,
                 &slot,
-                &self.cfg.model,
+                self.cfg.model.as_ref(),
                 CONNECT_READY_ATTEMPTS,
                 CONNECT_READY_INTERVAL,
             )
@@ -369,7 +376,7 @@ impl AppState {
             let conn = crate::bring_up_slot(
                 &http,
                 &slot,
-                &self.cfg.model,
+                self.cfg.model.as_ref(),
                 CONNECT_READY_ATTEMPTS,
                 CONNECT_READY_INTERVAL,
             )
@@ -409,7 +416,7 @@ impl AppState {
         let conn = crate::bring_up_slot(
             &http,
             &slot,
-            &self.cfg.model,
+            self.cfg.model.as_ref(),
             CONNECT_READY_ATTEMPTS,
             CONNECT_READY_INTERVAL,
         )
@@ -1260,13 +1267,18 @@ async fn run_turn(
     let client = state
         .client_for(&slot.name)
         .ok_or_else(|| anyhow::anyhow!("no opencode client for slot '{}'", slot.name))?;
+    // The model selector resolved for this slot at connect (#74) — config
+    // `[model]` or opencode's default.
+    let model = state
+        .model_for(&slot.name)
+        .ok_or_else(|| anyhow::anyhow!("no resolved model for slot '{}'", slot.name))?;
 
     // Read routing from SQLite (sync, lock released before the await below).
     let stored = state.db.get_session(chat_id)?;
     let session_id = session::get_or_create(
         &client,
         stored.as_deref(),
-        &state.cfg.model,
+        &model,
         &state.cfg.permissions.ask,
     )
     .await?;
@@ -1289,7 +1301,7 @@ async fn run_turn(
         &slot.opencode_url,
         chat_id,
         &session_id,
-        PromptModel::from(&state.cfg.model),
+        PromptModel::from(&model),
         parts,
         verbosity,
         state.context_limit_for(&slot.name),

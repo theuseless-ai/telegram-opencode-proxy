@@ -339,6 +339,28 @@ mod tests {
     }
 
     #[test]
+    fn sole_default_model_resolves_a_single_default() {
+        // The fixture's `default` has one entry → unambiguous (#74).
+        assert_eq!(
+            providers().sole_default_model(),
+            Some(("llm-lan", "Qwen3.6-35B-A3B-bf16"))
+        );
+    }
+
+    #[test]
+    fn sole_default_model_is_none_when_absent_or_ambiguous() {
+        let none: ProvidersResponse =
+            serde_json::from_value(serde_json::json!({ "providers": [], "default": {} })).unwrap();
+        assert_eq!(none.sole_default_model(), None);
+        let many: ProvidersResponse = serde_json::from_value(serde_json::json!({
+            "providers": [],
+            "default": { "a": "m1", "b": "m2" }
+        }))
+        .unwrap();
+        assert_eq!(many.sole_default_model(), None);
+    }
+
+    #[test]
     fn context_limit_absent_in_the_id_only_fixture() {
         // The real `/config/providers` fixture lists models as `{id, name}` with
         // no `limit` — so auto-detect returns None there and the `/provider`

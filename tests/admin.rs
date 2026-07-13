@@ -74,11 +74,11 @@ fn cfg_with_model() -> Config {
         bot_token: "t".into(),
         admin_socket: "/tmp/unused.sock".into(),
         slots: Vec::new(),
-        model: Model {
+        model: Some(Model {
             provider_id: "llm-lan".to_string(),
             model_id: "Qwen3.6-35B-A3B-bf16".to_string(),
             context_window: None,
-        },
+        }),
         permissions: Permissions { ask: Vec::new() },
         pairing: Pairing::default(),
         db_path: "unused.db".into(),
@@ -102,6 +102,11 @@ fn slot_conn(name: &str, url: &str, telegram_id: Option<i64>) -> SlotConn {
             telegram_id,
         },
         client: OpencodeClient::new(url).expect("opencode client builds"),
+        model: Model {
+            provider_id: "llm-lan".to_string(),
+            model_id: "Qwen3.6-35B-A3B-bf16".to_string(),
+            context_window: None,
+        },
         context_limit: None,
     }
 }

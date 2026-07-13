@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use config::{Config, Model, Slot};
 use opencode::client::{self, OpencodeClient};
@@ -52,10 +52,16 @@ const MCP_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// `proxy connect`-added slots back to it (#45), so config is the single source
 /// of truth for slots.
 pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
+    // `[model]` may be omitted (#74) — the per-slot default is resolved at
+    // connect and logged there; here just note the configured selector or "auto".
+    let model = cfg
+        .model
+        .as_ref()
+        .map(|m| format!("{}/{}", m.provider_id, m.model_id))
+        .unwrap_or_else(|| "auto (opencode default)".to_string());
     tracing::info!(
         slots = cfg.slots.len(),
-        provider = %cfg.model.provider_id,
-        model = %cfg.model.model_id,
+        model = %model,
         gated = cfg.permissions.ask.len(),
         "starting proxy (connect-only)"
     );
@@ -202,7 +208,7 @@ pub async fn connect_slots(cfg: &Config) -> Result<HashMap<String, SlotConn>> {
         match bring_up_slot(
             &http,
             slot,
-            &cfg.model,
+            cfg.model.as_ref(),
             health::READY_ATTEMPTS,
             health::READY_INTERVAL,
         )
@@ -262,7 +268,7 @@ pub fn spawn_slot_bringup(state: Arc<telegram::bot::AppState>, attempts: u32, in
         let state = Arc::clone(&state);
         let http = http.clone();
         tokio::spawn(async move {
-            match bring_up_slot(&http, &slot, &state.cfg.model, attempts, interval).await {
+            match bring_up_slot(&http, &slot, state.cfg.model.as_ref(), attempts, interval).await {
                 Ok(conn) => {
                     {
                         let mut guard = state
@@ -295,7 +301,7 @@ pub fn spawn_slot_bringup(state: Arc<telegram::bot::AppState>, attempts: u32, in
 pub(crate) async fn bring_up_slot(
     http: &reqwest::Client,
     slot: &Slot,
-    model: &Model,
+    model: Option<&Model>,
     attempts: u32,
     interval: Duration,
 ) -> Result<SlotConn> {
@@ -309,24 +315,66 @@ pub(crate) async fn bring_up_slot(
         .config_providers()
         .await
         .with_context(|| format!("fetching provider catalogue for slot '{}'", slot.name))?;
-    client::validate_model(&providers, &model.provider_id, &model.model_id)
-        .with_context(|| format!("validating model for slot '{}'", slot.name))?;
+
+    // Resolve the effective model selector (#74): the configured `[model]` if
+    // present (validated), else opencode's own sole default.
+    let model = resolve_model(&providers, model, &slot.name)
+        .with_context(|| format!("resolving model for slot '{}'", slot.name))?;
 
     // Resolve the context-window size for the usage footer (#72): the proxy
     // `[model].context_window` override wins, else opencode's own catalogue
     // (`/config/providers`, then the fuller `/provider`). `None` → the footer
     // shows a raw token count instead of a %.
-    let context_limit = resolve_context_limit(&client, &providers, model).await;
+    let context_limit = resolve_context_limit(&client, &providers, &model).await;
 
     tracing::info!(
         slot = %slot.name,
+        provider_id = %model.provider_id,
+        model_id = %model.model_id,
         context_limit,
-        "connected — provider/model validated"
+        "connected — provider/model resolved"
     );
     Ok(SlotConn {
         slot: slot.clone(),
         client,
+        model,
         context_limit,
+    })
+}
+
+/// Resolve the effective model selector for a slot (#74): the configured
+/// `[model]` if present (validated against opencode's catalogue), otherwise
+/// opencode's **sole** default model. Errors — with an actionable message — when
+/// no `[model]` is set and opencode has no single unambiguous default.
+fn resolve_model(
+    providers: &crate::opencode::types::ProvidersResponse,
+    configured: Option<&Model>,
+    slot_name: &str,
+) -> Result<Model> {
+    if let Some(model) = configured {
+        client::validate_model(providers, &model.provider_id, &model.model_id)?;
+        return Ok(model.clone());
+    }
+    let (provider_id, model_id) = providers.sole_default_model().ok_or_else(|| {
+        let detail = if providers.default.is_empty() {
+            "opencode reports no default model".to_string()
+        } else {
+            let mut providers: Vec<&str> = providers.default.keys().map(String::as_str).collect();
+            providers.sort_unstable();
+            format!(
+                "opencode has multiple provider defaults [{}]",
+                providers.join(", ")
+            )
+        };
+        anyhow!(
+            "no [model] configured for slot '{slot_name}' and {detail} — \
+             set [model] provider_id/model_id in config.toml"
+        )
+    })?;
+    Ok(Model {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        context_window: None,
     })
 }
 
@@ -349,5 +397,76 @@ async fn resolve_context_limit(
             tracing::debug!(error = %err, "GET /provider for context limit failed");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_model;
+    use crate::config::Model;
+    use crate::opencode::types::ProvidersResponse;
+
+    fn catalogue(json: serde_json::Value) -> ProvidersResponse {
+        serde_json::from_value(json).expect("catalogue parses")
+    }
+
+    #[test]
+    fn resolve_model_uses_configured_model_and_keeps_override() {
+        let cat = catalogue(serde_json::json!({
+            "providers": [{ "id": "llm-lan", "models": { "Qwen": {} } }],
+            "default": {}
+        }));
+        let cfg = Model {
+            provider_id: "llm-lan".into(),
+            model_id: "Qwen".into(),
+            context_window: Some(1000),
+        };
+        let resolved = resolve_model(&cat, Some(&cfg), "you").expect("resolves configured");
+        assert_eq!(resolved.provider_id, "llm-lan");
+        assert_eq!(resolved.model_id, "Qwen");
+        assert_eq!(resolved.context_window, Some(1000));
+    }
+
+    #[test]
+    fn resolve_model_falls_back_to_opencode_sole_default() {
+        let cat = catalogue(serde_json::json!({
+            "providers": [{ "id": "llm-lan", "models": { "Qwen": {} } }],
+            "default": { "llm-lan": "Qwen" }
+        }));
+        let resolved = resolve_model(&cat, None, "you").expect("resolves opencode default");
+        assert_eq!(resolved.provider_id, "llm-lan");
+        assert_eq!(resolved.model_id, "Qwen");
+        assert_eq!(resolved.context_window, None);
+    }
+
+    #[test]
+    fn resolve_model_errors_without_config_or_default() {
+        let cat = catalogue(serde_json::json!({ "providers": [], "default": {} }));
+        let err = resolve_model(&cat, None, "you").unwrap_err().to_string();
+        assert!(err.contains("no [model]"), "{err}");
+        assert!(err.contains("no default model"), "{err}");
+    }
+
+    #[test]
+    fn resolve_model_errors_on_ambiguous_defaults() {
+        let cat = catalogue(serde_json::json!({
+            "providers": [], "default": { "a": "m1", "b": "m2" }
+        }));
+        let err = resolve_model(&cat, None, "you").unwrap_err().to_string();
+        assert!(err.contains("multiple provider defaults"), "{err}");
+    }
+
+    #[test]
+    fn resolve_model_rejects_configured_model_absent_from_opencode() {
+        let cat = catalogue(serde_json::json!({
+            "providers": [{ "id": "llm-lan", "models": { "Qwen": {} } }],
+            "default": {}
+        }));
+        let cfg = Model {
+            provider_id: "llm-lan".into(),
+            model_id: "ghost".into(),
+            context_window: None,
+        };
+        assert!(resolve_model(&cat, Some(&cfg), "you").is_err());
     }
 }
