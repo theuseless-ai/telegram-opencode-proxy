@@ -1,6 +1,6 @@
 //! opencode output → Telegram: 4096-char chunking, ≤1/sec stream-edit throttle,
-//! `typing` liveness, flat tool-status line.
-//! See `docs/design/architecture.md` §13. Issues #6/#8.
+//! `typing` liveness, flat tool-status line, and a completion summary footer (#14).
+//! See `docs/design/architecture.md` §13. Issues #6/#8/#10/#14.
 //!
 //! [`split_message`] (the blocking-reply chunker) landed in #6. [`LiveState`] is
 //! the B2 streaming render machine (#8): a pure state accumulator the streaming
@@ -16,9 +16,10 @@ pub const TELEGRAM_LIMIT: usize = 4096;
 
 /// Per-user output verbosity (`/quiet` · `/verbose`, §13, #10). Persisted per
 /// chat; the streaming renderer reads it to decide how much to surface. `Normal`
-/// is the default. For now the concrete effect is the tool-status line (shown at
-/// Normal/Verbose, hidden at Quiet); tool **failures** are always shown at every
-/// level. Reasoning notes / cost footers are reserved for a fast-follow.
+/// is the default. Concrete effects: the tool-status line and the completion
+/// **summary footer** (#14) show at Normal/Verbose and are hidden at Quiet; tool
+/// **failures** are always shown at every level. Verbose-only detail (full tool
+/// args, cost, per-file names) is a fast-follow pending live wire validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Verbosity {
     /// Answer (and failures) only — no live tool-status line.
@@ -77,6 +78,14 @@ pub struct LiveState {
     failures: Vec<String>,
     /// The user's output verbosity (#10) — gates the tool-status line.
     verbosity: Verbosity,
+    /// Tool `call_id`s that have reached a terminal state, so the summary counts
+    /// (#14) tally each tool once across its pending→running→terminal updates.
+    counted_calls: std::collections::HashSet<String>,
+    /// Completion tallies for the summary footer (#14): total tools run, of which
+    /// `task` sub-agents, and `edit`/`write` file edits.
+    tools: usize,
+    subagents: usize,
+    files_edited: usize,
 }
 
 impl LiveState {
@@ -98,16 +107,23 @@ impl LiveState {
     /// line and record failures (kept visible at every verbosity, §13). Non-tool
     /// parts are ignored here — text arrives via [`push_text`].
     pub fn apply_part(&mut self, kind: &PartKind) {
-        if let PartKind::Tool { name, status, .. } = kind {
+        if let PartKind::Tool {
+            name,
+            call_id,
+            status,
+        } = kind
+        {
             match status {
                 ToolStatus::Pending | ToolStatus::Running => {
                     self.active_tool = Some(name.clone());
                 }
                 ToolStatus::Completed => {
                     self.active_tool = None;
+                    self.count_tool(name, call_id);
                 }
                 ToolStatus::Error => {
                     self.active_tool = None;
+                    self.count_tool(name, call_id);
                     let line = format!("✗ {name}: failed");
                     if !self.failures.contains(&line) {
                         self.failures.push(line);
@@ -116,6 +132,42 @@ impl LiveState {
                 ToolStatus::Other(_) => {}
             }
         }
+    }
+
+    /// Tally a tool that reached a terminal state, once per `call_id`, into the
+    /// summary-footer counts (#14): every terminal tool bumps `tools`; a `task`
+    /// child bumps `subagents`; an `edit`/`write` bumps `files_edited`.
+    fn count_tool(&mut self, name: &str, call_id: &str) {
+        if !self.counted_calls.insert(call_id.to_string()) {
+            return; // already tallied (an earlier terminal update for this call).
+        }
+        self.tools += 1;
+        if name == "task" {
+            self.subagents += 1;
+        } else if matches!(name, "edit" | "write") {
+            self.files_edited += 1;
+        }
+    }
+
+    /// The one-line completion summary footer (#14), or `None` when it should be
+    /// omitted — in Quiet mode, or when no tool ran (a plain text answer needs no
+    /// summary). Shown above the answer on finalize (§13); zero categories are
+    /// dropped, e.g. `✓ 3 tools · edited 1 file`.
+    fn summary_footer(&self) -> Option<String> {
+        if matches!(self.verbosity, Verbosity::Quiet) || self.tools == 0 {
+            return None;
+        }
+        let mut parts = vec![plural(self.tools, "tool", "tools")];
+        if self.subagents > 0 {
+            parts.push(plural(self.subagents, "subagent", "subagents"));
+        }
+        if self.files_edited > 0 {
+            parts.push(format!(
+                "edited {}",
+                plural(self.files_edited, "file", "files")
+            ));
+        }
+        Some(format!("✓ {}", parts.join(" · ")))
     }
 
     /// Whether the tool-status line is visible at the current verbosity and a
@@ -153,9 +205,15 @@ impl LiveState {
     }
 
     /// The authoritative answer text (no tool decoration) for the final render,
-    /// with failures appended so a blocked command is never silently dropped.
+    /// with the completion summary footer (#14) above it and failures appended so
+    /// a blocked command is never silently dropped.
     pub fn finalize(&self, authoritative: &str) -> String {
-        let mut out = authoritative.to_string();
+        let mut out = String::new();
+        if let Some(footer) = self.summary_footer() {
+            out.push_str(&footer);
+            out.push('\n');
+        }
+        out.push_str(authoritative);
         for failure in &self.failures {
             if !out.is_empty() {
                 out.push('\n');
@@ -164,6 +222,12 @@ impl LiveState {
         }
         out
     }
+}
+
+/// `"{n} {singular}"` or `"{n} {plural}"` by count — e.g. `plural(1, "file",
+/// "files") == "1 file"`, `plural(2, …) == "2 files"`.
+fn plural(n: usize, singular: &str, plural: &str) -> String {
+    format!("{n} {}", if n == 1 { singular } else { plural })
 }
 
 /// Split `text` into pieces of at most `limit` characters, cutting only on
@@ -271,9 +335,15 @@ mod tests {
     }
 
     fn tool(name: &str, status: ToolStatus) -> PartKind {
+        tool_id(name, "call_x", status)
+    }
+
+    /// Like [`tool`] but with an explicit `call_id`, so the summary counts (#14)
+    /// can be exercised with several distinct tool calls.
+    fn tool_id(name: &str, call_id: &str, status: ToolStatus) -> PartKind {
         PartKind::Tool {
             name: name.to_string(),
-            call_id: "call_x".to_string(),
+            call_id: call_id.to_string(),
             status,
         }
     }
@@ -350,9 +420,73 @@ mod tests {
         let mut s = LiveState::new(Verbosity::Normal);
         s.push_text("partial…"); // streamed buffer is ignored by finalize
         s.apply_part(&tool("bash", ToolStatus::Error));
+        // The errored tool both counts toward the footer and lists its failure.
         assert_eq!(
             s.finalize("The full answer."),
-            "The full answer.\n✗ bash: failed"
+            "✓ 1 tool\nThe full answer.\n✗ bash: failed"
         );
+    }
+
+    // --- summary footer (#14) --------------------------------------------------
+
+    #[test]
+    fn footer_counts_tools_subagents_and_file_edits() {
+        let mut s = LiveState::new(Verbosity::Normal);
+        for (name, id) in [
+            ("bash", "c1"),
+            ("read", "c2"),
+            ("grep", "c3"),
+            ("task", "c4"),
+            ("edit", "c5"),
+            ("write", "c6"),
+        ] {
+            s.apply_part(&tool_id(name, id, ToolStatus::Completed));
+        }
+        // 6 tools total; 1 of them a subagent (task); 2 file edits (edit + write).
+        assert_eq!(
+            s.finalize("Done."),
+            "✓ 6 tools · 1 subagent · edited 2 files\nDone."
+        );
+    }
+
+    #[test]
+    fn footer_omits_zero_categories_and_singularizes() {
+        let mut s = LiveState::new(Verbosity::Normal);
+        s.apply_part(&tool_id("edit", "c1", ToolStatus::Completed));
+        // One edit tool: "1 tool" (singular) + "edited 1 file"; no subagent clause.
+        assert_eq!(s.finalize("ok"), "✓ 1 tool · edited 1 file\nok");
+    }
+
+    #[test]
+    fn footer_hidden_in_quiet_and_absent_without_tools() {
+        // Quiet: no footer even though a tool ran.
+        let mut q = LiveState::new(Verbosity::Quiet);
+        q.apply_part(&tool_id("bash", "c1", ToolStatus::Completed));
+        assert_eq!(q.finalize("ans"), "ans");
+        // Normal but no tools: a plain text answer gets no footer.
+        let plain = LiveState::new(Verbosity::Normal);
+        assert_eq!(plain.finalize("just text"), "just text");
+    }
+
+    #[test]
+    fn footer_tallies_each_call_once_across_updates() {
+        let mut s = LiveState::new(Verbosity::Normal);
+        // The same call_id transitions pending → running → completed: counted once.
+        s.apply_part(&tool_id("bash", "c1", ToolStatus::Pending));
+        s.apply_part(&tool_id("bash", "c1", ToolStatus::Running));
+        s.apply_part(&tool_id("bash", "c1", ToolStatus::Completed));
+        s.apply_part(&tool_id("bash", "c1", ToolStatus::Completed)); // duplicate terminal
+        assert_eq!(s.finalize("done"), "✓ 1 tool\ndone");
+    }
+
+    #[test]
+    fn footer_is_absent_during_live_render() {
+        // The footer is a completion-only artifact — it never appears in the live
+        // (streaming) render, only in finalize.
+        let mut s = LiveState::new(Verbosity::Normal);
+        s.apply_part(&tool_id("bash", "c1", ToolStatus::Completed));
+        s.push_text("streaming answer");
+        assert_eq!(s.render(), "streaming answer");
+        assert_eq!(s.finalize("streaming answer"), "✓ 1 tool\nstreaming answer");
     }
 }
