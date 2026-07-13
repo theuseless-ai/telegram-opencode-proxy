@@ -26,6 +26,7 @@ use crate::admin::{
 };
 use crate::auth;
 use crate::config::{Config, Slot};
+use crate::mcp::store::FileStore;
 use crate::opencode::client::OpencodeClient;
 use crate::opencode::types::{PartInput, PermissionReplyRequest, PromptModel};
 use crate::pairing;
@@ -109,6 +110,13 @@ pub struct AppState {
     /// Slot names with a background reconnect in flight (#22), so a burst of
     /// turns hitting an unreachable opencode spawns at most one reconnect per slot.
     reconnecting: Mutex<HashSet<String>>,
+    /// The shared, disk-backed file store behind the MCP file-transfer tools
+    /// (#65). Both the inbound-media path (which `put`s a downloaded file and
+    /// announces its id to the model) and the `fetch_user_file` MCP tool (which
+    /// `take`s it by id) reach it through this `Arc`. Built once here from the
+    /// `[mcp]` config so every `AppState::new` caller shares one store; the TTL
+    /// sweep is spawned separately in `serve()` (#65 T7).
+    pub file_store: Arc<FileStore>,
 }
 
 impl AppState {
@@ -142,6 +150,13 @@ impl AppState {
                 );
             }
         }
+        // Build the shared MCP file store from the `[mcp]` config before `cfg` is
+        // moved into the struct. Constructed here (not passed in) so the several
+        // callers of `AppState::new` keep a stable signature.
+        let file_store = Arc::new(FileStore::new(
+            cfg.mcp.max_file_bytes,
+            Duration::from_secs(cfg.mcp.ttl_secs),
+        ));
         Arc::new(Self {
             cfg,
             config_path,
@@ -150,6 +165,7 @@ impl AppState {
             bot,
             user_queues: Mutex::new(HashMap::new()),
             reconnecting: Mutex::new(HashSet::new()),
+            file_store,
         })
     }
 

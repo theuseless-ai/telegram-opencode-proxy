@@ -199,16 +199,20 @@ pub async fn send_outbound_file(bot: &Bot, chat_id: ChatId, path: &Path) -> Resu
 /// `.caption(...)` setter on the photo/document request. This is a **plain**
 /// send with no retry — the MCP tool call site wraps it in `retry::with_retry`
 /// (#25), matching how [`send_outbound_file`] is called by the #12 outbox.
+/// Returns [`teloxide::RequestError`] (not `anyhow`) so the caller can wrap it in
+/// [`retry::with_retry`](crate::telegram::retry) for #25 flood-control/backoff —
+/// the error must be recoverable *by value*, which `anyhow` erasure would prevent.
 pub async fn send_outbound_bytes(
     bot: &Bot,
     chat_id: ChatId,
     filename: &str,
     bytes: Vec<u8>,
     caption: Option<&str>,
-) -> Result<()> {
+) -> Result<(), teloxide::RequestError> {
     let mime = resolve_mime(None, Some(filename));
     let (is_image, action) = outbound_send_kind(&mime);
 
+    // Liveness only — a failed chat action must not sink the send (§13).
     let _ = bot.send_chat_action(chat_id, action).await;
 
     let file = InputFile::memory(bytes).file_name(filename.to_string());
@@ -217,15 +221,13 @@ pub async fn send_outbound_bytes(
         if let Some(caption) = caption {
             req = req.caption(caption.to_string());
         }
-        req.await
-            .with_context(|| format!("send_photo {filename}"))?;
+        req.await?;
     } else {
         let mut req = bot.send_document(chat_id, file);
         if let Some(caption) = caption {
             req = req.caption(caption.to_string());
         }
-        req.await
-            .with_context(|| format!("send_document {filename}"))?;
+        req.await?;
     }
     Ok(())
 }
