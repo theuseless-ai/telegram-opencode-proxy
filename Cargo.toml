@@ -5,6 +5,13 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.103"
+# axum hosts the in-process MCP file-transfer server (issue #65): the single
+# stateless `/mcp` endpoint is an `rmcp` `StreamableHttpService` mounted via
+# `Router::nest_service`. axum is therefore a RUNTIME dependency now — it links
+# into the shipped binary (previously it was test-only; see the note below). The
+# `0.8` pin matches the version the test harness already used, so Cargo unifies
+# the two edges and nothing is compiled twice.
+axum = "0.8"
 base64 = "0.22.1"
 clap = { version = "4.6.1", features = ["derive"] }
 futures-util = "0.3"
@@ -12,27 +19,48 @@ notify = "8.2.0"
 rand = "0.9"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 reqwest-eventsource = "0.6.0"
+# Official Rust MCP SDK. Pinned EXACTLY (`=2.2.0`) — the crate churns fast (2.0.0
+# was breaking ~3 weeks before this was written) and the whole file-transfer
+# topology depends on 2.2.0's request-Parts-into-extensions behaviour. `server`
+# pulls in the tool macros + schemars support; `transport-streamable-http-server`
+# provides `StreamableHttpService`, a plain `tower_service::Service<http::Request>`
+# (rmcp does NOT depend on axum), so it mounts straight into our axum router.
+rmcp = { version = "=2.2.0", features = ["server", "transport-streamable-http-server"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+# JSON-Schema derive for the MCP tool argument structs (`#[derive(JsonSchema)]`).
+# rmcp 2.2.0 depends on `schemars = "1.0"` (resolves 1.2.1) internally; this
+# direct edge names the SAME 1.x line so Cargo unifies it — do NOT downgrade to
+# 0.x (rmcp's `schemars` feature would then fail to unify).
+schemars = "1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 teloxide = { version = "0.17.0", features = ["macros"] }
+# Per-file backing store for the MCP file-transfer server (issue #65): each
+# in-flight file streams to its own `NamedTempFile`, which auto-unlinks on drop.
+# A RUNTIME dependency now (previously test-only) because `src/mcp/store.rs` links
+# it; the `[dev-dependencies]` edge below is the same version, so Cargo unifies.
+tempfile = "3"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
+# `CancellationToken` for the MCP server's graceful-shutdown wiring
+# (`StreamableHttpServerConfig::with_cancellation_token`). rmcp already pulls
+# `tokio-util = "0.7"` transitively; this makes the edge direct.
+tokio-util = "0.7"
 toml = "1.1.2"
 toml_edit = "0.25.12"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# UUID v4 keys for the MCP file store (issue #65). Matches rmcp's own `uuid = "1"`
+# edge so Cargo unifies the two.
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-# In-process mock HTTP servers for the hermetic test harness (issue #24). axum
-# is a TEST-ONLY dependency (mock_opencode / mock_telegram under tests/support,
-# plus the Layer-2 `examples/mock_model.rs`); the production binary never links
-# it. axum's SSE support backs the mock opencode `/global/event` stub.
-#
-# NOTE: the Layer-2 mock model lives in `examples/` (not `src/bin/`) precisely
-# because only examples/tests/benches may use dev-dependencies — a `src/bin/`
-# target is part of the shipped package and could not reach axum.
-axum = "0.8"
+# NOTE: `axum` is no longer test-only — as of issue #65 it is a runtime
+# dependency (see the `[dependencies]` block above) because the production binary
+# now hosts the MCP `/mcp` server. The in-process mock HTTP servers for the
+# hermetic test harness (issue #24: mock_opencode / mock_telegram under
+# tests/support, plus the Layer-2 `examples/mock_model.rs`) still use it; that
+# usage is unchanged, it just links the same runtime edge now.
 # The integration test crate is a *separate* crate: it can name the library and
 # its dev-dependencies, but NOT the library's normal deps. teloxide (to build a
 # `Bot`/`Message` for the handlers) and serde_json (mock bodies + fixtures) are
@@ -44,3 +72,20 @@ tokio = { version = "1.52.3", features = ["full"] }
 # Temp DB files for persistence reopen tests (src/persistence.rs). Already in
 # the lockfile transitively, so this direct edge reuses the pinned version.
 tempfile = "3"
+# In-process rmcp CLIENT for the MCP file-transfer tests (issue #65, `tests/mcp.rs`):
+# it drives the real `/mcp` server through a faithful streamable-http client. Pinned
+# `=2.2.0` to UNIFY with the runtime `[dependencies]` edge (which carries the
+# `server`/`transport-streamable-http-server` features) — Cargo unions the two feature
+# sets for the test build, so one rmcp is compiled with both roles. The
+# `-reqwest` transport feature supplies `impl StreamableHttpClient for reqwest::Client`
+# + `StreamableHttpClientTransport::from_config`, the reqwest-backed client used here.
+rmcp = { version = "=2.2.0", features = ["client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+# The download-endpoint tests (`GET /files/{id}`) hit the server over real HTTP.
+# Same `0.12` line as the runtime edge, so Cargo unifies it.
+reqwest = { version = "0.12", features = ["json", "stream"] }
+# `CancellationToken` for `mcp::build_router(app, ct)` in the tests (same `0.7` as
+# the runtime edge).
+tokio-util = "0.7"
+# base64-encode the outbound `content` argument and decode inbound bytes in the
+# tests (same `0.22` line as the runtime edge).
+base64 = "0.22.1"

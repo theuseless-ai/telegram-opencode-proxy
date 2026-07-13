@@ -5,12 +5,14 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
+use uuid::Uuid;
 
 /// A secret string (the bot token) that is **redacted** in `Debug` and has no
 /// `Display`, so it can never leak into a log line, error, or `{:?}` dump (#23).
@@ -172,6 +174,13 @@ pub struct Config {
     /// `-wal`/`-shm` files next to it.
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
+    /// The `[mcp]` file-transfer server (#65): a single stateless
+    /// Streamable-HTTP MCP endpoint shared by every slot, giving opencode the
+    /// `send_file_to_user` tool (outbound) plus a `GET /files/{id}` download
+    /// endpoint for inbound files, instead of a filesystem convention. Optional —
+    /// a missing `[mcp]` block uses the defaults.
+    #[serde(default)]
+    pub mcp: Mcp,
 }
 
 /// Default SQLite path when `db_path` is omitted from config.
@@ -262,6 +271,103 @@ impl Default for Pairing {
 /// Default pairing-code TTL (10 minutes) when `[pairing]` omits it.
 fn default_code_ttl_secs() -> i64 {
     600
+}
+
+/// The `[mcp]` file-transfer server (#65). One stateless Streamable-HTTP MCP
+/// endpoint (`http://<bind>:<port>/mcp`) is mounted for **all** slots; a
+/// per-request `X-Slot` header (set by each workspace's `opencode.json`, never
+/// by the model) tells the server which Telegram user a call belongs to.
+/// Optional — a missing `[mcp]` block uses these defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Mcp {
+    /// Whether the MCP server task is started at all. Defaults to `true`; set
+    /// `false` to run the proxy without the file-transfer tools (e.g. #12's
+    /// legacy disk-outbox only).
+    #[serde(default = "default_mcp_enabled")]
+    pub enabled: bool,
+    /// Bind address for the MCP HTTP listener. Defaults to `127.0.0.1` — no
+    /// auth is implemented, so the loopback bind IS the trust boundary; do not
+    /// widen this without adding one.
+    #[serde(default = "default_mcp_bind")]
+    pub bind: IpAddr,
+    /// Bind port for the MCP HTTP listener. Defaults to `4100`.
+    #[serde(default = "default_mcp_port")]
+    pub port: u16,
+    /// Maximum size, in bytes, of a single file transferred through
+    /// `send_file_to_user` or the inbound download endpoint. Defaults to 20 MiB,
+    /// mirroring the inbound-file cap in `telegram::files::MAX_INBOUND_BYTES`.
+    #[serde(default = "default_mcp_max_file_bytes")]
+    pub max_file_bytes: u64,
+    /// How long, in seconds, an inbound file announced to the model stays
+    /// downloadable via `GET /files/{id}` before it is purged from the store.
+    /// Defaults to `300` (5 minutes).
+    #[serde(default = "default_mcp_ttl_secs")]
+    pub ttl_secs: u64,
+    /// When `true`, an inbound file is attached as a base64 `FilePart`
+    /// (#11) inline in the turn instead of the MCP download announcement, for
+    /// models/tooling that can't `curl` the download URL. Defaults to `false`.
+    #[serde(default)]
+    pub filepart_fallback: bool,
+}
+
+impl Default for Mcp {
+    fn default() -> Self {
+        Self {
+            enabled: default_mcp_enabled(),
+            bind: default_mcp_bind(),
+            port: default_mcp_port(),
+            max_file_bytes: default_mcp_max_file_bytes(),
+            ttl_secs: default_mcp_ttl_secs(),
+            filepart_fallback: false,
+        }
+    }
+}
+
+/// Default `[mcp]` enablement — on by default.
+fn default_mcp_enabled() -> bool {
+    true
+}
+
+/// Default `[mcp]` bind address — loopback only (the trust boundary).
+fn default_mcp_bind() -> IpAddr {
+    IpAddr::from([127, 0, 0, 1])
+}
+
+/// Default `[mcp]` bind port.
+fn default_mcp_port() -> u16 {
+    4100
+}
+
+/// Default `[mcp]` per-file size cap: 20 MiB, mirroring
+/// `telegram::files::MAX_INBOUND_BYTES`.
+fn default_mcp_max_file_bytes() -> u64 {
+    20 * 1024 * 1024
+}
+
+/// Default `[mcp]` fetch TTL (5 minutes) for announced inbound files.
+fn default_mcp_ttl_secs() -> u64 {
+    300
+}
+
+impl Mcp {
+    /// The single MCP registration URL every slot's `opencode.json` points at
+    /// (`http://<bind>:<port>/mcp`). The slot itself is **not** part of the
+    /// URL — it is conveyed per-request via the `X-Slot` header — so this URL
+    /// is identical for every slot.
+    pub fn url(&self) -> String {
+        format!("http://{}:{}/mcp", self.bind, self.port)
+    }
+
+    /// The one-shot download URL for an inbound file the proxy has stored under
+    /// `id` (`http://<bind>:<port>/files/<id>`). This is handed to the agent in the
+    /// inbound announce (#65): the agent `curl`s it into its workspace and reads
+    /// the file with its own tools, so the proxy stays format-agnostic (PDF, image,
+    /// docx, …) and host-independent (an HTTP pull, no shared filesystem). The
+    /// `GET /files/{id}` endpoint is single-use + TTL-bounded, so the URL works
+    /// exactly once. Mirrors [`Mcp::url`]; the loopback bind is the trust boundary.
+    pub fn download_url(&self, id: &Uuid) -> String {
+        format!("http://{}:{}/files/{}", self.bind, self.port, id)
+    }
 }
 
 impl Config {
@@ -535,6 +641,25 @@ model_id = \"m\"
         assert!(
             !dumped.contains("leaky-token-abc123"),
             "token leaked in Config Debug: {dumped}"
+        );
+    }
+
+    // --- [mcp] section (#65) ---------------------------------------------------
+
+    #[test]
+    fn missing_mcp_section_yields_defaults() {
+        let cfg: Config = toml::from_str(&sample()).unwrap();
+        assert!(cfg.mcp.enabled);
+        assert_eq!(cfg.mcp.bind, std::net::IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(cfg.mcp.port, 4100);
+        assert_eq!(cfg.mcp.max_file_bytes, 20 * 1024 * 1024);
+        assert_eq!(cfg.mcp.ttl_secs, 300);
+        assert!(!cfg.mcp.filepart_fallback);
+        assert_eq!(cfg.mcp.url(), "http://127.0.0.1:4100/mcp");
+        let id = uuid::Uuid::nil();
+        assert_eq!(
+            cfg.mcp.download_url(&id),
+            "http://127.0.0.1:4100/files/00000000-0000-0000-0000-000000000000"
         );
     }
 

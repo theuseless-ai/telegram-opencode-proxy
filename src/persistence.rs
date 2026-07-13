@@ -226,6 +226,24 @@ impl Db {
         })
     }
 
+    /// The `chat_id` bound to `slot`, if any. The outbound recipient resolver:
+    /// a validated `X-Slot` header (MCP file-transfer server, #65) maps back to
+    /// the Telegram chat that owns it. `slot` is not unique in `allowed_users`
+    /// (only `chat_id` is), so on the pathological case of >1 binding this takes
+    /// the **oldest** (`ORDER BY added_at`) — one-opencode-per-user in practice.
+    pub fn chat_for_slot(&self, slot: &str) -> Result<Option<i64>> {
+        self.with_conn(|c| {
+            let out = c
+                .query_row(
+                    "SELECT chat_id FROM allowed_users WHERE slot = ?1 ORDER BY added_at LIMIT 1",
+                    params![slot],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(out)
+        })
+    }
+
     /// Every whitelisted `(chat_id, slot)`, ordered by `chat_id`.
     pub fn list_allowed(&self) -> Result<Vec<(i64, String)>> {
         self.with_conn(|c| {
@@ -550,6 +568,16 @@ mod tests {
         db.remove_allowed(1).unwrap();
         assert_eq!(db.allowed_slot(1).unwrap(), None);
         assert_eq!(db.list_allowed().unwrap(), vec![(2, "wife".to_string())]);
+    }
+
+    #[test]
+    fn chat_for_slot_round_trip() {
+        let db = db();
+        assert_eq!(db.chat_for_slot("you").unwrap(), None);
+
+        db.add_allowed(1, "you").unwrap();
+        assert_eq!(db.chat_for_slot("you").unwrap(), Some(1));
+        assert_eq!(db.chat_for_slot("unknown").unwrap(), None);
     }
 
     #[test]

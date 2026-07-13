@@ -30,7 +30,7 @@ use teloxide::prelude::Requester;
 use teloxide::types::{ChatId, Message};
 
 use telegram_opencode_proxy::admin::{self, AdminRequest, AdminResponse, AdminState};
-use telegram_opencode_proxy::config::{Config, Model, Pairing, Permissions, Slot};
+use telegram_opencode_proxy::config::{Config, Mcp, Model, Pairing, Permissions, Slot};
 use telegram_opencode_proxy::opencode::client::OpencodeClient;
 use telegram_opencode_proxy::persistence::{Db, PendingApproval};
 use telegram_opencode_proxy::state::SlotConn;
@@ -64,6 +64,7 @@ fn config_for(opencode_url: &str) -> Config {
         permissions: Permissions { ask: Vec::new() },
         pairing: Pairing::default(),
         db_path: "proxy.db".into(),
+        mcp: Mcp::default(),
     }
 }
 
@@ -887,11 +888,19 @@ fn photo_message(chat_id: i64, caption: &str) -> Message {
 
 /// An inbound photo is downloaded and attached to the prompt as a data-URI file
 /// part; opencode receives a `type:"file"` part with the photo's MIME.
+///
+/// This exercises the **#11 FilePart path**, which under #65 is no longer the
+/// default: `Mcp::default()` (enabled, no fallback) now takes the MCP announce
+/// path instead, so the config here explicitly sets `filepart_fallback = true` to
+/// keep the FilePart path — and this test's coverage of it — alive. (The announce
+/// path end-to-end is covered separately in `tests/mcp.rs`.)
 #[tokio::test]
 async fn inbound_photo_is_sent_as_a_file_part() {
     let oc = MockOpencode::start().await;
     let tg = MockTelegram::start().await;
-    let state = state_for(config_for(&oc.url)).await;
+    let mut cfg = config_for(&oc.url);
+    cfg.mcp.filepart_fallback = true;
+    let state = state_for(cfg).await;
     let bot = bot_pointed_at(&tg);
 
     handle_media(bot, photo_message(SLOT_ID, "what is this?"), state.clone())
