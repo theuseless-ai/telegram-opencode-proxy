@@ -57,11 +57,11 @@ fn config_for(opencode_url: &str) -> Config {
             workdir: ".".into(),
             telegram_id: Some(SLOT_ID),
         }],
-        model: Model {
+        model: Some(Model {
             provider_id: "llm-lan".to_string(),
             model_id: "Qwen3.6-35B-A3B-bf16".to_string(),
             context_window: None,
-        },
+        }),
         permissions: Permissions { ask: Vec::new() },
         pairing: Pairing::default(),
         db_path: "proxy.db".into(),
@@ -780,6 +780,7 @@ async fn unreachable_opencode_gets_a_clear_message() {
         SlotConn {
             slot: cfg.slots[0].clone(),
             client,
+            model: cfg.model.clone().expect("harness config sets [model]"),
             context_limit: None,
         },
     );

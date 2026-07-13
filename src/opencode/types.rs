@@ -190,6 +190,20 @@ impl ProvidersResponse {
             .as_u64()
             .filter(|&n| n > 0)
     }
+
+    /// opencode's **sole** default `(provider_id, model_id)` from the `default`
+    /// map — `Some` only when exactly one provider default is configured, so the
+    /// choice is unambiguous. `None` when there is no default or several (the
+    /// caller then requires an explicit `[model]`, #74).
+    pub fn sole_default_model(&self) -> Option<(&str, &str)> {
+        if self.default.len() != 1 {
+            return None;
+        }
+        self.default
+            .iter()
+            .next()
+            .map(|(provider, model)| (provider.as_str(), model.as_str()))
+    }
 }
 
 // ---------------------------------------------------------------------------

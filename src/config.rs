@@ -160,7 +160,10 @@ pub struct Config {
     /// User seats. `telegram_id` is bound at pairing time (#4b), not here.
     pub slots: Vec<Slot>,
     /// Model selector — must match a provider/model configured in `opencode.json`.
-    pub model: Model,
+    /// Optional: when the `[model]` section is omitted, the proxy uses opencode's
+    /// own default model (`/config/providers` `default`) for each slot (#74).
+    #[serde(default)]
+    pub model: Option<Model>,
     /// Session permission rules (see #13).
     #[serde(default)]
     pub permissions: Permissions,
@@ -403,10 +406,13 @@ impl Config {
             "bot_token is empty — set it in config or via the TELOXIDE_TOKEN env var"
         );
         ensure!(!self.slots.is_empty(), "no [[slots]] configured");
-        ensure!(
-            !self.model.provider_id.is_empty() && !self.model.model_id.is_empty(),
-            "[model] provider_id and model_id must both be set"
-        );
+        // `[model]` is optional (#74); when present, both ids must be non-empty.
+        if let Some(model) = &self.model {
+            ensure!(
+                !model.provider_id.is_empty() && !model.model_id.is_empty(),
+                "[model] provider_id and model_id must both be set when [model] is present"
+            );
+        }
         let mut urls = HashSet::new();
         for slot in &self.slots {
             ensure!(
@@ -525,7 +531,24 @@ mod tests {
         let cfg: Config = toml::from_str(&sample()).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.slots.len(), 2);
-        assert_eq!(cfg.model.provider_id, "llm-lan");
+        assert_eq!(cfg.model.as_ref().unwrap().provider_id, "llm-lan");
+    }
+
+    #[test]
+    fn model_section_is_optional() {
+        // A config with no [model] block parses and validates (#74): the proxy
+        // falls back to opencode's default model at connect time.
+        let no_model = r#"
+            bot_token = "t"
+            admin_socket = "/tmp/admin.sock"
+            [[slots]]
+            name = "you"
+            opencode_url = "http://127.0.0.1:4096"
+            workdir = "."
+        "#;
+        let cfg: Config = toml::from_str(no_model).expect("parses without [model]");
+        cfg.validate().expect("validates without [model]");
+        assert!(cfg.model.is_none());
     }
 
     #[test]

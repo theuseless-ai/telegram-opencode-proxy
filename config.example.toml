@@ -41,7 +41,10 @@ workdir = "/home/you/work/wife"
 # telegram_id = 987654321
 
 # Model SELECTOR only — the endpoint URL + key live in opencode.json (§12).
-# These must match a provider/model configured there.
+# OPTIONAL (#74): omit the whole [model] section to use opencode's own default
+# model (its `/config/providers` default). Set it only to pin a specific
+# provider/model, or when opencode has several provider defaults (then it's
+# required to disambiguate). When present, both ids must match opencode.json.
 [model]
 provider_id = "llm-lan"
 model_id = "Qwen3.6-35B-A3B-bf16"

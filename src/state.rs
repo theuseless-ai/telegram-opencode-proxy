@@ -15,7 +15,7 @@
 //! turn path takes a short read-lock, clones the client out, and **drops the
 //! guard before any `.await`** — never holding the lock across a suspension.
 
-use crate::config::Slot;
+use crate::config::{Model, Slot};
 use crate::opencode::client::OpencodeClient;
 
 /// A live slot: its definition plus a connected, provider/model-validated
@@ -27,6 +27,11 @@ pub struct SlotConn {
     pub slot: Slot,
     /// A ready client bound to `slot.opencode_url`.
     pub client: OpencodeClient,
+    /// The effective model selector for this slot, resolved once at connect from
+    /// config `[model]` or opencode's default (#74). The turn sends it on
+    /// create/prompt. Its `context_window` field is not authoritative here — the
+    /// resolved limit lives in [`context_limit`](Self::context_limit).
+    pub model: Model,
     /// The active model's context-window size (tokens), resolved once at connect
     /// from opencode's provider catalogue (or the `[model].context_window`
     /// override). Drives the context-usage % footer (#72); `None` when unknown.

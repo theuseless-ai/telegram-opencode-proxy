@@ -72,11 +72,11 @@ fn config_for(opencode_url: &str, slot: &str, chat: i64) -> Config {
             workdir: ".".into(),
             telegram_id: Some(chat),
         }],
-        model: Model {
+        model: Some(Model {
             provider_id: "llm-lan".to_string(),
             model_id: "Qwen3.6-35B-A3B-bf16".to_string(),
             context_window: None,
-        },
+        }),
         permissions: Permissions { ask: Vec::new() },
         pairing: Pairing::default(),
         db_path: "proxy.db".into(),
