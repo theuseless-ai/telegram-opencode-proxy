@@ -74,13 +74,14 @@ pub async fn run_streaming_turn(
     model: PromptModel,
     parts: Vec<PartInput>,
     verbosity: Verbosity,
+    context_limit: Option<u64>,
     timing: StreamTiming,
 ) -> Result<()> {
     // Subscribe BEFORE firing the prompt so no delta of this turn is missed.
     let mut subscription = Subscription::connect(http, slot_url, timing.retry)
         .context("subscribing to /global/event for the streaming turn")?;
 
-    let mut state = LiveState::new(verbosity);
+    let mut state = LiveState::new(verbosity).with_context_limit(context_limit);
     // Part ids known to be reasoning — their deltas drive `typing`, not the answer.
     let mut reasoning_parts: HashSet<String> = HashSet::new();
     let mut sink = LiveSink::new(bot, chat_id);
@@ -120,6 +121,11 @@ pub async fn run_streaming_turn(
     };
 
     let reply = reply.context("streaming prompt failed")?;
+    // The completed assistant message carries the authoritative token usage —
+    // record it so the finalize footer can show context usage (#72).
+    if let Some(tokens) = &reply.info.tokens {
+        state.set_context_used(tokens.context_used());
+    }
     sink.finalize(&state, &reply.text()).await
 }
 

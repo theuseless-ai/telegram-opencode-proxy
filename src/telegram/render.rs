@@ -96,6 +96,11 @@ pub struct LiveState {
     tools: usize,
     subagents: usize,
     files_edited: usize,
+    /// Context tokens consumed this turn (from the assistant message's usage),
+    /// and the model's context-window size — together they render the context-%
+    /// footer segment (#72). Both `None` until known.
+    context_used: Option<u64>,
+    context_limit: Option<u64>,
 }
 
 impl LiveState {
@@ -105,6 +110,19 @@ impl LiveState {
             verbosity,
             ..Self::default()
         }
+    }
+
+    /// Set the model's context-window size (#72), consumed builder-style. `None`
+    /// leaves the footer to fall back to a raw token count instead of a %.
+    pub fn with_context_limit(mut self, limit: Option<u64>) -> Self {
+        self.context_limit = limit;
+        self
+    }
+
+    /// Record the turn's context-token usage for the footer (#72). Called with
+    /// the authoritative count from the completed assistant message.
+    pub fn set_context_used(&mut self, used: u64) {
+        self.context_used = Some(used);
     }
 
     /// Append a streamed text chunk to the answer buffer. A non-empty answer
@@ -163,25 +181,51 @@ impl LiveState {
         }
     }
 
-    /// The one-line completion summary footer (#14), or `None` when it should be
-    /// omitted — in Quiet mode, or when no tool ran (a plain text answer needs no
-    /// summary). Shown above the answer on finalize (§13); zero categories are
-    /// dropped, e.g. `✓ 3 tools · edited 1 file`.
+    /// The one-line completion summary footer (#14, #72), or `None` when it
+    /// should be omitted — in Quiet mode, or when there is nothing to report
+    /// (no tool ran and no context usage is known). Shown above the answer on
+    /// finalize (§13); zero categories are dropped, e.g.
+    /// `✓ 3 tools · edited 1 file · 🧠 42%`.
     fn summary_footer(&self) -> Option<String> {
-        if matches!(self.verbosity, Verbosity::Quiet) || self.tools == 0 {
+        if matches!(self.verbosity, Verbosity::Quiet) {
             return None;
         }
-        let mut parts = vec![plural(self.tools, "tool", "tools")];
-        if self.subagents > 0 {
-            parts.push(plural(self.subagents, "subagent", "subagents"));
+        let mut parts = Vec::new();
+        if self.tools > 0 {
+            parts.push(plural(self.tools, "tool", "tools"));
+            if self.subagents > 0 {
+                parts.push(plural(self.subagents, "subagent", "subagents"));
+            }
+            if self.files_edited > 0 {
+                parts.push(format!(
+                    "edited {}",
+                    plural(self.files_edited, "file", "files")
+                ));
+            }
         }
-        if self.files_edited > 0 {
-            parts.push(format!(
-                "edited {}",
-                plural(self.files_edited, "file", "files")
-            ));
+        // Context usage shows on every turn it is known — including a plain text
+        // answer with no tools — so the user can watch it climb toward compaction.
+        if let Some(segment) = self.context_segment() {
+            parts.push(segment);
+        }
+        if parts.is_empty() {
+            return None;
         }
         Some(format!("✓ {}", parts.join(" · ")))
+    }
+
+    /// The context-usage footer segment (#72): `🧠 42%` when the context-window
+    /// size is known, otherwise a raw count like `🧠 12.3k ctx`. `None` until a
+    /// usage figure has been recorded.
+    fn context_segment(&self) -> Option<String> {
+        let used = self.context_used?;
+        match self.context_limit {
+            Some(limit) if limit > 0 => {
+                let pct = ((used as f64 / limit as f64) * 100.0).round() as u64;
+                Some(format!("🧠 {pct}%"))
+            }
+            _ => Some(format!("🧠 {} ctx", human_tokens(used))),
+        }
     }
 
     /// The live status line for the in-flight tool (#14): a `🧵 <sub-agent>` tag
@@ -261,6 +305,18 @@ impl LiveState {
 /// "files") == "1 file"`, `plural(2, …) == "2 files"`.
 fn plural(n: usize, singular: &str, plural: &str) -> String {
     format!("{n} {}", if n == 1 { singular } else { plural })
+}
+
+/// A compact token count: `950 → "950"`, `12345 → "12.3k"`, `1_200_000 → "1.2M"`.
+/// Used by the context-usage footer when no context-window % can be shown (#72).
+fn human_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
 }
 
 #[cfg(test)]
@@ -461,5 +517,53 @@ mod tests {
         s.push_text("streaming answer");
         assert_eq!(s.render(), "streaming answer");
         assert_eq!(s.finalize("streaming answer"), "✓ 1 tool\nstreaming answer");
+    }
+
+    // --- context-usage footer (#72) --------------------------------------------
+
+    #[test]
+    fn context_percent_shows_when_the_limit_is_known() {
+        // 42_000 / 100_000 = 42%, appended after the tool tally.
+        let mut s = LiveState::new(Verbosity::Normal).with_context_limit(Some(100_000));
+        s.apply_part(&tool_id("bash", "c1", ToolStatus::Completed));
+        s.set_context_used(42_000);
+        assert_eq!(s.finalize("done"), "✓ 1 tool · 🧠 42%\ndone");
+    }
+
+    #[test]
+    fn context_shows_on_a_tool_free_turn() {
+        // No tool ran, but context usage still surfaces (unlike the old gate).
+        let mut s = LiveState::new(Verbosity::Normal).with_context_limit(Some(200_000));
+        s.set_context_used(50_000);
+        assert_eq!(s.finalize("just text"), "✓ 🧠 25%\njust text");
+    }
+
+    #[test]
+    fn context_falls_back_to_raw_count_without_a_limit() {
+        // No context-window configured → a human token count, not a %.
+        let mut s = LiveState::new(Verbosity::Normal);
+        s.set_context_used(12_345);
+        assert_eq!(s.finalize("answer"), "✓ 🧠 12.3k ctx\nanswer");
+    }
+
+    #[test]
+    fn context_hidden_in_quiet_mode() {
+        let mut s = LiveState::new(Verbosity::Quiet).with_context_limit(Some(100_000));
+        s.set_context_used(42_000);
+        assert_eq!(s.finalize("done"), "done");
+    }
+
+    #[test]
+    fn no_footer_when_no_tools_and_no_context() {
+        // Unchanged behaviour: a plain answer with nothing to report has no footer.
+        let s = LiveState::new(Verbosity::Normal);
+        assert_eq!(s.finalize("plain"), "plain");
+    }
+
+    #[test]
+    fn human_tokens_scales_units() {
+        assert_eq!(human_tokens(950), "950");
+        assert_eq!(human_tokens(12_345), "12.3k");
+        assert_eq!(human_tokens(1_200_000), "1.2M");
     }
 }

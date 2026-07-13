@@ -1285,6 +1285,7 @@ async fn run_turn(
         PromptModel::from(&state.cfg.model),
         parts,
         verbosity,
+        state.cfg.model.context_window,
         stream::StreamTiming::default(),
     )
     .await

@@ -77,6 +77,7 @@ fn cfg_with_model() -> Config {
         model: Model {
             provider_id: "llm-lan".to_string(),
             model_id: "Qwen3.6-35B-A3B-bf16".to_string(),
+            context_window: None,
         },
         permissions: Permissions { ask: Vec::new() },
         pairing: Pairing::default(),

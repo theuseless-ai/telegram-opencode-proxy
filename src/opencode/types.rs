@@ -236,8 +236,44 @@ pub struct MessageInfo {
     pub model_id: Option<String>,
     #[serde(default)]
     pub cost: Option<f64>,
+    /// Token usage for an assistant message (absent on user messages). Drives the
+    /// context-usage footer (#72).
+    #[serde(default)]
+    pub tokens: Option<Tokens>,
     #[serde(default)]
     pub finish: Option<String>,
+}
+
+/// Assistant token usage (opencode `Assistant.tokens`, #72). All counts default
+/// to `0` so a provider that omits a field still deserializes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Tokens {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub reasoning: u64,
+    #[serde(default)]
+    pub cache: TokenCache,
+}
+
+/// The `cache` sub-object of [`Tokens`] — prompt-cache read/write counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct TokenCache {
+    #[serde(default)]
+    pub read: u64,
+    #[serde(default)]
+    pub write: u64,
+}
+
+impl Tokens {
+    /// Context tokens currently consumed, mirroring opencode's own UI figure:
+    /// `input + output + reasoning + cache.read + cache.write`. This is the
+    /// numerator for the context-usage percentage (#72).
+    pub fn context_used(&self) -> u64 {
+        self.input + self.output + self.reasoning + self.cache.read + self.cache.write
+    }
 }
 
 /// A message part. Only text/reasoning carry data we read; everything else
@@ -301,6 +337,7 @@ mod tests {
         let cfg = Model {
             provider_id: "llm-lan".into(),
             model_id: "Qwen3.6-35B-A3B-bf16".into(),
+            context_window: None,
         };
         assert_eq!(CreateModel::from(&cfg).id, "Qwen3.6-35B-A3B-bf16");
         assert_eq!(CreateModel::from(&cfg).provider_id, "llm-lan");
@@ -409,6 +446,37 @@ mod tests {
         assert_eq!(m.info.finish.as_deref(), Some("stop"));
         // `text()` skips the step-start / reasoning / step-finish parts.
         assert_eq!(m.text(), "PONG");
+        // Assistant token usage rides on `info.tokens` (#72): the fixture reports
+        // input 10142 + output 3 + reasoning 15 + cache 0 = 10160 context tokens.
+        let tokens = m.info.tokens.expect("assistant message carries tokens");
+        assert_eq!(tokens.input, 10142);
+        assert_eq!(tokens.context_used(), 10_160);
+    }
+
+    #[test]
+    fn tokens_context_used_sums_all_components() {
+        let t = Tokens {
+            input: 100,
+            output: 20,
+            reasoning: 5,
+            cache: TokenCache {
+                read: 30,
+                write: 10,
+            },
+        };
+        assert_eq!(t.context_used(), 165);
+    }
+
+    #[test]
+    fn message_without_tokens_deserializes_with_none() {
+        // A user message (no `tokens` key) must still parse.
+        let info: MessageInfo = serde_json::from_value(serde_json::json!({
+            "id": "msg_x",
+            "sessionID": "ses_x",
+            "role": "user"
+        }))
+        .expect("user message info parses");
+        assert!(info.tokens.is_none());
     }
 
     #[test]
