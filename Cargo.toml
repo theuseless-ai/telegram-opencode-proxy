@@ -72,3 +72,20 @@ tokio = { version = "1.52.3", features = ["full"] }
 # Temp DB files for persistence reopen tests (src/persistence.rs). Already in
 # the lockfile transitively, so this direct edge reuses the pinned version.
 tempfile = "3"
+# In-process rmcp CLIENT for the MCP file-transfer tests (issue #65, `tests/mcp.rs`):
+# it drives the real `/mcp` server through a faithful streamable-http client. Pinned
+# `=2.2.0` to UNIFY with the runtime `[dependencies]` edge (which carries the
+# `server`/`transport-streamable-http-server` features) — Cargo unions the two feature
+# sets for the test build, so one rmcp is compiled with both roles. The
+# `-reqwest` transport feature supplies `impl StreamableHttpClient for reqwest::Client`
+# + `StreamableHttpClientTransport::from_config`, the reqwest-backed client used here.
+rmcp = { version = "=2.2.0", features = ["client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+# The download-endpoint tests (`GET /files/{id}`) hit the server over real HTTP.
+# Same `0.12` line as the runtime edge, so Cargo unifies it.
+reqwest = { version = "0.12", features = ["json", "stream"] }
+# `CancellationToken` for `mcp::build_router(app, ct)` in the tests (same `0.7` as
+# the runtime edge).
+tokio-util = "0.7"
+# base64-encode the outbound `content` argument and decode inbound bytes in the
+# tests (same `0.22` line as the runtime edge).
+base64 = "0.22.1"

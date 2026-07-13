@@ -252,6 +252,13 @@ flight is queued. `/stop` maps to `POST /session/:id/abort` for explicit interru
   > `FilePart` path stays host-independent regardless (base64 over HTTP), so it is
   > the required path whenever the two do not share a filesystem.
 
+  > **Superseded for outbound by §14 (#65):** the MCP `send_file_to_user` tool is
+  > now the default outbound path — an HTTP tool call, not a shared-filesystem
+  > watcher — so the constraint above no longer applies to outbound files. The
+  > outbox watcher + `/get` remain as the legacy path (still filesystem-coupled).
+  > Inbound is likewise HTTP-only now (a download URL, §14); the `FilePart` path
+  > above survives only as the `filepart_fallback` config toggle.
+
 ---
 
 ## 8. Build order (each shippable)
@@ -330,7 +337,26 @@ model_id    = "Qwen3.6-35B-A3B-bf16"   # must match a models key under that prov
 
 [permissions]
 ask = ["git commit*", "git push*"]   # PATCHed onto each session at creation
+
+[mcp]                            # file-transfer server (#65) — see §14. Optional;
+enabled = true                   # a missing [mcp] block uses these defaults.
+bind = "127.0.0.1"                # loopback IS the trust boundary — see §14
+port = 4100
+max_file_bytes = 20971520         # 20 MiB, mirrors the inbound Telegram file cap
+ttl_secs = 300                    # inbound download URL lifetime
+filepart_fallback = false         # true = revert inbound to the #11 base64 FilePart
 ```
+
+`[mcp]` keys, in full (also documented in `config.example.toml`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Start the MCP server task at all. `false` runs the proxy without file-transfer tools (#12's legacy disk-outbox + `/get` only). |
+| `bind` | `127.0.0.1` | Listener address. No auth is implemented — the loopback bind **is** the trust boundary; do not widen without adding one. |
+| `port` | `4100` | Listener port. Same value for both `/mcp` and `/files/{id}` — one axum server hosts both. |
+| `max_file_bytes` | `20971520` (20 MiB) | Per-file cap for `send_file_to_user` and inbound storage, mirroring `telegram::files::MAX_INBOUND_BYTES`. |
+| `ttl_secs` | `300` | How long an inbound file stays downloadable via `GET /files/{id}` before the TTL sweep purges it. |
+| `filepart_fallback` | `false` | `true` reverts the inbound path to the #11 base64 `FilePart` instead of the MCP download-URL announce (see §14). |
 
 ---
 
@@ -508,3 +534,127 @@ transcript — chat stays lightweight and linear.
   always-on failures.
 - **Milestone C / fast-follow:** `/quiet` `/verbose` toggle, sub-agent tags, the
   summary footer.
+
+---
+
+## 14. MCP file-transfer server (#65)
+
+Files move as **HTTP**, not as a filesystem convention: one tool call sends a
+file out, one capability URL brings a file in. This is the current default for
+both directions; it supersedes the filesystem-coupled paths in §7 (kept as
+legacy — see below).
+
+### Topology — one shared, stateless server
+
+The proxy hosts **exactly one** MCP server, for **all** slots — no per-slot
+mount, no per-slot process. It is a `type:"remote"` Streamable-HTTP server built
+on the official `rmcp` SDK (pinned `=2.2.0`), run **stateless**
+(`with_stateful_mode(false)`, no `MCP-Session-Id` bookkeeping) so a slot added at
+runtime (`proxy connect`) works with no restart.
+
+One `axum::Router`, bound once to `cfg.mcp.bind:cfg.mcp.port` (default
+`127.0.0.1:4100`), carries two routes:
+
+- `POST /mcp` — the rmcp tool service (`send_file_to_user`).
+- `GET /files/{id}` — a plain, stateful download route for inbound files.
+
+Both are started together in `serve()`, alongside the `FileStore`'s TTL sweep
+task. Like the admin socket, the MCP server is a **secondary** feature: a bind
+failure is logged and tolerated, never taking down the Telegram dispatcher. Both
+the HTTP server task and the TTL sweep are held for the process lifetime and
+torn down (cancellation token + abort) on graceful shutdown, alongside the admin
+socket task.
+
+### Outbound: the `send_file_to_user` tool
+
+The agent sends a file to its user by calling the tool
+`send_file_to_user(filename, content, caption?)`, where `content` is the file's
+bytes as standard base64 (an optional `data:<mime>;base64,` prefix is accepted
+and stripped). `filename`'s extension decides photo-vs-document delivery.
+
+**Recipient identity is never a tool argument.** It comes from the **`X-Slot`
+HTTP header**, set once in each workspace's `opencode.json` (`mcp.headers`, see
+below) — the model cannot see or spoof it. On every call the server:
+
+1. reads `X-Slot` from the request,
+2. validates it against the **live** slot registry (an unknown or missing slot
+   is a clean tool error, not a crash — and a slot added at runtime is accepted
+   immediately, no restart),
+3. resolves the owning `chat_id` (`Db::chat_for_slot`, oldest binding wins under
+   the one-opencode-per-user assumption),
+4. sends the bytes through the existing outbound path, wrapped in the `#25`
+   flood-control/backoff retry.
+
+`X-Slot` must match the slot's `name` in `config.toml` **exactly, case-sensitive**
+— there is no normalization.
+
+### Inbound: the `GET /files/{id}` download URL
+
+When the user sends Telegram a photo or document, the proxy downloads it,
+stores the bytes in the in-process `FileStore` under a fresh UUID, and instead
+of inlining the file into the turn, injects an **imperative announce** prompt
+part naming a one-shot download URL
+(`http://<bind>:<port>/files/<id>`, built by `Mcp::download_url`). The announce
+instructs the model to `curl` the URL into a `downloads/` folder inside its
+workspace and then read the file with its **own** tools — the proxy stays
+format-agnostic (images, PDFs, docx, …) this way, since opencode's read tool
+already renders images and extracts document text from a file on disk.
+
+The download endpoint carries **no `X-Slot`** — a bare `curl` has no way to
+supply an un-spoofable header — so its guard is different from the outbound
+tool: an unguessable v4 UUID, single-use (the file is removed from the store on
+first successful read), a TTL (`[mcp].ttl_secs`, default 300s, reclaimed by a
+fixed-interval sweep), and the `127.0.0.1` bind. An unknown, already-consumed,
+or expired id is a plain `404` that leaks nothing.
+
+### The `127.0.0.1` trust boundary
+
+Neither route implements auth. The loopback bind is the entire trust boundary —
+same model as the rest of the proxy (localhost + trusted users). Do not widen
+`[mcp].bind` without adding one. The `X-Slot` header is config-sourced (not a
+tool argument) and validated per request, which defeats *model* spoofing, but
+anything that can reach the port can claim any `X-Slot` — that's an accepted
+consequence of the no-auth design, not a gap specific to this feature.
+
+### One opencode instance per user
+
+`Db::chat_for_slot` returns the single (oldest, if ever ambiguous) `chat_id`
+bound to a slot — outbound delivery assumes one Telegram user per opencode
+workspace, matching the rest of the proxy's per-slot model.
+
+### Per-workspace `opencode.json` registration
+
+Every slot's `opencode.json` points at the **same** MCP URL — the slot travels
+in the header, not the URL — differing only in `X-Slot`:
+
+```jsonc
+// e.g. frank/opencode.json — holly's is identical but "X-Slot": "holly"
+{
+  "mcp": {
+    "telegram-files": {
+      "type": "remote",
+      "url": "http://127.0.0.1:4100/mcp",
+      "enabled": true,
+      "headers": { "X-Slot": "frank" }
+    }
+  }
+}
+```
+
+`X-Slot` **must equal the slot's `name` in `config.toml` exactly, case-sensitive**
+— `"Frank"` will not match `frank`. `<port>` matches `[mcp].port` (§11). This
+merges with any other `mcp`/`provider` config already in that workspace's
+`opencode.json` (§12) — add the key, don't replace the file.
+
+### Relationship to prior work
+
+- **Supersedes #12's disk-outbox for outbound.** The outbox watcher (`./outbox`
+  → send) still runs and is unchanged — it is now the **legacy** outbound path,
+  useful when the proxy and opencode share a filesystem — but
+  `send_file_to_user` is the default a model actually reaches for.
+- **`/get` is unchanged** — still a proxy-side, filesystem-coupled command,
+  orthogonal to this feature.
+- **#11's base64 `FilePart` is kept as the inbound fallback**, gated by
+  `[mcp].filepart_fallback` (or automatically when `[mcp].enabled = false`).
+  The two inbound paths are mutually exclusive per message — both-on would
+  double the file into the turn context.
