@@ -16,10 +16,11 @@ pub const TELEGRAM_LIMIT: usize = 4096;
 
 /// Per-user output verbosity (`/quiet` · `/verbose`, §13, #10). Persisted per
 /// chat; the streaming renderer reads it to decide how much to surface. `Normal`
-/// is the default. Concrete effects: the tool-status line and the completion
-/// **summary footer** (#14) show at Normal/Verbose and are hidden at Quiet; tool
-/// **failures** are always shown at every level. Verbose-only detail (full tool
-/// args, cost, per-file names) is a fast-follow pending live wire validation.
+/// is the default. Concrete effects (#14): the tool-status line, the `🧵`
+/// sub-agent tag on `task` children, and the completion **summary footer** show at
+/// Normal/Verbose and are hidden at Quiet; the tool line adds opencode's `title`
+/// arg-summary at **Verbose** (`⚙️ git status` vs `⚙️ bash`). Tool **failures** are
+/// always shown at every level. (Cost / per-file names remain a later add.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Verbosity {
     /// Answer (and failures) only — no live tool-status line.
@@ -68,12 +69,21 @@ impl Verbosity {
 ///
 /// The driver edits the message on a ≤1/sec ticker and only when [`render`] has
 /// changed, so this type carries no timing — just the content.
+/// The current in-flight tool: its name plus opencode's `state.title` summary
+/// (#14). Drives the live status line — a `🧵` sub-agent tag for a `task` child,
+/// otherwise `⚙️`, with `title` as the label at Verbose or for the sub-agent.
+#[derive(Debug, Clone)]
+struct ActiveTool {
+    name: String,
+    title: Option<String>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct LiveState {
     /// Accumulated visible answer text (concatenated `text` deltas).
     answer: String,
     /// The current in-flight tool, shown while there is no answer text yet.
-    active_tool: Option<String>,
+    active_tool: Option<ActiveTool>,
     /// Tool failures, shown at every stage and preserved into the final render.
     failures: Vec<String>,
     /// The user's output verbosity (#10) — gates the tool-status line.
@@ -111,11 +121,15 @@ impl LiveState {
             name,
             call_id,
             status,
+            title,
         } = kind
         {
             match status {
                 ToolStatus::Pending | ToolStatus::Running => {
-                    self.active_tool = Some(name.clone());
+                    self.active_tool = Some(ActiveTool {
+                        name: name.clone(),
+                        title: title.clone(),
+                    });
                 }
                 ToolStatus::Completed => {
                     self.active_tool = None;
@@ -170,6 +184,23 @@ impl LiveState {
         Some(format!("✓ {}", parts.join(" · ")))
     }
 
+    /// The live status line for the in-flight tool (#14): a `🧵 <sub-agent>` tag
+    /// for a `task` child, otherwise `⚙️ <tool>` — with opencode's `title` summary
+    /// as the label at Verbose (and always for the sub-agent), falling back to the
+    /// bare tool name when no title is present. `None` when no tool is active.
+    fn active_tool_line(&self) -> Option<String> {
+        let t = self.active_tool.as_ref()?;
+        let titled = t.title.as_deref().filter(|s| !s.is_empty());
+        if t.name == "task" {
+            // Sub-agent tag — the title carries the sub-agent's name/description.
+            Some(format!("🧵 {}", titled.unwrap_or(&t.name)))
+        } else if matches!(self.verbosity, Verbosity::Verbose) {
+            Some(format!("⚙️ {}", titled.unwrap_or(&t.name)))
+        } else {
+            Some(format!("⚙️ {}", t.name))
+        }
+    }
+
     /// Whether the tool-status line is visible at the current verbosity and a
     /// tool is active (hidden entirely in Quiet, #10).
     fn tool_line_visible(&self) -> bool {
@@ -191,9 +222,10 @@ impl LiveState {
         let mut out = String::new();
         if !self.answer.is_empty() {
             out.push_str(&self.answer);
-        } else if self.tool_line_visible() {
-            out.push_str("⚙️ ");
-            out.push_str(self.active_tool.as_deref().unwrap_or_default());
+        } else if self.tool_line_visible()
+            && let Some(line) = self.active_tool_line()
+        {
+            out.push_str(&line);
         }
         for failure in &self.failures {
             if !out.is_empty() {
@@ -345,6 +377,17 @@ mod tests {
             name: name.to_string(),
             call_id: call_id.to_string(),
             status,
+            title: None,
+        }
+    }
+
+    /// A tool part carrying opencode's `state.title` summary (#14).
+    fn tool_titled(name: &str, status: ToolStatus, title: &str) -> PartKind {
+        PartKind::Tool {
+            name: name.to_string(),
+            call_id: "call_x".to_string(),
+            status,
+            title: Some(title.to_string()),
         }
     }
 
@@ -477,6 +520,35 @@ mod tests {
         s.apply_part(&tool_id("bash", "c1", ToolStatus::Completed));
         s.apply_part(&tool_id("bash", "c1", ToolStatus::Completed)); // duplicate terminal
         assert_eq!(s.finalize("done"), "✓ 1 tool\ndone");
+    }
+
+    // --- sub-agent tag + verbose tool args (#14) -------------------------------
+
+    #[test]
+    fn task_tool_renders_as_a_subagent_tag_with_its_title() {
+        let mut s = LiveState::new(Verbosity::Normal);
+        s.apply_part(&tool_titled("task", ToolStatus::Running, "explore"));
+        // A running `task` child shows the 🧵 sub-agent tag labelled by its title.
+        assert_eq!(s.render(), "🧵 explore");
+    }
+
+    #[test]
+    fn task_tool_without_title_falls_back_to_a_bare_tag() {
+        let mut s = LiveState::new(Verbosity::Normal);
+        s.apply_part(&tool("task", ToolStatus::Running));
+        assert_eq!(s.render(), "🧵 task");
+    }
+
+    #[test]
+    fn verbose_shows_the_tool_title_normal_shows_the_bare_name() {
+        // Verbose surfaces opencode's title (the args summary); Normal stays bare.
+        let mut v = LiveState::new(Verbosity::Verbose);
+        v.apply_part(&tool_titled("bash", ToolStatus::Running, "git status"));
+        assert_eq!(v.render(), "⚙️ git status");
+
+        let mut n = LiveState::new(Verbosity::Normal);
+        n.apply_part(&tool_titled("bash", ToolStatus::Running, "git status"));
+        assert_eq!(n.render(), "⚙️ bash");
     }
 
     #[test]
