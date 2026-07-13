@@ -102,6 +102,7 @@ fn slot_conn(name: &str, url: &str, telegram_id: Option<i64>) -> SlotConn {
             telegram_id,
         },
         client: OpencodeClient::new(url).expect("opencode client builds"),
+        context_limit: None,
     }
 }
 

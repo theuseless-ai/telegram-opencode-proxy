@@ -167,10 +167,29 @@ pub struct ProviderInfo {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
-    /// modelID → model metadata. We check presence of the key only, so the
-    /// value is kept opaque for forward-compatibility.
+    /// modelID → model metadata. Kept as an opaque value for forward-compat; the
+    /// only field we reach into is `limit.context` (#72, see
+    /// [`ProvidersResponse::context_limit`]).
     #[serde(default)]
     pub models: HashMap<String, serde_json::Value>,
+}
+
+impl ProvidersResponse {
+    /// The context-window size (`models[model].limit.context`) opencode reports
+    /// for `{provider_id, model_id}`, or `None` when the provider/model is absent
+    /// or carries no positive limit. This is how a limit set in **opencode.json**
+    /// reaches the context-usage footer (#72) without a proxy-side duplicate.
+    pub fn context_limit(&self, provider_id: &str, model_id: &str) -> Option<u64> {
+        self.providers
+            .iter()
+            .find(|p| p.id == provider_id)?
+            .models
+            .get(model_id)?
+            .get("limit")?
+            .get("context")?
+            .as_u64()
+            .filter(|&n| n > 0)
+    }
 }
 
 // ---------------------------------------------------------------------------

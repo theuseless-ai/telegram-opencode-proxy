@@ -77,6 +77,25 @@ impl OpencodeClient {
             .context("decoding /config/providers response")
     }
 
+    /// `GET /provider` — the fuller provider catalogue, whose per-model metadata
+    /// carries `limit.context` on opencode builds where `/config/providers` omits
+    /// it. Used only to resolve the context-window size for the usage footer
+    /// (#72); shares the `{providers:[{id, models}]}` shape, so it decodes into
+    /// the same [`ProvidersResponse`] (unknown fields ignored).
+    pub async fn provider_catalogue(&self) -> Result<ProvidersResponse> {
+        let resp = self
+            .http
+            .get(self.url("/provider"))
+            .send()
+            .await
+            .context("GET /provider")?
+            .error_for_status()
+            .context("GET /provider returned an error status")?;
+        resp.json::<ProvidersResponse>()
+            .await
+            .context("decoding /provider response")
+    }
+
     /// `POST /session` — create a session, optionally with a title and model.
     pub async fn create_session(
         &self,
@@ -293,6 +312,41 @@ mod tests {
         assert!(err.contains("provider 'nope'"), "{err}");
         // Error lists what IS available.
         assert!(err.contains("llm-lan"), "{err}");
+    }
+
+    #[test]
+    fn context_limit_reads_model_limit_context() {
+        // A catalogue where the model carries `limit.context` (as opencode
+        // reports when the window is configured, incl. via opencode.json) (#72).
+        let cat: ProvidersResponse = serde_json::from_value(serde_json::json!({
+            "providers": [{
+                "id": "llm-lan",
+                "models": {
+                    "Qwen3.6-35B-A3B-bf16": { "id": "Qwen3.6-35B-A3B-bf16", "limit": { "context": 40960, "output": 8192 } },
+                    "no-limit": { "id": "no-limit" }
+                }
+            }]
+        }))
+        .expect("catalogue parses");
+        assert_eq!(
+            cat.context_limit("llm-lan", "Qwen3.6-35B-A3B-bf16"),
+            Some(40960)
+        );
+        // Missing limit / unknown model / unknown provider → None.
+        assert_eq!(cat.context_limit("llm-lan", "no-limit"), None);
+        assert_eq!(cat.context_limit("llm-lan", "ghost"), None);
+        assert_eq!(cat.context_limit("nope", "Qwen3.6-35B-A3B-bf16"), None);
+    }
+
+    #[test]
+    fn context_limit_absent_in_the_id_only_fixture() {
+        // The real `/config/providers` fixture lists models as `{id, name}` with
+        // no `limit` — so auto-detect returns None there and the `/provider`
+        // fallback / config override takes over (#72).
+        assert_eq!(
+            providers().context_limit("llm-lan", "Qwen3.6-35B-A3B-bf16"),
+            None
+        );
     }
 
     #[test]

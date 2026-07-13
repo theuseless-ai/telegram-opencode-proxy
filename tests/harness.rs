@@ -780,6 +780,7 @@ async fn unreachable_opencode_gets_a_clear_message() {
         SlotConn {
             slot: cfg.slots[0].clone(),
             client,
+            context_limit: None,
         },
     );
     let db = Db::open_in_memory().expect("db");
