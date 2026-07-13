@@ -29,7 +29,7 @@ use telegram_opencode_proxy::admin::{
     self, AdminRequest, AdminResponse, AdminState, BoxFuture, ConnectOutcome, ConnectParams,
     SlotInfo,
 };
-use telegram_opencode_proxy::config::{Config, Model, Pairing, Permissions, Slot};
+use telegram_opencode_proxy::config::{Config, Mcp, Model, Pairing, Permissions, Slot};
 use telegram_opencode_proxy::opencode::client::OpencodeClient;
 use telegram_opencode_proxy::persistence::Db;
 use telegram_opencode_proxy::state::SlotConn;
@@ -81,6 +81,7 @@ fn cfg_with_model() -> Config {
         permissions: Permissions { ask: Vec::new() },
         pairing: Pairing::default(),
         db_path: "unused.db".into(),
+        mcp: Mcp::default(),
     }
 }
 

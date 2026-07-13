@@ -150,6 +150,20 @@ fn data_uri(mime: &str, bytes: &[u8]) -> String {
     format!("data:{mime};base64,{}", STANDARD.encode(bytes))
 }
 
+/// Decide the photo-vs-document split and the matching `upload_*` chat action
+/// for a resolved MIME: an image MIME sends as a **photo**, everything else as
+/// a **document**. Shared by [`send_outbound_file`] and [`send_outbound_bytes`]
+/// so the branch logic lives in exactly one place.
+fn outbound_send_kind(mime: &str) -> (bool, ChatAction) {
+    let is_image = mime.starts_with("image/");
+    let action = if is_image {
+        ChatAction::UploadPhoto
+    } else {
+        ChatAction::UploadDocument
+    };
+    (is_image, action)
+}
+
 /// Send a local file to `chat_id` (#12): an image MIME goes as a **photo**,
 /// everything else as a **document**. A matching `upload_*` chat action is fired
 /// first so the client shows "sending a file…" while the upload runs (§13). The
@@ -158,14 +172,9 @@ fn data_uri(mime: &str, bytes: &[u8]) -> String {
 pub async fn send_outbound_file(bot: &Bot, chat_id: ChatId, path: &Path) -> Result<()> {
     let filename = path.file_name().and_then(|n| n.to_str());
     let mime = resolve_mime(None, filename);
-    let is_image = mime.starts_with("image/");
+    let (is_image, action) = outbound_send_kind(&mime);
 
     // Liveness only — a failed chat action must not sink the send (§13).
-    let action = if is_image {
-        ChatAction::UploadPhoto
-    } else {
-        ChatAction::UploadDocument
-    };
     let _ = bot.send_chat_action(chat_id, action).await;
 
     let file = InputFile::file(path);
@@ -177,6 +186,46 @@ pub async fn send_outbound_file(bot: &Bot, chat_id: ChatId, path: &Path) -> Resu
         bot.send_document(chat_id, file)
             .await
             .with_context(|| format!("send_document {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Send in-memory bytes to `chat_id` (#65 MCP outbound): the bytes-based twin of
+/// [`send_outbound_file`] for the `send_file_to_user` MCP tool, which decodes a
+/// payload into memory rather than reading a workdir path. Same
+/// MIME→photo/document split (via [`outbound_send_kind`], keyed off `filename`'s
+/// extension through [`resolve_mime`]) and the same `upload_*` liveness action
+/// fired first (§13). An optional `caption` is attached via teloxide's
+/// `.caption(...)` setter on the photo/document request. This is a **plain**
+/// send with no retry — the MCP tool call site wraps it in `retry::with_retry`
+/// (#25), matching how [`send_outbound_file`] is called by the #12 outbox.
+pub async fn send_outbound_bytes(
+    bot: &Bot,
+    chat_id: ChatId,
+    filename: &str,
+    bytes: Vec<u8>,
+    caption: Option<&str>,
+) -> Result<()> {
+    let mime = resolve_mime(None, Some(filename));
+    let (is_image, action) = outbound_send_kind(&mime);
+
+    let _ = bot.send_chat_action(chat_id, action).await;
+
+    let file = InputFile::memory(bytes).file_name(filename.to_string());
+    if is_image {
+        let mut req = bot.send_photo(chat_id, file);
+        if let Some(caption) = caption {
+            req = req.caption(caption.to_string());
+        }
+        req.await
+            .with_context(|| format!("send_photo {filename}"))?;
+    } else {
+        let mut req = bot.send_document(chat_id, file);
+        if let Some(caption) = caption {
+            req = req.caption(caption.to_string());
+        }
+        req.await
+            .with_context(|| format!("send_document {filename}"))?;
     }
     Ok(())
 }
@@ -312,6 +361,30 @@ mod tests {
         std::fs::create_dir(workdir.path().join("outbox")).expect("mkdir");
         let err = resolve_within_workdir(workdir.path(), "outbox").unwrap_err();
         assert!(err.to_string().contains("not a file"), "{err}");
+    }
+
+    /// The shared photo/document + chat-action decision (#65): image MIMEs pick
+    /// the photo branch and `UploadPhoto`; everything else picks document and
+    /// `UploadDocument`. Both [`send_outbound_file`] and [`send_outbound_bytes`]
+    /// key off this so they can never disagree.
+    #[test]
+    fn outbound_send_kind_splits_on_image_mime() {
+        assert_eq!(
+            outbound_send_kind("image/png"),
+            (true, ChatAction::UploadPhoto)
+        );
+        assert_eq!(
+            outbound_send_kind("image/jpeg"),
+            (true, ChatAction::UploadPhoto)
+        );
+        assert_eq!(
+            outbound_send_kind("application/pdf"),
+            (false, ChatAction::UploadDocument)
+        );
+        assert_eq!(
+            outbound_send_kind("text/plain"),
+            (false, ChatAction::UploadDocument)
+        );
     }
 
     #[test]

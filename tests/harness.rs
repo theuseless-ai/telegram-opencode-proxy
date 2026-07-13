@@ -30,7 +30,7 @@ use teloxide::prelude::Requester;
 use teloxide::types::{ChatId, Message};
 
 use telegram_opencode_proxy::admin::{self, AdminRequest, AdminResponse, AdminState};
-use telegram_opencode_proxy::config::{Config, Model, Pairing, Permissions, Slot};
+use telegram_opencode_proxy::config::{Config, Mcp, Model, Pairing, Permissions, Slot};
 use telegram_opencode_proxy::opencode::client::OpencodeClient;
 use telegram_opencode_proxy::persistence::{Db, PendingApproval};
 use telegram_opencode_proxy::state::SlotConn;
@@ -64,6 +64,7 @@ fn config_for(opencode_url: &str) -> Config {
         permissions: Permissions { ask: Vec::new() },
         pairing: Pairing::default(),
         db_path: "proxy.db".into(),
+        mcp: Mcp::default(),
     }
 }
 

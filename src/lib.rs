@@ -9,6 +9,7 @@
 pub mod admin;
 pub mod auth;
 pub mod config;
+pub mod mcp;
 pub mod opencode;
 pub mod outbox;
 pub mod pairing;
