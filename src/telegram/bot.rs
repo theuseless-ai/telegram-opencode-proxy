@@ -1,12 +1,11 @@
 //! teloxide long-poll dispatcher: text + media messages, `/whoami` `/stop` `/new`
-//! `/quiet` `/verbose` `/get`, and the whitelist gate. See `architecture.md` §4/§13.
+//! `/quiet` `/verbose`, and the whitelist gate. See `architecture.md` §4/§13.
 //!
 //! A whitelisted user's text is routed to their opencode slot and answered by a
 //! streaming turn (#8) run through a per-user serial worker (#9); an inbound
 //! photo/document is downloaded and attached as a file part (#11, `handle_media`).
-//! `/get <path>` sends a workdir file back out (#12, `handle_get`); the outbox
-//! watcher (`outbox.rs`) pushes files the agent writes. The permission relay is
-//! the inline-button callback path (#13, `handle_callback`).
+//! The outbox watcher (`outbox.rs`) pushes files the agent writes back out (#12).
+//! The permission relay is the inline-button callback path (#13, `handle_callback`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -559,7 +558,7 @@ impl crate::admin::AdminState for AppState {
 
 /// Bot commands. `/whoami` aids bootstrap (the operator learns their chat id to
 /// whitelist); `/stop` interrupts the in-flight turn (#9); `/new` resets the
-/// session and `/quiet` `/verbose` toggle output verbosity (#10). `/get` later.
+/// session and `/quiet` `/verbose` toggle output verbosity (#10).
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
 enum Command {
@@ -573,8 +572,6 @@ enum Command {
     Quiet,
     /// Toggle verbose mode (extra detail).
     Verbose,
-    /// Send me a file from your workdir: `/get <path>`.
-    Get(String),
 }
 
 /// Friendly message shown to the user when a turn fails; details go to the log.
@@ -686,7 +683,6 @@ async fn handle_command(
         Command::New => handle_new(bot, msg, state).await,
         Command::Quiet => handle_verbosity(bot, msg, state, Verbosity::Quiet).await,
         Command::Verbose => handle_verbosity(bot, msg, state, Verbosity::Verbose).await,
-        Command::Get(path) => handle_get(bot, msg, state, path).await,
     }
 }
 
@@ -887,74 +883,6 @@ pub async fn handle_stop(bot: Bot, msg: Message, state: Arc<AppState>) -> Respon
             bot.send_message(msg.chat.id, "⚠️ Couldn't stop the current turn.")
                 .await?;
         }
-    }
-    Ok(())
-}
-
-/// `/get <path>` (#12): send the user a file from their slot's workdir. The path
-/// is resolved and **guarded** by [`files::resolve_within_workdir`] — a `../`
-/// traversal, an absolute path elsewhere, or a symlink out of the workdir is
-/// rejected before anything is read. Auth-gated: only a bound user (whose slot is
-/// live) has a workdir to read from.
-///
-/// `pub` so the harness can drive it directly (like [`handle_stop`]).
-pub async fn handle_get(
-    bot: Bot,
-    msg: Message,
-    state: Arc<AppState>,
-    path: String,
-) -> ResponseResult<()> {
-    let chat_id = msg.chat.id.0;
-    let requested = path.trim();
-    if requested.is_empty() {
-        bot.send_message(
-            msg.chat.id,
-            "Usage: `/get <path>` — a file in your workdir.",
-        )
-        .await?;
-        return Ok(());
-    }
-
-    // Auth-gate: resolve the sender's live slot (its workdir is the read root).
-    let slots = state.slot_snapshot();
-    let slot = match auth::resolve(&state.db, &slots, chat_id) {
-        Ok(Some(slot)) => slot,
-        Ok(None) => {
-            bot.send_message(msg.chat.id, "You're not set up to fetch files yet.")
-                .await?;
-            return Ok(());
-        }
-        Err(err) => {
-            tracing::error!(chat_id, error = %err, "auth lookup failed on /get");
-            bot.send_message(msg.chat.id, ERROR_REPLY).await?;
-            return Ok(());
-        }
-    };
-
-    // Guard the requested path against the workdir before touching disk.
-    let resolved = match files::resolve_within_workdir(&slot.workdir, requested) {
-        Ok(resolved) => resolved,
-        Err(err) => {
-            tracing::info!(chat_id, slot = %slot.name, requested, error = %err, "rejected /get path");
-            bot.send_message(msg.chat.id, format!("⚠️ Can't get `{requested}`: {err}"))
-                .await?;
-            return Ok(());
-        }
-    };
-
-    if let Err(err) = files::send_outbound_file(&bot, msg.chat.id, &resolved).await {
-        tracing::error!(
-            chat_id,
-            slot = %slot.name,
-            path = %resolved.display(),
-            error = format!("{err:#}"),
-            "sending /get file failed"
-        );
-        bot.send_message(
-            msg.chat.id,
-            "⚠️ Couldn't send that file — please try again.",
-        )
-        .await?;
     }
     Ok(())
 }
@@ -1336,13 +1264,13 @@ mod tests {
             .iter()
             .map(|c| c.command.clone())
             .collect();
-        for expected in ["/whoami", "/stop", "/new", "/quiet", "/verbose", "/get"] {
+        for expected in ["/whoami", "/stop", "/new", "/quiet", "/verbose"] {
             assert!(
                 names.iter().any(|n| n == expected),
                 "command {expected} missing from the advertised menu: {names:?}"
             );
         }
-        assert_eq!(names.len(), 6, "unexpected command set: {names:?}");
+        assert_eq!(names.len(), 5, "unexpected command set: {names:?}");
     }
 
     #[tokio::test]

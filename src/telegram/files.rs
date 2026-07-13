@@ -1,5 +1,5 @@
 //! Inbound: Telegram photo/doc → base64 `FilePart` (data URI). Outbound:
-//! `send_document`/`send_photo` by mime; `/get <path>` with within-workdir guard.
+//! `send_document`/`send_photo` by mime, with a within-workdir guard.
 //! See `docs/design/architecture.md` §2.4/§2.5. Issues #11/#12.
 //!
 //! #11 implements the **inbound** half: [`inbound_parts`] turns a media message
@@ -8,8 +8,8 @@
 //!
 //! #12 implements the **outbound** half: [`send_outbound_file`] uploads a local
 //! file to a user (photo for images, document otherwise), and
-//! [`resolve_within_workdir`] is the canonicalize-guard that keeps `/get` and the
-//! outbox watcher from ever reading outside a slot's workdir.
+//! [`resolve_within_workdir`] is the canonicalize-guard that keeps outbound file
+//! reads from ever escaping a slot's workdir.
 
 use std::path::{Path, PathBuf};
 
@@ -260,8 +260,8 @@ pub async fn send_outbound_bytes(
 }
 
 /// Resolve a user-supplied `requested` path against a slot's `workdir` and prove
-/// it stays **inside** that workdir (#12). This is the guard for `/get`: it
-/// canonicalizes both the workdir and the target (following symlinks, collapsing
+/// it stays **inside** that workdir (#12). This is the guard for outbound file
+/// reads: it canonicalizes both the workdir and the target (following symlinks, collapsing
 /// `..`) and rejects anything that escapes — a `../` traversal, an absolute path
 /// elsewhere, or a symlink pointing out. The target must exist (it's about to be
 /// read and sent), so a missing file is an error too.
@@ -382,8 +382,8 @@ mod tests {
         assert!(resolve_within_workdir(&workdir, "   ").is_err());
     }
 
-    /// A directory (not a file) inside the workdir is rejected — `/get` only
-    /// sends files.
+    /// A directory (not a file) inside the workdir is rejected — the guard is
+    /// for sending files.
     #[test]
     fn resolve_within_workdir_rejects_a_directory() {
         let workdir = tempfile::tempdir().expect("tempdir");
