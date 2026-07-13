@@ -123,6 +123,7 @@ async fn streaming_turn_live_edits_typing_and_finalizes() {
         model,
         text_parts("hi"),
         Verbosity::Normal,
+        None,
         timing,
     )
     .await
@@ -182,6 +183,64 @@ async fn streaming_turn_live_edits_typing_and_finalizes() {
 }
 
 #[tokio::test]
+async fn finalize_footer_shows_context_usage_percent() {
+    // With the model's context window known and the reply reporting token usage,
+    // the completion footer surfaces a context-used % — even with no tools (#72).
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    oc.set_reply("Hello");
+    oc.set_reply_tokens(50_000); // 50k of a 100k window → 50%
+    oc.set_message_delay(Duration::from_millis(150));
+    oc.set_event_frames(
+        vec![
+            frame(serde_json::json!({"type":"server.connected","properties":{}})),
+            frame(part_updated(SESSION, "prt_ans", "text")),
+            frame(delta(SESSION, "prt_ans", "Hello")),
+        ],
+        Duration::from_millis(20),
+    );
+
+    let bot = Bot::new("test-token").set_api_url(tg.url.parse().expect("mock url"));
+    let http = reqwest::Client::new();
+    let client = OpencodeClient::new(&oc.url).expect("client");
+    let db = telegram_opencode_proxy::persistence::Db::open_in_memory().expect("db");
+    let model = PromptModel {
+        provider_id: "llm-lan".into(),
+        model_id: "Qwen3.6-35B-A3B-bf16".into(),
+    };
+
+    run_streaming_turn(
+        &bot,
+        &http,
+        &client,
+        &db,
+        &oc.url,
+        CHAT_ID,
+        SESSION,
+        model,
+        text_parts("hi"),
+        Verbosity::Normal,
+        Some(100_000), // context window → drives the %
+        StreamTiming {
+            flush_interval: Duration::from_millis(10),
+            typing_interval: Duration::from_millis(20),
+            retry: Duration::from_secs(5),
+        },
+    )
+    .await
+    .expect("streaming turn");
+
+    // The finalized message leads with the context-usage footer.
+    let final_text = tg
+        .edits()
+        .last()
+        .map(|e| e.text.clone())
+        .or_else(|| tg.sent_messages().last().map(|m| m.text.clone()))
+        .expect("some message was written");
+    assert_eq!(final_text, "🧠 50%\nHello", "footer shows context %, no ✓");
+}
+
+#[tokio::test]
 async fn leading_whitespace_delta_does_not_trigger_empty_send() {
     // Regression: a model whose first streamed token is whitespace briefly makes
     // the live buffer whitespace-only, which Telegram rejects ("text must be
@@ -222,6 +281,7 @@ async fn leading_whitespace_delta_does_not_trigger_empty_send() {
         model,
         text_parts("hi"),
         Verbosity::Normal,
+        None,
         StreamTiming {
             flush_interval: Duration::from_millis(10),
             typing_interval: Duration::from_millis(20),
@@ -274,6 +334,7 @@ async fn streaming_turn_with_no_stream_still_posts_final_reply() {
         model,
         text_parts("ping"),
         Verbosity::Normal,
+        None,
         StreamTiming {
             flush_interval: Duration::from_millis(10),
             typing_interval: Duration::from_millis(20),
@@ -337,6 +398,7 @@ async fn permission_asked_posts_approval_buttons() {
         model,
         text_parts("commit please"),
         Verbosity::Normal,
+        None,
         StreamTiming {
             flush_interval: Duration::from_millis(10),
             typing_interval: Duration::from_millis(20),

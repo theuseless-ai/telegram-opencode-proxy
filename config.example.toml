@@ -45,6 +45,11 @@ workdir = "/home/you/work/wife"
 [model]
 provider_id = "llm-lan"
 model_id = "Qwen3.6-35B-A3B-bf16"
+# Context-window size (tokens), used to show a context-usage % in the reply
+# footer (#72), e.g. `🧠 42%`. opencode reports no limit for locally hosted /
+# non-models.dev models, so set it here to get a percentage; when omitted the
+# footer falls back to a raw token count (e.g. `🧠 12.3k ctx`).
+# context_window = 32768
 
 # Bash patterns gated per session. Held at `deny` until the permission relay
 # (#13) exists to answer prompts, then flipped to `ask`.

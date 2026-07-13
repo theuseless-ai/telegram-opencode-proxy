@@ -312,9 +312,42 @@ pub(crate) async fn bring_up_slot(
     client::validate_model(&providers, &model.provider_id, &model.model_id)
         .with_context(|| format!("validating model for slot '{}'", slot.name))?;
 
-    tracing::info!(slot = %slot.name, "connected — provider/model validated");
+    // Resolve the context-window size for the usage footer (#72): the proxy
+    // `[model].context_window` override wins, else opencode's own catalogue
+    // (`/config/providers`, then the fuller `/provider`). `None` → the footer
+    // shows a raw token count instead of a %.
+    let context_limit = resolve_context_limit(&client, &providers, model).await;
+
+    tracing::info!(
+        slot = %slot.name,
+        context_limit,
+        "connected — provider/model validated"
+    );
     Ok(SlotConn {
         slot: slot.clone(),
         client,
+        context_limit,
     })
+}
+
+/// Resolve the active model's context-window size (#72), preferring the proxy
+/// config override, then opencode's `/config/providers`, then `/provider`.
+async fn resolve_context_limit(
+    client: &OpencodeClient,
+    providers: &crate::opencode::types::ProvidersResponse,
+    model: &Model,
+) -> Option<u64> {
+    if let Some(window) = model.context_window {
+        return Some(window);
+    }
+    if let Some(limit) = providers.context_limit(&model.provider_id, &model.model_id) {
+        return Some(limit);
+    }
+    match client.provider_catalogue().await {
+        Ok(catalogue) => catalogue.context_limit(&model.provider_id, &model.model_id),
+        Err(err) => {
+            tracing::debug!(error = %err, "GET /provider for context limit failed");
+            None
+        }
+    }
 }

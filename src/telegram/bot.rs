@@ -298,6 +298,13 @@ impl AppState {
         guard.get(name).map(|c| c.client.clone())
     }
 
+    /// The resolved context-window size for slot `name` (#72), or `None` when the
+    /// slot is unknown or no limit could be resolved.
+    pub(crate) fn context_limit_for(&self, name: &str) -> Option<u64> {
+        let guard = self.registry.read().unwrap_or_else(PoisonError::into_inner);
+        guard.get(name).and_then(|c| c.context_limit)
+    }
+
     /// The three-way idempotent `connect` behaviour (#39). All opencode
     /// round-trips happen outside the registry lock; the lock is only taken to
     /// snapshot the current slot and to swap the rebuilt client in.
@@ -1285,6 +1292,7 @@ async fn run_turn(
         PromptModel::from(&state.cfg.model),
         parts,
         verbosity,
+        state.context_limit_for(&slot.name),
         stream::StreamTiming::default(),
     )
     .await

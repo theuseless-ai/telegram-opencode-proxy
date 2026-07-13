@@ -240,6 +240,12 @@ pub struct Slot {
 pub struct Model {
     pub provider_id: String,
     pub model_id: String,
+    /// Context-window size (tokens) used to render the context-usage % in the
+    /// completion footer (#72). opencode does not report a limit for locally
+    /// hosted / non-models.dev models, so set it here to get a percentage;
+    /// when unset the footer falls back to a raw token count.
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 /// Session permission rules.

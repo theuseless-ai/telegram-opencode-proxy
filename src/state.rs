@@ -27,4 +27,8 @@ pub struct SlotConn {
     pub slot: Slot,
     /// A ready client bound to `slot.opencode_url`.
     pub client: OpencodeClient,
+    /// The active model's context-window size (tokens), resolved once at connect
+    /// from opencode's provider catalogue (or the `[model].context_window`
+    /// override). Drives the context-usage % footer (#72); `None` when unknown.
+    pub context_limit: Option<u64>,
 }

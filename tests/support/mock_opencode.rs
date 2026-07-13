@@ -84,6 +84,9 @@ struct OcState {
     file_part_mimes: Arc<Mutex<Vec<String>>>,
     /// `(permission_id, reply)` from `POST /permission/:id/reply` (the relay, #13).
     permission_replies: Arc<Mutex<Vec<(String, String)>>>,
+    /// Context-token count reported on the assistant reply's `info.tokens` (#72);
+    /// `0` → omit `tokens` entirely (a provider that reports no usage).
+    reply_tokens: Arc<AtomicU64>,
 }
 
 /// A running in-process mock opencode instance. Dropping it leaves the spawned
@@ -100,6 +103,7 @@ pub struct MockOpencode {
     aborts: Arc<Mutex<Vec<String>>>,
     file_part_mimes: Arc<Mutex<Vec<String>>>,
     permission_replies: Arc<Mutex<Vec<(String, String)>>>,
+    reply_tokens: Arc<AtomicU64>,
 }
 
 impl MockOpencode {
@@ -127,6 +131,13 @@ impl MockOpencode {
     /// string to exercise chunking). When unset, the mock echoes the prompt.
     pub fn set_reply(&self, text: impl Into<String>) {
         *self.reply.lock().expect("mock_opencode reply lock") = Some(text.into());
+    }
+
+    /// Report `n` context tokens on the assistant reply's `info.tokens` (#72), so
+    /// a test can exercise the context-usage footer. `0` omits `tokens`.
+    #[allow(dead_code)] // only the streaming test crate uses this.
+    pub fn set_reply_tokens(&self, n: u64) {
+        self.reply_tokens.store(n, Ordering::SeqCst);
     }
 
     /// Pin the SSE body served by `GET /global/event`. Each connection replays
@@ -211,9 +222,11 @@ impl MockOpencode {
         let file_part_mimes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let permission_replies: Arc<Mutex<Vec<(String, String)>>> =
             Arc::new(Mutex::new(Vec::new()));
+        let reply_tokens = Arc::new(AtomicU64::new(0));
         let state = OcState {
             include_model,
             reply: Arc::clone(&reply),
+            reply_tokens: Arc::clone(&reply_tokens),
             sessions: Arc::new(Mutex::new(HashSet::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             config_fails: Arc::new(AtomicU64::new(config_fails)),
@@ -260,6 +273,7 @@ impl MockOpencode {
             aborts,
             file_part_mimes,
             permission_replies,
+            reply_tokens,
         }
     }
 }
@@ -394,8 +408,19 @@ async fn message(
         .clone()
         .unwrap_or_else(|| format!("echo: {prompt}"));
 
+    let mut info = json!({
+        "id": "msg_mock", "sessionID": id, "role": "assistant", "finish": "stop"
+    });
+    // Report token usage on the assistant reply when a test asked for it (#72).
+    let tokens = st.reply_tokens.load(Ordering::SeqCst);
+    if tokens > 0 {
+        info["tokens"] = json!({
+            "input": tokens, "output": 0, "reasoning": 0,
+            "cache": { "read": 0, "write": 0 }
+        });
+    }
     Json(json!({
-        "info": { "id": "msg_mock", "sessionID": id, "role": "assistant", "finish": "stop" },
+        "info": info,
         "parts": [{ "type": "text", "text": reply }]
     }))
 }

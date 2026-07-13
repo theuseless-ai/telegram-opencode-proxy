@@ -60,6 +60,7 @@ fn config_for(opencode_url: &str) -> Config {
         model: Model {
             provider_id: "llm-lan".to_string(),
             model_id: "Qwen3.6-35B-A3B-bf16".to_string(),
+            context_window: None,
         },
         permissions: Permissions { ask: Vec::new() },
         pairing: Pairing::default(),
@@ -779,6 +780,7 @@ async fn unreachable_opencode_gets_a_clear_message() {
         SlotConn {
             slot: cfg.slots[0].clone(),
             client,
+            context_limit: None,
         },
     );
     let db = Db::open_in_memory().expect("db");
