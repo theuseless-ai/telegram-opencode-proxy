@@ -43,11 +43,14 @@ use axum::routing::any;
 use axum::{Router, body::Bytes};
 use serde_json::{Value, json};
 
-/// A `sendMessage` call the mock recorded.
+/// A `sendMessage` call the mock recorded. `parse_mode` captures the formatting
+/// mode (e.g. `"MarkdownV2"`, #70) or `None` when the send was plain text.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct SentMessage {
     pub chat_id: i64,
     pub text: String,
+    pub parse_mode: Option<String>,
 }
 
 /// An `editMessageText` call the mock recorded (the live streaming edits, #8).
@@ -59,6 +62,7 @@ pub struct EditMessage {
     pub chat_id: i64,
     pub message_id: i64,
     pub text: String,
+    pub parse_mode: Option<String>,
 }
 
 /// A `sendDocument`/`sendPhoto` file upload the mock recorded (outbound files,
@@ -311,6 +315,7 @@ async fn handler(
         "SendMessage" => {
             let chat_id = req["chat_id"].as_i64().unwrap_or_default();
             let text = req["text"].as_str().unwrap_or_default().to_string();
+            let parse_mode = req["parse_mode"].as_str().map(str::to_string);
             if req.get("reply_markup").is_some() {
                 st.markups.fetch_add(1, Ordering::SeqCst);
             }
@@ -320,6 +325,7 @@ async fn handler(
                 .push(SentMessage {
                     chat_id,
                     text: text.clone(),
+                    parse_mode,
                 });
             let mid = st.next_msg_id.fetch_add(1, Ordering::SeqCst);
             json!({
@@ -334,6 +340,7 @@ async fn handler(
             let chat_id = req["chat_id"].as_i64().unwrap_or_default();
             let message_id = req["message_id"].as_i64().unwrap_or_default();
             let text = req["text"].as_str().unwrap_or_default().to_string();
+            let parse_mode = req["parse_mode"].as_str().map(str::to_string);
             st.edits
                 .lock()
                 .expect("mock_telegram edits lock")
@@ -341,6 +348,7 @@ async fn handler(
                     chat_id,
                     message_id,
                     text: text.clone(),
+                    parse_mode,
                 });
             json!({
                 "message_id": message_id,
