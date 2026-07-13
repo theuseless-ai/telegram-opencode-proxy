@@ -237,7 +237,7 @@ async fn finalize_footer_shows_context_usage_percent() {
         .map(|e| e.text.clone())
         .or_else(|| tg.sent_messages().last().map(|m| m.text.clone()))
         .expect("some message was written");
-    assert_eq!(final_text, "✓ 🧠 50%\nHello", "footer shows context %");
+    assert_eq!(final_text, "🧠 50%\nHello", "footer shows context %, no ✓");
 }
 
 #[tokio::test]

@@ -186,32 +186,36 @@ impl LiveState {
     /// (no tool ran and no context usage is known). Shown above the answer on
     /// finalize (§13); zero categories are dropped, e.g.
     /// `✓ 3 tools · edited 1 file · 🧠 42%`.
+    ///
+    /// The `✓` marks the **tool** completion summary; a context-only footer (a
+    /// plain text answer with no tools) carries no `✓`, just `🧠 42%`.
     fn summary_footer(&self) -> Option<String> {
         if matches!(self.verbosity, Verbosity::Quiet) {
             return None;
         }
-        let mut parts = Vec::new();
+        let mut segments = Vec::new();
         if self.tools > 0 {
-            parts.push(plural(self.tools, "tool", "tools"));
+            let mut tools = vec![plural(self.tools, "tool", "tools")];
             if self.subagents > 0 {
-                parts.push(plural(self.subagents, "subagent", "subagents"));
+                tools.push(plural(self.subagents, "subagent", "subagents"));
             }
             if self.files_edited > 0 {
-                parts.push(format!(
+                tools.push(format!(
                     "edited {}",
                     plural(self.files_edited, "file", "files")
                 ));
             }
+            segments.push(format!("✓ {}", tools.join(" · ")));
         }
         // Context usage shows on every turn it is known — including a plain text
         // answer with no tools — so the user can watch it climb toward compaction.
         if let Some(segment) = self.context_segment() {
-            parts.push(segment);
+            segments.push(segment);
         }
-        if parts.is_empty() {
+        if segments.is_empty() {
             return None;
         }
-        Some(format!("✓ {}", parts.join(" · ")))
+        Some(segments.join(" · "))
     }
 
     /// The context-usage footer segment (#72): `🧠 42%` when the context-window
@@ -531,11 +535,12 @@ mod tests {
     }
 
     #[test]
-    fn context_shows_on_a_tool_free_turn() {
-        // No tool ran, but context usage still surfaces (unlike the old gate).
+    fn context_shows_on_a_tool_free_turn_without_a_checkmark() {
+        // No tool ran, but context usage still surfaces (unlike the old gate) —
+        // and with no `✓`, which marks the tool summary only (#72 feedback).
         let mut s = LiveState::new(Verbosity::Normal).with_context_limit(Some(200_000));
         s.set_context_used(50_000);
-        assert_eq!(s.finalize("just text"), "✓ 🧠 25%\njust text");
+        assert_eq!(s.finalize("just text"), "🧠 25%\njust text");
     }
 
     #[test]
@@ -543,7 +548,7 @@ mod tests {
         // No context-window configured → a human token count, not a %.
         let mut s = LiveState::new(Verbosity::Normal);
         s.set_context_used(12_345);
-        assert_eq!(s.finalize("answer"), "✓ 🧠 12.3k ctx\nanswer");
+        assert_eq!(s.finalize("answer"), "🧠 12.3k ctx\nanswer");
     }
 
     #[test]
