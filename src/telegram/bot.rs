@@ -1013,22 +1013,47 @@ async fn handle_media_announce(
         }
     };
 
-    // Imperative, self-describing announce — the model downloads the file with a
-    // one-shot URL and reads it with its own tools (format-agnostic; PDF/image/…).
+    // Imperative, self-describing announce — the model downloads the file INTO ITS
+    // WORKSPACE with a one-shot URL, then opens it with its own tools (format-
+    // agnostic; PDF/image/…). The wording deliberately frames it as "download a
+    // file, then open it" and counters the model's reflexive "I can't view images"
+    // refusal — opencode's read tool renders images and extracts document text from
+    // a file on disk, so the model must open the file rather than assume it can't.
     let url = state.cfg.mcp.download_url(&id);
-    let mut parts = vec![PartInput::Text {
+    // Land inbound files in a `downloads/` folder so the workspace stays tidy; the
+    // model creates it if missing (`mkdir -p`).
+    let path = format!("downloads/{filename}");
+    // The verb matters: models reliably act on "view the image" for pictures and
+    // "extract the text" for documents, but reflexively refuse "read this PDF" (a
+    // text+image model genuinely can't ingest a PDF; extracting its text is the
+    // path that works). So step 2 is tailored to the file type — still one download.
+    let read_step = if mime.starts_with("image/") {
+        format!(
+            "2. Open and VIEW the image `{path}` with your file-reading tool — it displays images from disk, so this is how you see the photo."
+        )
+    } else {
+        format!(
+            "2. Open `{path}` and EXTRACT ITS TEXT with your file-reading tool — it extracts the text of PDFs and documents from disk. You do NOT need native PDF support: extracting the text IS how you read the file."
+        )
+    };
+    // Fold any caption INTO the instruction as the question to answer, so it can't
+    // compete with the file-handling steps as a separate message (a caption like
+    // "what's in this pdf?" otherwise triggers the model's refusal reflex).
+    let answer_step = match msg.caption().map(str::trim).filter(|c| !c.is_empty()) {
+        Some(caption) => {
+            format!("3. Then answer the user's question using the file. They asked: \"{caption}\".")
+        }
+        None => "3. Then tell the user what the file contains.".to_string(),
+    };
+    let parts = vec![PartInput::Text {
         text: format!(
-            "The user sent a file `{filename}`. Download and read it now: run `curl -sf '{url}' -o '{filename}'` then read the file `{filename}`. (The link works once.)"
+            "The user has sent you a file named `{filename}`. You MUST do ALL of these steps, in order, before replying:\n\
+             1. Download it into a `downloads` folder in your workspace (create the folder if it doesn't exist): run `mkdir -p downloads && curl -sf '{url}' -o '{path}'` (this link works only once).\n\
+             {read_step}\n\
+             {answer_step}\n\
+             Do NOT stop after downloading and do NOT refuse — for a PDF or document EXTRACT ITS TEXT, for an image VIEW it, then reply."
         ),
     }];
-    // A caption rides along as its own text part.
-    if let Some(caption) = msg.caption()
-        && !caption.trim().is_empty()
-    {
-        parts.push(PartInput::Text {
-            text: caption.to_string(),
-        });
-    }
     enqueue_parts(&bot, &msg, &state, chat_id, slot, parts).await
 }
 
