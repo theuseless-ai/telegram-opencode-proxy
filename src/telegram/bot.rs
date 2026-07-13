@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use teloxide::prelude::*;
-use teloxide::types::{CallbackQuery, ChatId};
+use teloxide::types::{BotCommandScope, CallbackQuery, ChatId};
 use teloxide::utils::command::BotCommands;
 use tokio::sync::mpsc;
 use tracing::Instrument;
@@ -602,13 +602,26 @@ fn is_opencode_unreachable(err: &anyhow::Error) -> bool {
 /// flushes the store ([`AppState::shutdown`], #21). `bot` and `state` are
 /// injected as handler dependencies.
 pub async fn run(bot: Bot, state: Arc<AppState>) {
-    // Advertise exactly the bot's own commands (`/whoami`, `/stop`). This
-    // replaces any stale menu previously registered via @BotFather, keeping
-    // Telegram's "/" command list in sync with the code. Best-effort — a failure
-    // here must not stop the dispatcher.
-    if let Err(err) = bot.set_my_commands(Command::bot_commands()).await {
-        tracing::warn!(error = %err, "could not set the bot command menu");
+    // Advertise the bot's own commands so Telegram's "/" menu stays in sync with
+    // the code. We register at BOTH the default scope and `AllPrivateChats` (the
+    // bot is only ever used in private chats). This matters (#76): Telegram
+    // resolves a chat's menu by precedence chat-specific > all_private_chats >
+    // default, so a stale list left at the more-specific `all_private_chats`
+    // scope (e.g. a past @BotFather "Edit Commands") would SHADOW a default-scope
+    // registration — the observed "only /whoami shows, though every command
+    // works". Writing `all_private_chats` overwrites that stale entry.
+    // Best-effort — a failure here must not stop the dispatcher.
+    let commands = Command::bot_commands();
+    for scope in [BotCommandScope::Default, BotCommandScope::AllPrivateChats] {
+        if let Err(err) = bot
+            .set_my_commands(commands.clone())
+            .scope(scope.clone())
+            .await
+        {
+            tracing::warn!(error = %err, ?scope, "could not set the bot command menu");
+        }
     }
+    tracing::info!(count = commands.len(), "advertised bot commands to Telegram");
 
     let handler = dptree::entry()
         .branch(
@@ -1313,6 +1326,24 @@ async fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_command_is_advertised() {
+        // The "/" menu must list every user-facing command (#76). A `Command`
+        // variant added without a `///` description is silently dropped by
+        // `bot_commands()` — this guards against that regression.
+        let names: Vec<String> = Command::bot_commands()
+            .iter()
+            .map(|c| c.command.clone())
+            .collect();
+        for expected in ["/whoami", "/stop", "/new", "/quiet", "/verbose", "/get"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "command {expected} missing from the advertised menu: {names:?}"
+            );
+        }
+        assert_eq!(names.len(), 6, "unexpected command set: {names:?}");
+    }
 
     #[tokio::test]
     async fn connection_refused_classifies_as_opencode_unreachable() {
