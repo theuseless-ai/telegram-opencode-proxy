@@ -153,14 +153,28 @@ async fn streaming_turn_live_edits_typing_and_finalizes() {
         "another session's delta must not be rendered: {texts:?}"
     );
 
-    // The final visible message is the authoritative reply.
-    let final_text = tg
+    // The final visible message is the authoritative reply, rendered to
+    // MarkdownV2 — the `!` is a reserved char and must arrive backslash-escaped
+    // (#70), sent with `parse_mode=MarkdownV2`.
+    let final_msg = tg
         .edits()
         .last()
-        .map(|e| e.text.clone())
-        .or_else(|| tg.sent_messages().last().map(|m| m.text.clone()))
+        .map(|e| (e.text.clone(), e.parse_mode.clone()))
+        .or_else(|| {
+            tg.sent_messages()
+                .last()
+                .map(|m| (m.text.clone(), m.parse_mode.clone()))
+        })
         .expect("some message was written");
-    assert_eq!(final_text, "Hello world!");
+    assert_eq!(
+        final_msg.0, "Hello world\\!",
+        "reply rendered to MarkdownV2"
+    );
+    assert_eq!(
+        final_msg.1.as_deref(),
+        Some("MarkdownV2"),
+        "the formatted send must carry parse_mode=MarkdownV2"
+    );
 
     // Everything went to the right chat.
     assert!(tg.sent_messages().iter().all(|m| m.chat_id == CHAT_ID));

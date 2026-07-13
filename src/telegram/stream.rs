@@ -13,8 +13,9 @@
 //! - reasoning deltas are **not** streamed into the answer (they only keep the
 //!   `typing` action alive, §13);
 //! - when the blocking prompt returns, the message is finalized to the
-//!   authoritative assistant text, chunked with [`split_message`] if it exceeds
-//!   [`TELEGRAM_LIMIT`], with tool failures always appended.
+//!   authoritative assistant text, rendered to Telegram MarkdownV2 and chunked
+//!   with [`markdown::to_chunks`] if it exceeds [`TELEGRAM_LIMIT`] (#70), with
+//!   tool failures always appended.
 //!
 //! The message is created lazily on the first flush that has something to show,
 //! so a fast turn with no intermediate output just posts the final answer.
@@ -23,16 +24,17 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use teloxide::RequestError;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, ChatId, Message, MessageId};
+use teloxide::types::{ChatAction, ChatId, Message, MessageId, ParseMode};
+use teloxide::{ApiError, RequestError};
 
 use crate::opencode::client::OpencodeClient;
 use crate::opencode::events::{Event, PartKind, Subscription};
 use crate::opencode::types::{PartInput, PromptModel};
 use crate::permission;
 use crate::persistence::Db;
-use crate::telegram::render::{LiveState, TELEGRAM_LIMIT, Verbosity, split_message};
+use crate::telegram::markdown::{self, Chunk};
+use crate::telegram::render::{LiveState, TELEGRAM_LIMIT, Verbosity};
 use crate::telegram::retry;
 
 /// Timing knobs for [`run_streaming_turn`], injectable so tests can run fast.
@@ -167,8 +169,52 @@ impl<'a> LiveSink<'a> {
         }
     }
 
-    /// `sendMessage`, retrying flood/transient failures (#25).
-    async fn send(&self, text: &str) -> Result<Message, RequestError> {
+    /// `sendMessage` for a rendered [`Chunk`]: try the MarkdownV2 body, and on a
+    /// Telegram parse rejection resend the raw-Markdown fallback as plain text so
+    /// a message is never lost to a formatting slip (#70). Both paths retry
+    /// flood/transient failures (#25).
+    async fn send(&self, chunk: &Chunk) -> Result<Message, RequestError> {
+        match self.send_formatted(&chunk.formatted).await {
+            Err(err) if is_parse_error(&err) => {
+                tracing::debug!("markdownv2 rejected by telegram; sending plain text");
+                self.send_plain(&chunk.plain).await
+            }
+            other => other,
+        }
+    }
+
+    /// `editMessageText` for a rendered [`Chunk`], with the same MarkdownV2 →
+    /// plain-text fallback as [`send`](Self::send).
+    async fn edit(&self, id: MessageId, chunk: &Chunk) -> Result<Message, RequestError> {
+        match self.edit_formatted(id, &chunk.formatted).await {
+            Err(err) if is_parse_error(&err) => {
+                tracing::debug!("markdownv2 rejected by telegram; editing to plain text");
+                self.edit_plain(id, &chunk.plain).await
+            }
+            other => other,
+        }
+    }
+
+    /// `sendMessage` with `parse_mode=MarkdownV2`, retrying flood/transient
+    /// failures (#25).
+    async fn send_formatted(&self, text: &str) -> Result<Message, RequestError> {
+        let bot = self.bot.clone();
+        let chat = self.chat;
+        let text = text.to_string();
+        retry::with_retry("send_message", move || {
+            let bot = bot.clone();
+            let text = text.clone();
+            async move {
+                bot.send_message(chat, text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await
+            }
+        })
+        .await
+    }
+
+    /// `sendMessage` with no parse mode — the plain-text fallback / system notes.
+    async fn send_plain(&self, text: &str) -> Result<Message, RequestError> {
         let bot = self.bot.clone();
         let chat = self.chat;
         let text = text.to_string();
@@ -180,8 +226,25 @@ impl<'a> LiveSink<'a> {
         .await
     }
 
-    /// `editMessageText`, retrying flood/transient failures (#25).
-    async fn edit(&self, id: MessageId, text: &str) -> Result<Message, RequestError> {
+    /// `editMessageText` with `parse_mode=MarkdownV2`, retrying (#25).
+    async fn edit_formatted(&self, id: MessageId, text: &str) -> Result<Message, RequestError> {
+        let bot = self.bot.clone();
+        let chat = self.chat;
+        let text = text.to_string();
+        retry::with_retry("edit_message_text", move || {
+            let bot = bot.clone();
+            let text = text.clone();
+            async move {
+                bot.edit_message_text(chat, id, text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await
+            }
+        })
+        .await
+    }
+
+    /// `editMessageText` with no parse mode — the plain-text fallback / notes.
+    async fn edit_plain(&self, id: MessageId, text: &str) -> Result<Message, RequestError> {
         let bot = self.bot.clone();
         let chat = self.chat;
         let text = text.to_string();
@@ -217,25 +280,32 @@ impl<'a> LiveSink<'a> {
             return;
         }
         // While streaming, only the first chunk is live-edited; the rest is sent
-        // on finalize. This keeps every edit within the per-message limit.
+        // on finalize. Rendering to MarkdownV2 (#70) here keeps every edit both
+        // within the per-message limit and valid for the current partial text.
         let content = state.render();
-        let chunk = first_chunk(&content);
+        let Some(chunk) = markdown::to_chunks(&content, TELEGRAM_LIMIT)
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
         // Telegram rejects a whitespace-only body ("text must be non-empty"), so
         // hold off until there is a visible character — e.g. a leading-whitespace
-        // first token shouldn't create the message yet.
-        if chunk.trim().is_empty() || chunk == self.last_sent {
+        // first token shouldn't create the message yet. Dedup on the rendered
+        // form so an unchanged view is never re-sent.
+        if chunk.plain.trim().is_empty() || chunk.formatted == self.last_sent {
             return;
         }
         match self.message_id {
             None => match self.send(&chunk).await {
                 Ok(msg) => {
                     self.message_id = Some(msg.id);
-                    self.last_sent = chunk;
+                    self.last_sent = chunk.formatted;
                 }
                 Err(err) => tracing::warn!(error = %err, "creating live message failed"),
             },
             Some(id) => match self.edit(id, &chunk).await {
-                Ok(_) => self.last_sent = chunk,
+                Ok(_) => self.last_sent = chunk.formatted,
                 Err(err) => tracing::debug!(error = %err, "live edit failed (will finalize)"),
             },
         }
@@ -251,7 +321,7 @@ impl<'a> LiveSink<'a> {
         let chunks = if final_text.trim().is_empty() {
             Vec::new()
         } else {
-            split_message(&final_text, TELEGRAM_LIMIT)
+            markdown::to_chunks(&final_text, TELEGRAM_LIMIT)
         };
 
         let Some((first, rest)) = chunks.split_first() else {
@@ -261,17 +331,19 @@ impl<'a> LiveSink<'a> {
                         reasoned or used a tool). Try rephrasing, or /new to reset.";
             match self.message_id {
                 Some(id) => {
-                    let _ = self.edit(id, note).await;
+                    let _ = self.edit_plain(id, note).await;
                 }
                 None => {
-                    self.send(note).await.context("sending empty-reply note")?;
+                    self.send_plain(note)
+                        .await
+                        .context("sending empty-reply note")?;
                 }
             }
             return Ok(());
         };
 
         match self.message_id {
-            Some(id) if *first != self.last_sent => {
+            Some(id) if first.formatted != self.last_sent => {
                 self.edit(id, first)
                     .await
                     .context("finalizing live message")?;
@@ -288,10 +360,44 @@ impl<'a> LiveSink<'a> {
     }
 }
 
-/// The first Telegram-sized chunk of `content` (empty string if none).
-fn first_chunk(content: &str) -> String {
-    split_message(content, TELEGRAM_LIMIT)
-        .into_iter()
-        .next()
-        .unwrap_or_default()
+/// Whether a Telegram error is a MarkdownV2 parse rejection — the signal to fall
+/// back to a plain-text send/edit (#70). Telegram reports this as
+/// `Bad Request: can't parse entities: …`.
+fn is_parse_error(err: &RequestError) -> bool {
+    match err {
+        RequestError::Api(ApiError::CantParseEntities(_)) => true,
+        RequestError::Api(ApiError::Unknown(msg)) => {
+            msg.to_ascii_lowercase().contains("can't parse entities")
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_parse_error;
+    use teloxide::{ApiError, RequestError};
+
+    #[test]
+    fn parse_error_matches_the_typed_variant() {
+        let err = RequestError::Api(ApiError::CantParseEntities("byte offset 12".into()));
+        assert!(is_parse_error(&err));
+    }
+
+    #[test]
+    fn parse_error_matches_an_unknown_cant_parse_message() {
+        // Telegram sometimes surfaces this as a generic Unknown error string.
+        let err = RequestError::Api(ApiError::Unknown(
+            "Bad Request: can't parse entities: unexpected end of input".into(),
+        ));
+        assert!(is_parse_error(&err));
+    }
+
+    #[test]
+    fn unrelated_api_errors_do_not_trigger_the_fallback() {
+        // A "not modified" edit must NOT be treated as a parse failure.
+        assert!(!is_parse_error(&RequestError::Api(
+            ApiError::MessageNotModified
+        )));
+    }
 }

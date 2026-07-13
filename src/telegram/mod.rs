@@ -3,6 +3,7 @@
 
 pub mod bot;
 pub mod files;
+pub mod markdown;
 pub mod render;
 pub mod retry;
 pub mod stream;

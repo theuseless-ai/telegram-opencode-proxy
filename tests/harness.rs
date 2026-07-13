@@ -14,7 +14,7 @@
 //! Direct-handler invocation (rather than spinning the long-poll dispatcher) is
 //! deterministic — no polling races — while still exercising the whole turn:
 //! auth gate → `session::get_or_create` (→ mock opencode) → blocking `prompt`
-//! (→ mock opencode) → `render::split_message` → `bot.send_message` (→ mock
+//! (→ mock opencode) → `markdown::to_chunks` → `bot.send_message` (→ mock
 //! telegram).
 
 mod support;
