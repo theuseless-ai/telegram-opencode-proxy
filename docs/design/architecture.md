@@ -357,7 +357,10 @@ Qwen models) is registered as a **custom OpenAI-compatible provider** in
         "apiKey": "{env:LLM_LAN_KEY}"         // use an env var — never hard-code the key
       },
       "models": {
-        "Qwen3.6-35B-A3B-bf16": {}            // ← this key IS the modelID
+        "Qwen3.6-35B-A3B-bf16": {             // ← this key IS the modelID
+          "attachment": true,                 // accept file/image attachments
+          "modalities": { "input": ["text", "image"], "output": ["text"] }
+        }
       }
     }
   }
@@ -372,6 +375,13 @@ Qwen models) is registered as a **custom OpenAI-compatible provider** in
 - **`options.apiKey`** — optional for local servers; supports `{env:VAR}`.
 - **Models must be hand-listed** — there is no `/v1/models` auto-discovery yet
   (upstream issue #6231). Each `modelID` you want must appear under `models`.
+- **Declare `attachment` + `modalities` for image/file input** — an **empty `{}`
+  model object makes opencode 400 on image input**, even for a vision-capable
+  model. Set `"attachment": true` and list `"image"` in `modalities.input` for any
+  model you'll send photos/PDFs to. (Validated live: Qwen3.6 reads images once
+  configured — the earlier "text-only, can't see images" symptom was this config
+  omission, **not** a model limit. Image support is per-model opencode config, so
+  the proxy's disk/download file paths carry images for *any* configured model.)
 - **`providerID` = the `provider` object key; `modelID` = the `models` object key.**
   Both are free-form strings you choose. The proxy's `[model]` (§11) must match
   them exactly.
