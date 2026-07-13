@@ -98,6 +98,11 @@ pub enum PartKind {
         name: String,
         call_id: String,
         status: ToolStatus,
+        /// `state.title` — opencode's own human-readable summary of the call
+        /// (e.g. the command for `bash`, the sub-agent for `task`), when present.
+        /// Drives the Verbose arg line and the sub-agent tag (#14); `None` on the
+        /// pending state or when opencode omits it.
+        title: Option<String>,
     },
     /// Any other part `type` we don't special-case; carries the raw wire value.
     Other(String),
@@ -229,6 +234,8 @@ fn parse_part_update(props: serde_json::Value) -> Result<PartUpdate, serde_json:
     struct ToolStateWire {
         #[serde(default)]
         status: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
     }
 
     let p: Props = serde_json::from_value(props)?;
@@ -237,15 +244,23 @@ fn parse_part_update(props: serde_json::Value) -> Result<PartUpdate, serde_json:
         "step-start" => PartKind::StepStart,
         "reasoning" => PartKind::Reasoning,
         "text" => PartKind::Text,
-        "tool" => PartKind::Tool {
-            name: part.tool.unwrap_or_default(),
-            call_id: part.call_id.unwrap_or_default(),
-            status: part
-                .state
-                .and_then(|s| s.status)
-                .map(|s| ToolStatus::from_wire(&s))
-                .unwrap_or(ToolStatus::Pending),
-        },
+        "tool" => {
+            let (status, title) = match part.state {
+                Some(s) => (
+                    s.status
+                        .map(|s| ToolStatus::from_wire(&s))
+                        .unwrap_or(ToolStatus::Pending),
+                    s.title,
+                ),
+                None => (ToolStatus::Pending, None),
+            };
+            PartKind::Tool {
+                name: part.tool.unwrap_or_default(),
+                call_id: part.call_id.unwrap_or_default(),
+                status,
+                title,
+            }
+        }
         other => PartKind::Other(other.to_string()),
     };
     Ok(PartUpdate {
