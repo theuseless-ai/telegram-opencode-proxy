@@ -36,6 +36,12 @@ use state::SlotConn;
 /// systemd's default `TimeoutStopSec` (90s).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
+/// How often the MCP file-store TTL sweep runs (#65). Inbound files stay
+/// fetchable for `[mcp].ttl_secs` (default 300s); a fixed 60s sweep reclaims
+/// expired temp files promptly without busy-looping — the sweep interval is the
+/// only slack on top of a file's deadline.
+const MCP_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Bring up the daemon: for each slot, connect to its (externally-managed)
 /// opencode instance, wait until it's reachable, validate the configured
 /// provider/model against its live catalogue, build a client — then run the
@@ -97,6 +103,48 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     });
 
+    // The MCP file-transfer server (#65) is, like the admin socket, a SECONDARY
+    // feature: one stateless `/mcp` HTTP endpoint serving every slot, plus the
+    // file-store's TTL sweep. Both are held for the process lifetime and torn
+    // down on shutdown. A bind failure only logs and is tolerated — it must
+    // never take down the dispatcher. Held in `Option`s so shutdown is a no-op
+    // when the feature is disabled or the port could not be bound.
+    let mcp_ct = tokio_util::sync::CancellationToken::new();
+    let mut mcp_server: Option<tokio::task::JoinHandle<()>> = None;
+    let mut mcp_sweep: Option<tokio::task::JoinHandle<()>> = None;
+    if state.cfg.mcp.enabled {
+        // Reclaim expired inbound files regardless of whether the listener binds
+        // (the media path may still populate the store when MCP is enabled), so
+        // the store can never grow unbounded. Held like `_outbox_watchers`.
+        mcp_sweep = Some(mcp::store::FileStore::spawn_ttl_sweep(
+            state.file_store.clone(),
+            MCP_SWEEP_INTERVAL,
+        ));
+
+        let router = mcp::build_router(state.clone(), mcp_ct.clone());
+        let bind = (state.cfg.mcp.bind, state.cfg.mcp.port);
+        match tokio::net::TcpListener::bind(bind).await {
+            Ok(listener) => {
+                tracing::info!(
+                    host = %state.cfg.mcp.bind,
+                    port = state.cfg.mcp.port,
+                    "MCP file-transfer server listening (single stateless /mcp for all slots)"
+                );
+                mcp_server = Some(tokio::spawn(async move {
+                    if let Err(err) = axum::serve(listener, router).await {
+                        tracing::error!(error = %err, "MCP file-transfer server terminated unexpectedly");
+                    }
+                }));
+            }
+            Err(err) => tracing::warn!(
+                error = %err,
+                host = %state.cfg.mcp.bind,
+                port = state.cfg.mcp.port,
+                "could not bind MCP file-transfer server — continuing without it"
+            ),
+        }
+    }
+
     tracing::info!("starting Telegram long-poll dispatcher (Ctrl-C / SIGTERM to stop)");
     telegram::bot::run(bot, state.clone()).await;
     tracing::info!("dispatcher stopped — shutting down gracefully");
@@ -113,6 +161,21 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
         Err(err) => {
             tracing::warn!(error = %err, socket = %admin_socket.display(), "failed to remove admin socket on shutdown");
         }
+    }
+
+    // Stop the MCP file-transfer server + TTL sweep (#65), alongside the admin
+    // task above. Cancelling the token drains the stateless `/mcp` service; then
+    // abort and await the tasks so they unwind before the process exits.
+    mcp_ct.cancel();
+    if let Some(server) = mcp_server {
+        server.abort();
+        let _ = server.await;
+        tracing::debug!("MCP file-transfer server stopped");
+    }
+    if let Some(sweep) = mcp_sweep {
+        sweep.abort();
+        let _ = sweep.await;
+        tracing::debug!("MCP file-store TTL sweep stopped");
     }
 
     tracing::info!("shutdown complete");

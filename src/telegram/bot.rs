@@ -952,9 +952,18 @@ pub async fn handle_text(bot: Bot, msg: Message, state: Arc<AppState>) -> Respon
     Ok(())
 }
 
-/// Handle a media message — an inbound photo or document (#11). Downloads the
-/// file, base64-encodes it as a data-URI [`PartInput::File`], appends any caption
-/// as text, and runs a turn. Non-file, non-text messages are ignored.
+/// Handle a media message — an inbound photo or document. Non-file, non-text
+/// messages are ignored.
+///
+/// Two mutually-exclusive inbound paths, gated by config (both-on would double the
+/// file into the turn context):
+/// - **MCP announce (#65), the default** when `mcp.enabled && !mcp.filepart_fallback`:
+///   stash the bytes in the [`FileStore`](crate::mcp::store::FileStore) under the
+///   sender's slot and inject an imperative announce text part that tells the model
+///   to pull the file via the `fetch_user_file` MCP tool. See [`handle_media_announce`].
+/// - **FilePart fallback (#11)** when `mcp.filepart_fallback` is set **or** MCP is
+///   disabled: base64-encode the file as a data-URI [`PartInput::File`] inline in
+///   the turn, unchanged from #11. See [`handle_media_filepart`].
 ///
 /// `pub` so the harness can drive it directly (like [`handle_text`]).
 pub async fn handle_media(bot: Bot, msg: Message, state: Arc<AppState>) -> ResponseResult<()> {
@@ -962,18 +971,95 @@ pub async fn handle_media(bot: Bot, msg: Message, state: Arc<AppState>) -> Respo
     let Some(slot) = resolve_or_reject(&bot, &msg, &state, chat_id).await? else {
         return Ok(());
     };
+    if state.cfg.mcp.filepart_fallback || !state.cfg.mcp.enabled {
+        handle_media_filepart(bot, msg, state, chat_id, slot).await
+    } else {
+        handle_media_announce(bot, msg, state, chat_id, slot).await
+    }
+}
+
+/// The MCP announce inbound path (#65, default): download the file, stash it in
+/// the [`FileStore`](crate::mcp::store::FileStore) under `slot`, and enqueue an
+/// imperative announce text part carrying the store id (plus any caption as its
+/// own text part) so the model reads the bytes by calling `fetch_user_file(id)`.
+/// A download or store failure becomes the friendly [`reply_inbound_file_failed`]
+/// reply plus a `tracing::warn!`.
+async fn handle_media_announce(
+    bot: Bot,
+    msg: Message,
+    state: Arc<AppState>,
+    chat_id: i64,
+    slot: Slot,
+) -> ResponseResult<()> {
+    let (filename, mime, bytes) = match files::download_inbound(&bot, &msg).await {
+        Ok(Some(triple)) => triple,
+        Ok(None) => return Ok(()), // not a photo/document — nothing to do.
+        Err(err) => {
+            tracing::warn!(chat_id, slot = %slot.name, error = format!("{err:#}"), "inbound file download failed");
+            return reply_inbound_file_failed(&bot, &msg).await;
+        }
+    };
+
+    let id = match state
+        .file_store
+        .put(&slot.name, &filename, &mime, &bytes[..])
+        .await
+    {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::warn!(chat_id, slot = %slot.name, error = %err, "storing inbound file failed");
+            return reply_inbound_file_failed(&bot, &msg).await;
+        }
+    };
+
+    // Imperative, self-describing announce — the model must choose to call the
+    // `fetch_user_file` MCP tool with this id to actually read the bytes.
+    let mut parts = vec![PartInput::Text {
+        text: format!(
+            "The user sent a file `{filename}` (id `{id}`). Read it now by calling the fetch_user_file tool with id `{id}`."
+        ),
+    }];
+    // A caption rides along as its own text part.
+    if let Some(caption) = msg.caption()
+        && !caption.trim().is_empty()
+    {
+        parts.push(PartInput::Text {
+            text: caption.to_string(),
+        });
+    }
+    enqueue_parts(&bot, &msg, &state, chat_id, slot, parts).await
+}
+
+/// The #11 FilePart inbound path (fallback): download the file, base64-encode it
+/// as a data-URI [`PartInput::File`], append any caption as text, and run a turn —
+/// unchanged from #11. Taken when `mcp.filepart_fallback` is set or MCP is disabled.
+async fn handle_media_filepart(
+    bot: Bot,
+    msg: Message,
+    state: Arc<AppState>,
+    chat_id: i64,
+    slot: Slot,
+) -> ResponseResult<()> {
     match files::inbound_parts(&bot, &msg).await {
         Ok(Some(parts)) => enqueue_parts(&bot, &msg, &state, chat_id, slot, parts).await?,
         Ok(None) => {} // not a photo/document — nothing to do.
         Err(err) => {
             tracing::warn!(chat_id, slot = %slot.name, error = format!("{err:#}"), "inbound file failed");
-            bot.send_message(
-                msg.chat.id,
-                "⚠️ I couldn't read that file — please try again.",
-            )
-            .await?;
+            reply_inbound_file_failed(&bot, &msg).await?;
         }
     }
+    Ok(())
+}
+
+/// The friendly reply shown when an inbound file can't be ingested — a download
+/// failure, or the store rejecting/erroring on the bytes. Shared by both inbound
+/// paths so they fail identically (the original #11 wording).
+async fn reply_inbound_file_failed(bot: &Bot, msg: &Message) -> ResponseResult<()> {
+    bot.send_message(
+        msg.chat.id,
+        "⚠️ I couldn't read that file — please try again.",
+    )
+    .await?;
     Ok(())
 }
 

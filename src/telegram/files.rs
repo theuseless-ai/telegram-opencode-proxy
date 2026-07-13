@@ -105,10 +105,21 @@ fn mime_from_extension(filename: Option<&str>) -> Option<String> {
     Some(mime.to_string())
 }
 
-/// Build the prompt parts for an inbound media message (#11): download the
-/// photo/document, base64-encode it as a data-URI [`PartInput::File`], and append
-/// any caption as a text part. `Ok(None)` if the message carries no file.
-pub async fn inbound_parts(bot: &Bot, msg: &Message) -> Result<Option<Vec<PartInput>>> {
+/// Download an inbound photo/document into memory. Resolves the attachment,
+/// enforces the [`MAX_INBOUND_BYTES`] guard, runs `getFile` + streams the bytes,
+/// and resolves a display filename (falling back to `"file"` for the rare
+/// document with no name). Returns `(filename, mime, bytes)`, or `Ok(None)` when
+/// the message carries no file.
+///
+/// This is the **shared download half** of both inbound paths: [`inbound_parts`]
+/// builds the #11 base64 FilePart from the returned bytes, while `handle_media`'s
+/// MCP announce path (#65) streams the same bytes into the `FileStore` and injects
+/// a `fetch_user_file` announce instead — so the download logic (and the 20 MB
+/// guard) lives in exactly one place.
+pub async fn download_inbound(
+    bot: &Bot,
+    msg: &Message,
+) -> Result<Option<(String, String, Vec<u8>)>> {
     let Some(att) = pick_attachment(msg) else {
         return Ok(None);
     };
@@ -129,10 +140,26 @@ pub async fn inbound_parts(bot: &Bot, msg: &Message) -> Result<Option<Vec<PartIn
         bytes.extend_from_slice(&chunk);
     }
 
+    // Documents almost always carry a name and photos are labelled `photo.jpg`
+    // by `pick_attachment`; `"file"` is only the last-resort label for an unnamed
+    // document (the announce text and the FilePart both want a concrete name).
+    let filename = att.filename.unwrap_or_else(|| "file".to_string());
+    Ok(Some((filename, att.mime, bytes)))
+}
+
+/// Build the prompt parts for an inbound media message (#11): download the
+/// photo/document via [`download_inbound`], base64-encode it as a data-URI
+/// [`PartInput::File`], and append any caption as a text part. `Ok(None)` if the
+/// message carries no file.
+pub async fn inbound_parts(bot: &Bot, msg: &Message) -> Result<Option<Vec<PartInput>>> {
+    let Some((filename, mime, bytes)) = download_inbound(bot, msg).await? else {
+        return Ok(None);
+    };
+
     let mut parts = vec![PartInput::File {
-        mime: att.mime.clone(),
-        filename: att.filename,
-        url: data_uri(&att.mime, &bytes),
+        mime: mime.clone(),
+        filename: Some(filename),
+        url: data_uri(&mime, &bytes),
     }];
     // A caption becomes a text part alongside the file.
     if let Some(caption) = msg.caption()
