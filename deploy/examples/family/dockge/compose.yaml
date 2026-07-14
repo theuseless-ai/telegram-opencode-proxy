@@ -1,12 +1,21 @@
 # Dockge — a lightweight web UI to manage compose stacks from the browser.
 #
 # Run this as its OWN stack (it's the management plane, so it shouldn't live in
-# the stack it manages). Then open http://agent.lan:5001 and adopt the "family"
-# stack from the UI.
+# the stack it manages):
 #
 #   docker compose -f dockge/compose.yaml up -d
+#   # then open http://agent.lan:5001
 #
-# Keep the family stack directory under DOCKGE_STACKS_DIR so Dockge can see it.
+# Managing the family stack IN PLACE (Colima gotcha): Dockge shells out to
+# `docker compose` INSIDE its own container, so a stack it manages must be
+# reachable at the SAME absolute path Dockge sees AND the Colima VM (the Docker
+# daemon) sees. Otherwise the stack shows as "not managed by Dockge" and its
+# relative bind-mounts / build context won't resolve. The reliable pattern is an
+# IDENTITY MOUNT of the checkout (same path on both sides) with DOCKGE_STACKS_DIR
+# pointing at the examples dir, so `family` is discovered and buildable in place.
+#
+# Replace /ABS/PATH/TO/telegram-opencode-proxy below with your actual clone path
+# (must be under a dir Colima shares into the VM — your home dir is, by default).
 
 name: dockge
 
@@ -21,7 +30,9 @@ services:
       # Colima exposes the Docker socket in the VM at this path.
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/app/data
-      # Where you keep your compose stacks on the host (adjust to taste).
-      - /Users/relaed/agent/stacks:/opt/stacks
+      # Identity mount: same path inside Dockge as on the host/VM, so the family
+      # stack's bind-mounts + build context resolve identically on both sides.
+      - /ABS/PATH/TO/telegram-opencode-proxy:/ABS/PATH/TO/telegram-opencode-proxy
     environment:
-      DOCKGE_STACKS_DIR: /opt/stacks
+      # The family stack lives at deploy/examples/family under this dir.
+      DOCKGE_STACKS_DIR: /ABS/PATH/TO/telegram-opencode-proxy/deploy/examples

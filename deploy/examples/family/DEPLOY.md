@@ -156,3 +156,43 @@ docker exec -it family-opencode-alice bash      # shell into an agent's box
 
 State that survives everything: the `proxy-db` volume (routing, whitelist,
 pairings) and the external `WS_ROOT` workspaces. Back those up.
+
+## Troubleshooting (headless macOS / Colima)
+
+Things that bit a real headless deploy:
+
+- **Pull/build fails: `error getting credentials … keychain … locked`.** With no
+  GUI login the macOS login keychain is locked, and Docker's default
+  `osxkeychain` credential helper — plus the `docker scout` / `debug` build
+  hooks — invoke it even for anonymous pulls of public images. In
+  `~/.docker/config.json` drop `"credsStore"` and set `"features":{"hooks":"false"}`;
+  if it still calls the helper, take it off `PATH` (public images pull anon):
+  `mv "$(command -v docker-credential-osxkeychain)"{,.disabled}`. (Unlocking the
+  keychain works too but doesn't survive a reboot on a headless box.)
+
+- **Build fails: `open ~/.docker/buildx/current: permission denied`.** Leftover
+  root-owned buildx state from a prior Docker Desktop install. The parent dir is
+  yours, so move it aside and buildx recreates it against Colima:
+  `mv ~/.docker/buildx ~/.docker/buildx.stale`.
+
+- **`docker compose` → `unknown command`.** The box may have standalone
+  `docker-compose` (v2) but not the CLI plugin. Use `docker-compose …` (hyphen).
+
+- **Model host (e.g. `llm.lan`) doesn't resolve inside a container.** The Mac may
+  use a public resolver that doesn't know your `.lan` names. Point the opencode
+  services' `dns:` at your LAN resolver (see `compose.yaml`); verify with
+  `docker exec family-opencode-alice getent hosts llm.lan`.
+
+- **Slots show `down` right after `docker compose up`.** The proxy connects to
+  opencode once at startup and doesn't retry; if opencode wasn't serving yet the
+  slot stays down. The opencode `healthcheck` + `depends_on: service_healthy` in
+  `compose.yaml` prevent this on a cold `up`/reboot; `docker compose restart proxy`
+  is the manual recovery.
+
+- **Colima doesn't start after a reboot.** The LaunchAgent needs Homebrew on
+  `PATH` to find `limactl` (see `launchd/*.plist`) and a logged-in user session —
+  enable auto-login on the headless mini.
+
+- **Dockge says "this stack is not managed by Dockge".** Its compose file must
+  live under `DOCKGE_STACKS_DIR` at the same absolute path the Colima VM sees.
+  See `dockge/compose.yaml` for the identity-mount pattern.

@@ -38,7 +38,15 @@ services:
     image: telegram-opencode-proxy:local
     container_name: family-proxy
     restart: unless-stopped
-    depends_on: [opencode-alice, opencode-bob]
+    # Wait until each opencode is actually SERVING, not just started: the proxy
+    # connects to opencode once at startup and does NOT retry a failed initial
+    # connect, so a cold `up`/reboot race would otherwise leave slots "down"
+    # until you restart the proxy. Gated on the opencode healthchecks below.
+    depends_on:
+      opencode-alice:
+        condition: service_healthy
+      opencode-bob:
+        condition: service_healthy
     networks:
       family:
         ipv4_address: 172.28.0.10              # MUST equal [mcp].bind in config.toml
@@ -61,6 +69,11 @@ services:
     restart: unless-stopped
     working_dir: /workspaces/alice
     networks: [family]
+    # If your model host is a LAN name (e.g. the llm.lan baseURL in
+    # opencode-config/*.json) that the container's default resolver can't see,
+    # point DNS at your LAN resolver so it — and everything else, forwarded
+    # upstream — resolves inside the container:
+    #   dns: ["192.168.1.2"]   # e.g. your Pi-hole / router DNS
     environment:
       LLM_LAN_KEY: ${LLM_LAN_KEY:-}
     volumes:
@@ -68,6 +81,14 @@ services:
       - ./opencode-config/alice.opencode.json:/root/.config/opencode/opencode.json:ro
     # hostname 0.0.0.0 (NOT 127.0.0.1) so the proxy container can reach it.
     command: ["serve", "--hostname", "0.0.0.0", "--port", "4096"]
+    # Gates the proxy's startup (see depends_on above): /config returns 200 once
+    # opencode is serving. curl is installed in the opencode image.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:4096/config"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
     mem_limit: 4g          # "just enough" runtime caps; disk quota is separate (DEPLOY.md)
     pids_limit: 512
 
@@ -78,12 +99,19 @@ services:
     restart: unless-stopped
     working_dir: /workspaces/bob
     networks: [family]
+    # (see opencode-alice above re: `dns:` for LAN model hosts)
     environment:
       LLM_LAN_KEY: ${LLM_LAN_KEY:-}
     volumes:
       - ${WS_ROOT:-./ws}/bob:/workspaces/bob
       - ./opencode-config/bob.opencode.json:/root/.config/opencode/opencode.json:ro
     command: ["serve", "--hostname", "0.0.0.0", "--port", "4097"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:4097/config"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
     mem_limit: 4g
     pids_limit: 512
 
