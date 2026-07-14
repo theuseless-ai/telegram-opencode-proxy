@@ -158,10 +158,9 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
     // never be unauthenticated.
     let mut admin_http_task: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(bind) = state.cfg.admin.http_bind {
-        match state.cfg.admin.token.as_ref() {
-            Some(token) if !token.is_empty() => {
+        match state.cfg.admin.resolved_token() {
+            Some(token) => {
                 let http_state: Arc<dyn admin::AdminState> = state.clone();
-                let token = token.expose().to_string();
                 admin_http_task = Some(tokio::spawn(async move {
                     if let Err(err) = admin::serve_admin_http(http_state, bind, token).await {
                         tracing::error!(
@@ -171,10 +170,10 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
                     }
                 }));
             }
-            _ => tracing::error!(
+            None => tracing::error!(
                 %bind,
-                "[admin].http_bind is set but [admin].token is missing/empty — \
-                 refusing to expose the admin API without authentication"
+                "[admin].http_bind is set but no token (config [admin].token or \
+                 TOPX_ADMIN_TOKEN) — refusing to expose the admin API without authentication"
             ),
         }
     }

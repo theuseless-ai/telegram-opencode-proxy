@@ -415,9 +415,30 @@ pub struct Admin {
     pub http_bind: Option<SocketAddr>,
     /// Bearer token required on every HTTP admin request
     /// (`Authorization: Bearer <token>`). **Required** whenever `http_bind` is
-    /// set; the daemon refuses to start the listener without it.
+    /// set; the daemon refuses to start the listener without it. The
+    /// `TOPX_ADMIN_TOKEN` env var overrides this (mirroring how `TELOXIDE_TOKEN`
+    /// overrides `bot_token`), so the secret can live in the environment / an
+    /// `.env` file rather than in `config.toml`.
     #[serde(default)]
     pub token: Option<Secret>,
+}
+
+impl Admin {
+    /// The effective admin bearer token: `TOPX_ADMIN_TOKEN` (if set and
+    /// non-empty) overrides the config `token`. `None` when neither is set — the
+    /// HTTP admin API then refuses to start.
+    pub fn resolved_token(&self) -> Option<String> {
+        Self::resolve_token(std::env::var("TOPX_ADMIN_TOKEN").ok(), self.token.as_ref())
+    }
+
+    /// Pure token-resolution logic (env wins over config; empties are ignored),
+    /// split out so it is testable without touching process env.
+    fn resolve_token(env: Option<String>, cfg: Option<&Secret>) -> Option<String> {
+        env.filter(|t| !t.is_empty()).or_else(|| {
+            cfg.map(|s| s.expose().to_string())
+                .filter(|t| !t.is_empty())
+        })
+    }
 }
 
 impl Mcp {
@@ -697,6 +718,30 @@ model_id = \"m\"
     }
 
     // --- Secrets handling (#23) -----------------------------------------------
+
+    #[test]
+    fn admin_token_env_overrides_config_and_ignores_empties() {
+        let cfg = Some(Secret::from("from-config"));
+        // env (non-empty) wins over config.
+        assert_eq!(
+            Admin::resolve_token(Some("from-env".into()), cfg.as_ref()),
+            Some("from-env".to_string())
+        );
+        // empty env falls back to config.
+        assert_eq!(
+            Admin::resolve_token(Some(String::new()), cfg.as_ref()),
+            Some("from-config".to_string())
+        );
+        // no env → config.
+        assert_eq!(
+            Admin::resolve_token(None, cfg.as_ref()),
+            Some("from-config".to_string())
+        );
+        // neither → None (the HTTP API then refuses to start).
+        assert_eq!(Admin::resolve_token(None, None), None);
+        // an empty config token is treated as unset.
+        assert_eq!(Admin::resolve_token(None, Some(&Secret::from(""))), None);
+    }
 
     #[test]
     fn secret_redacts_in_debug() {

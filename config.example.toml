@@ -19,9 +19,13 @@ admin_socket = "/tmp/topx-admin.sock"
 # bearer `token` is REQUIRED — the daemon refuses to expose it without one.
 # Serve it only behind TLS or on a trusted network (LAN / Tailscale). Omit the
 # whole [admin] block to keep admin socket-only (the default).
+#
+# The token may be set here OR via the TOPX_ADMIN_TOKEN env var, which overrides
+# this (like TELOXIDE_TOKEN overrides bot_token) — prefer keeping it in your
+# environment / .env rather than in this file. Generate one with `openssl rand -hex 32`.
 # [admin]
 # http_bind = "0.0.0.0:4200"
-# token = "change-me-to-a-long-random-secret"
+# token = "change-me-to-a-long-random-secret"   # or leave unset and set TOPX_ADMIN_TOKEN
 
 # SQLite store for routing (chat_id → opencode session), the whitelist, and
 # pending pairings/approvals. Survives restarts. Relative paths resolve against
