@@ -26,4 +26,25 @@ ENV PATH="/root/.opencode/bin:${PATH}"
 # fast (the agent can still `npx` others on demand).
 RUN npm i -g @modelcontextprotocol/server-filesystem
 
+# --- agent-browser: a CLI the agent drives from its shell to scrape the web ---
+# vercel-labs/agent-browser is a Rust CLI+daemon that drives Chrome via CDP on
+# demand (no MCP server — the agent just runs `agent-browser …`, guided by the
+# baked SKILL.md below). This host is ARM64, where Chrome-for-Testing has no build,
+# so `agent-browser install` cannot fetch a browser; use the distro `chromium`
+# package instead (it pulls in every headless dep) and point the CLI at it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends chromium fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+RUN npm i -g agent-browser
+# Point agent-browser at the distro Chromium, and pass the flags a root-in-container
+# Chrome needs (--no-sandbox; --disable-dev-shm-usage avoids /dev/shm crashes). Baked
+# as env so the agent never has to remember them.
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium \
+    AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage
+
+# --- preloaded opencode skills (deterministic; baked, not on the session volume) ---
+# opencode auto-discovers <name>/SKILL.md here at session start (native Agent Skills,
+# opencode >= v1.0.186). Claude-Code-format skills work unmodified.
+COPY skills/ /root/.config/opencode/skills/
+
 ENTRYPOINT ["opencode"]
