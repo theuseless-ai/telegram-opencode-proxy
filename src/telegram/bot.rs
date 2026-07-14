@@ -618,7 +618,10 @@ pub async fn run(bot: Bot, state: Arc<AppState>) {
             tracing::warn!(error = %err, ?scope, "could not set the bot command menu");
         }
     }
-    tracing::info!(count = commands.len(), "advertised bot commands to Telegram");
+    tracing::info!(
+        count = commands.len(),
+        "advertised bot commands to Telegram"
+    );
 
     let handler = dptree::entry()
         .branch(

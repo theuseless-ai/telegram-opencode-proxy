@@ -35,8 +35,7 @@ use telegram_opencode_proxy::opencode::client::OpencodeClient;
 use telegram_opencode_proxy::persistence::{Db, PendingApproval};
 use telegram_opencode_proxy::state::SlotConn;
 use telegram_opencode_proxy::telegram::bot::{
-    AppState, handle_callback, handle_media, handle_new, handle_stop, handle_text,
-    handle_verbosity,
+    AppState, handle_callback, handle_media, handle_new, handle_stop, handle_text, handle_verbosity,
 };
 use telegram_opencode_proxy::telegram::render::Verbosity;
 use telegram_opencode_proxy::{connect_slots, spawn_slot_bringup};
