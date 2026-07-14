@@ -21,8 +21,13 @@
   <array>
     <string>/bin/sh</string>
     <string>-lc</string>
-    <!-- Idempotent: start only if not already running (colima start is one-shot). -->
-    <string>/opt/homebrew/bin/colima status >/dev/null 2>&amp;1 || /opt/homebrew/bin/colima start --cpu 4 --memory 8 --disk 60</string>
+    <!-- Idempotent: start only if not already running (colima start is one-shot).
+         PATH must include Homebrew so colima can find its `limactl` dependency:
+         launchd's default PATH does not, and `sh -l` won't pick it up from a zsh
+         profile — without this, colima fails at boot with "lima not found" and
+         the VM never comes up. Use /opt/homebrew/bin on Apple Silicon,
+         /usr/local/bin on Intel. -->
+    <string>export PATH=/opt/homebrew/bin:$PATH; colima status >/dev/null 2>&amp;1 || colima start --cpu 4 --memory 8 --disk 60</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
