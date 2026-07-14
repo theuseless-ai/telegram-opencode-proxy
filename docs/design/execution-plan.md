@@ -69,7 +69,7 @@ T6 ─► T9(#9 mpsc + /stop)          T7 ─► T10(#10 /new /whoami + verbosit
 
                           ┌─────────────────────────── v0.0.3 (full scenario) ───────────────────────────┐
 T7,T3,T5 ─► T13(#13 permission relay + git-ask FLIP)   ◄── headline deliverable
-T8       ─► T11(#11 inbound files)  ∥  T8 ─► T12(#12 outbox + /get) ─► T-AGENTS(NEW AGENTS.md)
+T8       ─► T11(#11 inbound files)  ∥  T8 ─► T12(#12 outbox) ─► T-AGENTS(NEW AGENTS.md)
 T8,T10   ─► T14(#14 verbosity + sub-agent tags + footer)
 T9,T3,T13 ─► /stop-rejects-pending + re-surface-pending-gates (acceptance in T13/T9)
                           └───────────────────────────────────────────────────────────────────────────────┘
@@ -391,12 +391,12 @@ routing; `/new` `/whoami` `/stop`; robust under Telegram flood control; structur
 - **Modules touched:** `telegram/files.rs`, `telegram/bot.rs`, `opencode/client.rs`.
 - **Agent:** sisyphus-junior.
 
-#### T12 — Outbox watcher + /get  ·  #12  ·  v0.0.3  ·  P1
+#### T12 — Outbox watcher  ·  #12  ·  v0.0.3  ·  P1
 - **Goal:** Send deliverables back to the owning user.
 - **Depends on:** T8 (independent of T11/T13 — parallelizable).
 - **Acceptance criteria:** `notify` watcher on each slot's `./outbox` → send new files
-  (`send_document`/`send_photo` by mime, `upload_document`/`upload_photo` chat action first); `/get
-  <path>` with **canonicalize-within-workdir** path-traversal guard (unit-tested in T-TEST); 50 MB /
+  (`send_document`/`send_photo` by mime, `upload_document`/`upload_photo` chat action first), with a
+  **canonicalize-within-workdir** path-traversal guard (unit-tested in T-TEST); 50 MB /
   1024-char caption limits respected (§2.5).
 - **Modules touched:** `outbox.rs`, `telegram/files.rs`, `telegram/bot.rs`.
 - **Agent:** hephaestus (watcher lifecycle + per-slot wiring).
@@ -477,7 +477,7 @@ commit; verbosity toggles + sub-agent tags + footer.
 | T-TGERR | **NEW** | Telegram error/rate-limit/backoff | v0.0.2 | P1 | **CREATE** |
 | T-LOG | **NEW** | Structured logging (per-turn spans, redaction) | v0.0.2 | P2 | **CREATE** |
 | T11 | #11 | C1: Inbound files (base64 FilePart) | v0.0.3 | P1 | exists |
-| T12 | #12 | C2: Outbox watcher + /get | v0.0.3 | P1 | exists |
+| T12 | #12 | C2: Outbox watcher | v0.0.3 | P1 | exists |
 | T13 | #13 | C3: Permission relay + git-ask — *+flip deny→ask, +reject-pending, +restart re-surface* | v0.0.3 | P1 | exists (edit AC) |
 | T14 | #14 | C4: Verbosity + sub-agent tags + summary footer | v0.0.3 | P2 | exists |
 | T-AGENTS | **NEW** | AGENTS.md provisioning | v0.0.3 | P2 | **CREATE** |
@@ -578,8 +578,7 @@ table so the wire-first critical path is filterable.
 - [ ] **Backpressure:** a second message during a turn is queued; channel-full yields a
       reject-with-message, not a hang.
 - [ ] **/stop:** aborts the turn and rejects any pending permission.
-- [ ] **v0.0.3 files:** inbound photo reaches the model; a file written to `./outbox` is sent;
-      `/get ../../etc/passwd` is rejected by the path guard.
+- [ ] **v0.0.3 files:** inbound photo reaches the model; a file written to `./outbox` is sent.
 - [ ] **Headline:** "summarise as minutes, send me to approve, then commit" → minutes file delivered
       → commit gate buttons → Approve → commit proceeds; Revise feeds corrigible feedback; Deny
       abandons.
