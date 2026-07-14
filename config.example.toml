@@ -10,6 +10,19 @@ bot_token = ""
 # path — e.g. $XDG_RUNTIME_DIR/topx/admin.sock in production; /tmp is fine for dev.
 admin_socket = "/tmp/topx-admin.sock"
 
+# Optional authenticated HTTP admin API (#82). The socket above is local-only —
+# its trust boundary is the 0600 file mode. When the proxy runs where the socket
+# isn't reachable (e.g. in a container), set [admin].http_bind to ALSO serve the
+# same admin commands over HTTP, so an authorized operator can run e.g.
+# `proxy pair approve <code> --slot <name> --admin-url http://host:4200 --token …`
+# from another machine. A network endpoint has NO filesystem boundary, so a
+# bearer `token` is REQUIRED — the daemon refuses to expose it without one.
+# Serve it only behind TLS or on a trusted network (LAN / Tailscale). Omit the
+# whole [admin] block to keep admin socket-only (the default).
+# [admin]
+# http_bind = "0.0.0.0:4200"
+# token = "change-me-to-a-long-random-secret"
+
 # SQLite store for routing (chat_id → opencode session), the whitelist, and
 # pending pairings/approvals. Survives restarts. Relative paths resolve against
 # the working directory; WAL creates proxy.db-wal / proxy.db-shm alongside it.

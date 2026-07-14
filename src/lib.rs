@@ -151,6 +151,34 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
         }
     }
 
+    // Optional authenticated HTTP admin API (#82): the same admin commands over
+    // HTTP so an authorized operator can administer from another machine (e.g.
+    // the proxy in a container). SECONDARY like the socket/MCP — a bind failure
+    // only logs. Refuses to start without a token: a network admin endpoint must
+    // never be unauthenticated.
+    let mut admin_http_task: Option<tokio::task::JoinHandle<()>> = None;
+    if let Some(bind) = state.cfg.admin.http_bind {
+        match state.cfg.admin.token.as_ref() {
+            Some(token) if !token.is_empty() => {
+                let http_state: Arc<dyn admin::AdminState> = state.clone();
+                let token = token.expose().to_string();
+                admin_http_task = Some(tokio::spawn(async move {
+                    if let Err(err) = admin::serve_admin_http(http_state, bind, token).await {
+                        tracing::error!(
+                            error = format!("{err:#}"),
+                            "HTTP admin API unavailable — continuing without it"
+                        );
+                    }
+                }));
+            }
+            _ => tracing::error!(
+                %bind,
+                "[admin].http_bind is set but [admin].token is missing/empty — \
+                 refusing to expose the admin API without authentication"
+            ),
+        }
+    }
+
     tracing::info!("starting Telegram long-poll dispatcher (Ctrl-C / SIGTERM to stop)");
     telegram::bot::run(bot, state.clone()).await;
     tracing::info!("dispatcher stopped — shutting down gracefully");
@@ -161,6 +189,9 @@ pub async fn serve(cfg: Config, config_path: PathBuf) -> Result<()> {
 
     // Stop the admin socket task and unlink the socket so a restart binds cleanly.
     admin_task.abort();
+    if let Some(task) = admin_http_task {
+        task.abort();
+    }
     match std::fs::remove_file(&admin_socket) {
         Ok(()) => tracing::debug!(socket = %admin_socket.display(), "removed admin socket"),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}

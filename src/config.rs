@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -81,6 +81,14 @@ pub enum Command {
         /// Admin socket path override. When set, the config file is not read.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// HTTP admin API base URL (e.g. `https://agent.lan:4200`). When set, the
+        /// daemon's admin socket is not used — the request goes over HTTP (#82).
+        #[arg(long)]
+        admin_url: Option<String>,
+        /// Bearer token for the HTTP admin API (required with `--admin-url`);
+        /// falls back to the `TOPX_ADMIN_TOKEN` env var.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Idempotently ensure a slot exists and is connected on the running daemon
     /// (#39): reports `connected`, `reconnected`, or `added`.
@@ -102,6 +110,14 @@ pub enum Command {
         /// Admin socket path override. When set, the config file is not read.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// HTTP admin API base URL (e.g. `https://agent.lan:4200`). When set, the
+        /// daemon's admin socket is not used — the request goes over HTTP (#82).
+        #[arg(long)]
+        admin_url: Option<String>,
+        /// Bearer token for the HTTP admin API (required with `--admin-url`);
+        /// falls back to the `TOPX_ADMIN_TOKEN` env var.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Per-slot inventory over the admin socket (#4b): name, opencode URL,
     /// workdir, bound Telegram ids, reachability, and config-vs-db source. Use it
@@ -113,6 +129,14 @@ pub enum Command {
         /// Admin socket path override. When set, the config file is not read.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// HTTP admin API base URL (e.g. `https://agent.lan:4200`). When set, the
+        /// daemon's admin socket is not used — the request goes over HTTP (#82).
+        #[arg(long)]
+        admin_url: Option<String>,
+        /// Bearer token for the HTTP admin API (required with `--admin-url`);
+        /// falls back to the `TOPX_ADMIN_TOKEN` env var.
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Admin enrollment client (#4b): list / approve / deny pending pairings.
     Pair {
@@ -124,6 +148,14 @@ pub enum Command {
         /// Admin socket path override. When set, the config file is not read.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// HTTP admin API base URL (e.g. `https://agent.lan:4200`). When set, the
+        /// daemon's admin socket is not used — the request goes over HTTP (#82).
+        #[arg(long)]
+        admin_url: Option<String>,
+        /// Bearer token for the HTTP admin API (required with `--admin-url`);
+        /// falls back to the `TOPX_ADMIN_TOKEN` env var.
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -184,6 +216,13 @@ pub struct Config {
     /// a missing `[mcp]` block uses the defaults.
     #[serde(default)]
     pub mcp: Mcp,
+    /// The optional `[admin]` authenticated HTTP admin API (#82). Off by default:
+    /// admin stays on the local `admin_socket` only. When `http_bind` is set the
+    /// daemon ALSO serves the admin commands over HTTP so an authorized operator
+    /// can administer from another machine (e.g. the proxy running in a
+    /// container). Requires `token` — see [`Admin`].
+    #[serde(default)]
+    pub admin: Admin,
 }
 
 /// Default SQLite path when `db_path` is omitted from config.
@@ -356,6 +395,29 @@ fn default_mcp_max_file_bytes() -> u64 {
 /// Default `[mcp]` fetch TTL (5 minutes) for announced inbound files.
 fn default_mcp_ttl_secs() -> u64 {
     300
+}
+
+/// The optional `[admin]` authenticated HTTP admin API (#82).
+///
+/// The local `admin_socket` (top-level) is the default admin transport and its
+/// trust boundary is the `0600` filesystem mode — it is never on the network.
+/// That boundary does **not** extend to a network endpoint, so when `http_bind`
+/// is set the daemon serves the same admin commands over HTTP guarded by a
+/// mandatory bearer `token`. The daemon **refuses to expose the HTTP API without
+/// a non-empty token** (mirroring the socket's `0600` verify). Expose it only
+/// behind TLS or on a trusted network (LAN / Tailscale) — the token is the whole
+/// auth story.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Admin {
+    /// Bind address for the HTTP admin listener, e.g. `"0.0.0.0:4200"`. Absent →
+    /// the HTTP admin API is off (socket-only, unchanged).
+    #[serde(default)]
+    pub http_bind: Option<SocketAddr>,
+    /// Bearer token required on every HTTP admin request
+    /// (`Authorization: Bearer <token>`). **Required** whenever `http_bind` is
+    /// set; the daemon refuses to start the listener without it.
+    #[serde(default)]
+    pub token: Option<Secret>,
 }
 
 impl Mcp {

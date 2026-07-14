@@ -1,14 +1,25 @@
-//! Admin control channel: a **local-only** Unix-domain socket that the CLI
-//! (`proxy status`, later `proxy connect` #39 and `proxy pair …` #4b) uses to
-//! talk to the running daemon. See `docs/design/architecture.md` §5.
+//! Admin control channel: the CLI (`proxy status` / `connect` #39 / `pair …`
+//! #4b) talking to the running daemon. See `docs/design/architecture.md` §5.
+//!
+//! Two transports over one [`dispatch`] core:
+//! - the default **local Unix-domain socket** ([`serve_admin`] / [`send_request`]);
+//! - an optional **authenticated HTTP API** ([`serve_admin_http`] /
+//!   [`send_request_http`], #82) for administering from another machine — e.g.
+//!   the proxy running in a container where the socket is unreachable.
 //!
 //! # Security boundary (hold this line)
 //!
-//! opencode executes code, so this channel is privileged. It is **never** put on
-//! the network: it is a filesystem Unix socket, and [`serve_admin`] `chmod`s it
+//! opencode executes code, so this channel is privileged.
+//!
+//! The Unix socket is **never** put on the network: [`serve_admin`] `chmod`s it
 //! to `0600` and **verifies** the mode before serving — refusing to run if the
 //! kernel didn't honour the permissions. Any stale socket left by a previous
 //! process is unlinked before bind, and the socket is removed on shutdown.
+//!
+//! A network endpoint has **no** such filesystem boundary, so the HTTP transport
+//! requires a bearer `token` on every request (constant-time checked) and
+//! [`serve_admin_http`] refuses to run without one. Expose it only behind TLS or
+//! on a trusted network.
 //!
 //! # Wire protocol
 //!
@@ -19,12 +30,19 @@
 //! format or the existing `status` client.
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -395,6 +413,138 @@ pub async fn send_request(socket_path: &Path, req: &AdminRequest) -> Result<Admi
         "admin socket closed without a response"
     );
     serde_json::from_str(resp_line.trim_end()).context("parsing admin response")
+}
+
+// ===================== HTTP admin transport (#82) ============================
+//
+// A SECOND transport over the SAME [`dispatch`] core: one authenticated
+// `POST /admin` endpoint carrying a JSON [`AdminRequest`], replying with a JSON
+// [`AdminResponse`]. It exists so an authorized operator can administer from a
+// different machine (e.g. the proxy running in a container, where the Unix
+// socket is unreachable) — see #82.
+//
+// Security: the Unix socket's trust boundary is the verified `0600` filesystem
+// mode; a network endpoint has NO such ambient boundary, so EVERY request must
+// carry a valid bearer token, and [`serve_admin_http`] refuses to run without a
+// non-empty one. Expose this only behind TLS or on a trusted network.
+
+/// Shared state for the HTTP admin handler: the dispatch target, the readiness
+/// probe client, and the required bearer token.
+#[derive(Clone)]
+struct HttpAdminState {
+    state: Arc<dyn AdminState>,
+    http: reqwest::Client,
+    token: Arc<str>,
+}
+
+/// Build the axum router for the HTTP admin API. Split from [`serve_admin_http`]
+/// so tests (and future callers) can bind an ephemeral port and drive it.
+fn admin_router(state: Arc<dyn AdminState>, http: reqwest::Client, token: Arc<str>) -> Router {
+    Router::new()
+        .route("/admin", post(http_admin))
+        .with_state(HttpAdminState { state, http, token })
+}
+
+/// Serve the authenticated HTTP admin API at `bind` until the task is dropped
+/// (the daemon aborts it on shutdown; see `lib::serve`). **Refuses** an empty
+/// token — a network admin endpoint must never be exposed unauthenticated.
+pub async fn serve_admin_http(
+    state: Arc<dyn AdminState>,
+    bind: SocketAddr,
+    token: String,
+) -> Result<()> {
+    ensure!(
+        !token.is_empty(),
+        "the HTTP admin API requires a non-empty [admin].token — refusing to expose it unauthenticated"
+    );
+    let http = probe_client()?;
+    let router = admin_router(state, http, Arc::from(token.as_str()));
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("binding HTTP admin API at {bind}"))?;
+    tracing::info!(%bind, "authenticated HTTP admin API listening");
+    axum::serve(listener, router)
+        .await
+        .context("HTTP admin API server terminated")
+}
+
+/// The `POST /admin` handler: authenticate first (bearer token, constant-time),
+/// then deserialize + [`dispatch`]. Auth precedes parsing so an unauthorized
+/// caller learns nothing about the request — and does no work.
+async fn http_admin(State(st): State<HttpAdminState>, headers: HeaderMap, body: Bytes) -> Response {
+    if !bearer_ok(&headers, &st.token) {
+        tracing::warn!("HTTP admin request rejected: missing or invalid bearer token");
+        return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
+    }
+    match serde_json::from_slice::<AdminRequest>(&body) {
+        Ok(req) => (
+            StatusCode::OK,
+            Json(dispatch(st.state.as_ref(), &st.http, req).await),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(AdminResponse::Error {
+                message: format!("invalid admin request: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Whether the request carries `Authorization: Bearer <token>` matching the
+/// configured token (constant-time compare).
+fn bearer_ok(headers: &HeaderMap, token: &str) -> bool {
+    let Some(presented) = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    ct_eq(presented.as_bytes(), token.as_bytes())
+}
+
+/// Constant-time byte-string equality. Short-circuits only on length (a bearer
+/// token's length is not itself the secret), so two same-length values take the
+/// same time regardless of where they first differ.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Client half over HTTP: `POST {base_url}/admin` with a bearer token, one JSON
+/// [`AdminRequest`] in, one JSON [`AdminResponse`] out. The remote-machine
+/// analogue of [`send_request`], used by the CLI when `--url` is given.
+pub async fn send_request_http(
+    base_url: &str,
+    token: &str,
+    req: &AdminRequest,
+) -> Result<AdminResponse> {
+    let url = format!("{}/admin", base_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(token)
+        .json(req)
+        .send()
+        .await
+        .with_context(|| format!("POST {url} — is the HTTP admin API running?"))?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!(
+            "the HTTP admin API rejected the token (401) — check --token / TOPX_ADMIN_TOKEN"
+        );
+    }
+    let body = resp.text().await.context("reading HTTP admin response")?;
+    serde_json::from_str(&body)
+        .with_context(|| format!("parsing HTTP admin response (HTTP {status}): {body}"))
 }
 
 /// Handle one connection: read a request line, dispatch, write a response line,
@@ -841,5 +991,93 @@ mod tests {
             other => panic!("expected Error, got {other:?}"),
         }
         server.abort();
+    }
+
+    // ---- HTTP admin transport (#82) ----------------------------------------
+
+    /// Spawn the HTTP admin API on an ephemeral port; returns its base URL.
+    async fn spawn_http_admin(token: &str) -> String {
+        let state = fake(&[("you", DEAD_URL)]);
+        let http = probe_client().unwrap();
+        let router = admin_router(state, http, Arc::from(token));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn http_admin_accepts_a_valid_token() {
+        let base = spawn_http_admin("s3cr3t").await;
+        let resp = send_request_http(&base, "s3cr3t", &AdminRequest::Status)
+            .await
+            .expect("a valid token must be accepted");
+        match resp {
+            AdminResponse::Status { slots } => assert_eq!(slots.len(), 1),
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_admin_rejects_a_wrong_token() {
+        let base = spawn_http_admin("s3cr3t").await;
+        let err = send_request_http(&base, "wrong", &AdminRequest::Status)
+            .await
+            .expect_err("a wrong token must be rejected");
+        assert!(
+            format!("{err:#}").contains("401"),
+            "expected a 401 rejection, got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_admin_rejects_a_missing_token() {
+        let base = spawn_http_admin("s3cr3t").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/admin"))
+            .json(&AdminRequest::Status)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn http_admin_malformed_body_is_an_error_response() {
+        let base = spawn_http_admin("s3cr3t").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/admin"))
+            .bearer_auth("s3cr3t")
+            .body("not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let parsed: AdminResponse = resp.json().await.unwrap();
+        assert!(matches!(parsed, AdminResponse::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn serve_admin_http_refuses_an_empty_token() {
+        let state = fake(&[]);
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let err = serve_admin_http(state, bind, String::new())
+            .await
+            .expect_err("an empty token must be refused");
+        assert!(
+            format!("{err:#}").contains("token"),
+            "expected a token-required error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn ct_eq_matches_ordinary_equality() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(ct_eq(b"", b""));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab")); // length mismatch
+        assert!(!ct_eq(b"", b"x"));
     }
 }
