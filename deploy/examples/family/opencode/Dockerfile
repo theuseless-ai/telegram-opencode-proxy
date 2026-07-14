@@ -26,25 +26,27 @@ ENV PATH="/root/.opencode/bin:${PATH}"
 # fast (the agent can still `npx` others on demand).
 RUN npm i -g @modelcontextprotocol/server-filesystem
 
-# --- agent-browser: a CLI the agent drives from its shell to scrape the web ---
-# vercel-labs/agent-browser is a Rust CLI+daemon that drives Chrome via CDP on
-# demand (no MCP server — the agent just runs `agent-browser …`, guided by the
-# baked SKILL.md below). This host is ARM64, where Chrome-for-Testing has no build,
-# so `agent-browser install` cannot fetch a browser; use the distro `chromium`
-# package instead (it pulls in every headless dep) and point the CLI at it.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends chromium fonts-liberation \
-    && rm -rf /var/lib/apt/lists/*
-RUN npm i -g agent-browser
-# Point agent-browser at the distro Chromium, and pass the flags a root-in-container
-# Chrome needs (--no-sandbox; --disable-dev-shm-usage avoids /dev/shm crashes). Baked
-# as env so the agent never has to remember them.
-ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium \
-    AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage
-
-# --- preloaded opencode skills (deterministic; baked, not on the session volume) ---
-# opencode auto-discovers <name>/SKILL.md here at session start (native Agent Skills,
-# opencode >= v1.0.186). Claude-Code-format skills work unmodified.
-COPY skills/ /root/.config/opencode/skills/
+# --- obscura: lightweight headless browser exposing browser tools via MCP ---
+# obscura (h4ckf0r0day/obscura) is a Rust headless browser: a ~77MB static-ish
+# binary, ~30MB RAM, real JS via V8, that ships a built-in MCP server. opencode
+# launches `obscura mcp` as a stdio MCP (wired in opencode.json), so the agent gets
+# browser_navigate/click/fill/evaluate/… tools with NO Chromium and NO separate
+# browser service — a fraction of chromium's ~1.1GB. Pinned; arm64 + amd64 builds.
+ARG OBSCURA_VERSION=v0.1.10
+RUN arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      arm64) tgt=aarch64-linux ;; \
+      amd64) tgt=x86_64-linux ;; \
+      *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/obscura.tgz \
+      "https://github.com/h4ckf0r0day/obscura/releases/download/${OBSCURA_VERSION}/obscura-${tgt}.tar.gz" \
+    && mkdir -p /tmp/ob && tar xzf /tmp/obscura.tgz -C /tmp/ob \
+    && install -m 0755 "$(find /tmp/ob -name obscura -type f | head -1)" /usr/local/bin/obscura \
+    && rm -rf /tmp/ob /tmp/obscura.tgz \
+    && obscura --version
+# Let the browser reach LAN/private services (searxng, metube, llm.lan). obscura
+# blocks RFC1918/loopback by default (SSRF protection); opt in here per this deploy.
+ENV OBSCURA_ALLOW_PRIVATE_NETWORK=1
 
 ENTRYPOINT ["opencode"]
