@@ -1,0 +1,27 @@
+# Dockge — a lightweight web UI to manage compose stacks from the browser.
+#
+# Run this as its OWN stack (it's the management plane, so it shouldn't live in
+# the stack it manages). Then open http://agent.lan:5001 and adopt the "family"
+# stack from the UI.
+#
+#   docker compose -f dockge/compose.yaml up -d
+#
+# Keep the family stack directory under DOCKGE_STACKS_DIR so Dockge can see it.
+
+name: dockge
+
+services:
+  dockge:
+    image: louislam/dockge:1
+    container_name: dockge
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    volumes:
+      # Colima exposes the Docker socket in the VM at this path.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+      # Where you keep your compose stacks on the host (adjust to taste).
+      - /Users/relaed/agent/stacks:/opt/stacks
+    environment:
+      DOCKGE_STACKS_DIR: /opt/stacks

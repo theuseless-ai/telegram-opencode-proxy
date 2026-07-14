@@ -1,0 +1,41 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "provider": {
+    "llm-lan": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local LLM (llm.lan)",
+      "options": {
+        "baseURL": "http://llm.lan:8080/v1",
+        "apiKey": "{env:LLM_LAN_KEY}"
+      },
+      "models": {
+        "Qwen3.6-35B-A3B-bf16": {
+          "attachment": true,
+          "modalities": { "input": ["text", "image"], "output": ["text"] }
+        }
+      }
+    }
+  },
+
+  "mcp": {
+    "telegram-files": {
+      "type": "remote",
+      "url": "http://172.28.0.10:4100/mcp",
+      "enabled": true,
+      "headers": { "X-Slot": "bob" }
+    },
+
+    "filesystem": {
+      "type": "local",
+      "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/workspaces/bob"],
+      "enabled": true
+    },
+
+    "example-http": {
+      "type": "remote",
+      "url": "http://mcp-example:8000/mcp",
+      "enabled": false
+    }
+  }
+}

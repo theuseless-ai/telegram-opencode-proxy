@@ -1,0 +1,4 @@
+# Local secrets and state — never commit.
+.env
+/ws/
+dockge/data/

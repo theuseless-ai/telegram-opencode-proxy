@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Start Colima at login so the Docker VM comes back after a reboot. Each service's
+  `restart: unless-stopped` then brings the family stack back up inside the VM.
+
+  Install:
+    cp launchd/net.theuseless.colima.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/net.theuseless.colima.plist
+
+  NOTE: a LaunchAgent runs in your user GUI session. On a headless Mac mini,
+  enable auto-login for the admin user (System Settings → Users & Groups) so it
+  loads on boot without a manual login. Adjust the Homebrew path below for Intel
+  Macs (/usr/local/bin).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>net.theuseless.colima</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-lc</string>
+    <!-- Idempotent: start only if not already running (colima start is one-shot). -->
+    <string>/opt/homebrew/bin/colima status >/dev/null 2>&amp;1 || /opt/homebrew/bin/colima start --cpu 4 --memory 8 --disk 60</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/colima.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/colima.err.log</string>
+</dict>
+</plist>

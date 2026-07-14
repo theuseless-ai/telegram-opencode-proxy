@@ -1,0 +1,112 @@
+# Family deployment — telegram-opencode-proxy + per-slot opencode, one stack.
+#
+# Target: a headless, always-on Mac mini (agent.lan) running Colima (Docker
+# runtime). Manage from a browser with Dockge (see ./dockge/compose.yaml).
+#
+# Topology (all inside the Colima Linux VM):
+#
+#   network "family" (172.28.0.0/24)
+#     proxy           172.28.0.10   ← PINNED. The MCP file-download URL is built
+#                                     from [mcp].bind, which must be an IP the
+#                                     opencode containers can route to. See
+#                                     config.toml + DEPLOY.md.
+#     opencode-alice  :4096         reached by the proxy as http://opencode-alice:4096
+#     opencode-bob    :4097
+#     mcp-example     :8000         illustrative SHARED, STATELESS HTTP MCP server
+#
+# Each slot's workspace is a bind-mount from an external host folder (easy to
+# back up / inspect) and is mounted into BOTH the opencode container AND the
+# proxy — the proxy's outbox watcher reads the workdir by local path.
+
+name: family
+
+networks:
+  family:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  proxy-db:
+
+services:
+  proxy:
+    build:
+      context: ../../..                        # repo root (see DEPLOY.md: add a root .dockerignore)
+      dockerfile: deploy/examples/family/proxy/Dockerfile
+    image: telegram-opencode-proxy:local
+    container_name: family-proxy
+    restart: unless-stopped
+    depends_on: [opencode-alice, opencode-bob]
+    networks:
+      family:
+        ipv4_address: 172.28.0.10              # MUST equal [mcp].bind in config.toml
+    environment:
+      TELOXIDE_TOKEN: ${TELOXIDE_TOKEN:?set TELOXIDE_TOKEN in .env}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./config.toml:/etc/topx/config.toml:ro
+      - proxy-db:/data
+      # Same external workspace folders the opencode containers use, so the
+      # outbox watcher finds each slot's workdir.
+      - ${WS_ROOT:-./ws}/alice:/workspaces/alice
+      - ${WS_ROOT:-./ws}/bob:/workspaces/bob
+    command: ["serve", "--config", "/etc/topx/config.toml"]
+
+  opencode-alice:
+    build: { context: ./opencode }
+    image: opencode-slot:local
+    container_name: family-opencode-alice
+    restart: unless-stopped
+    working_dir: /workspaces/alice
+    networks: [family]
+    environment:
+      LLM_LAN_KEY: ${LLM_LAN_KEY:-}
+    volumes:
+      - ${WS_ROOT:-./ws}/alice:/workspaces/alice
+      - ./opencode-config/alice.opencode.json:/root/.config/opencode/opencode.json:ro
+    # hostname 0.0.0.0 (NOT 127.0.0.1) so the proxy container can reach it.
+    command: ["serve", "--hostname", "0.0.0.0", "--port", "4096"]
+    mem_limit: 4g          # "just enough" runtime caps; disk quota is separate (DEPLOY.md)
+    pids_limit: 512
+
+  opencode-bob:
+    build: { context: ./opencode }
+    image: opencode-slot:local
+    container_name: family-opencode-bob
+    restart: unless-stopped
+    working_dir: /workspaces/bob
+    networks: [family]
+    environment:
+      LLM_LAN_KEY: ${LLM_LAN_KEY:-}
+    volumes:
+      - ${WS_ROOT:-./ws}/bob:/workspaces/bob
+      - ./opencode-config/bob.opencode.json:/root/.config/opencode/opencode.json:ro
+    command: ["serve", "--hostname", "0.0.0.0", "--port", "4097"]
+    mem_limit: 4g
+    pids_limit: 512
+
+  # ---- Example SHARED, STATELESS HTTP MCP server -----------------------------
+  # Illustrates the "own container" MCP pattern: opencode reaches it by service
+  # DNS (http://mcp-example:8000/mcp) — no static IP needed, because a normal MCP
+  # server is request/response and never advertises a callback URL (unlike the
+  # proxy's file server).
+  #
+  # SAFE to share across slots ONLY because it is stateless. Do NOT point a
+  # shared server at user-scoped data — give stateful/sensitive tools a per-slot
+  # instance or run them stdio (see opencode-config/*.json → "filesystem").
+  #
+  # This wraps a stdio reference server as Streamable HTTP via supergateway.
+  # Flags vary by supergateway version — treat as a template and adjust. Disabled
+  # in opencode.json by default.
+  mcp-example:
+    image: node:22-bookworm-slim
+    container_name: family-mcp-example
+    restart: unless-stopped
+    networks: [family]
+    command: >
+      npx -y supergateway
+      --stdio "npx -y @modelcontextprotocol/server-everything"
+      --outputTransport streamableHttp
+      --port 8000
