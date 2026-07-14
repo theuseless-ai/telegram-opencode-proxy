@@ -33,7 +33,7 @@ In scope:
   proxy stores only routing (`chat_id → session_id`) + pending approvals.
 - **Streaming** assistant output (SSE → live message edits).
 - **Files both ways:** inbound (Telegram photo/doc → base64 `FilePart`);
-  outbound (outbox watcher + `/get`).
+  outbound (outbox watcher).
 - **Approval gate:** native opencode permission relay
   (`permission.asked` → Telegram buttons → `/permission/:id/reply`), delivering
   the **minutes → approve → commit** flow.
@@ -87,7 +87,7 @@ Documented as conscious deferrals, not oversights:
                        ▼
    ┌───────────────────────────────────────────────────────────────────────┐
    │  telegram/bot.rs   (teloxide dispatcher)                               │
-   │  • text msgs   • /new /whoami /get /stop   • callback_query (buttons)  │
+   │  • text msgs   • /new /whoami /stop   • callback_query (buttons)       │
    │  • inbound file download                                              │
    └───────┬──────────────────────────────────────────┬────────────────────┘
            │                                           │
@@ -155,7 +155,7 @@ Documented as conscious deferrals, not oversights:
 | `opencode/events.rs` | SSE `/event` subscribe + parse `session.next.*` + `permission.asked` |
 | `opencode/health.rs` | Readiness check on each opencode URL + reconnect. **Connect-only:** the proxy does **not** spawn opencode — instances are external (systemd / compose / `./dev.sh`) |
 | `opencode/types.rs` | API structs (codegen from `/doc`, behind a V1/V2 version adapter) |
-| `telegram/bot.rs` | teloxide dispatcher: messages, `/new` `/whoami` `/get` `/stop`, `callback_query`, file download |
+| `telegram/bot.rs` | teloxide dispatcher: messages, `/new` `/whoami` `/stop`, `callback_query`, file download |
 | `telegram/render.rs` | opencode output → TG msg; 4096 chunking; stream-edit throttle ~1/s |
 | `telegram/files.rs` | Inbound: TG file → base64 `FilePart` · Outbound: send_document/photo by mime |
 | `permission.rs` | `permission.asked` → inline keyboard → callback → reply (V1/V2 adapter) |
@@ -239,12 +239,12 @@ flight is queued. `/stop` maps to `POST /session/:id/abort` for explicit interru
   `callback_query` in `bot.rs` → `permission.rs` → `client.reply_permission`.
   opencode holds the agent turn blocked throughout — no resume machinery needed.
 - **Files:** inbound photo/doc → `files.rs` download + base64 → `FilePart` in the
-  prompt. Outbound → `outbox.rs` fires → `files.rs` sends. `/get <path>` guarded
-  by canonicalize-within-workdir.
+  prompt. Outbound → `outbox.rs` fires → `files.rs` sends, guarded by
+  canonicalize-within-workdir.
 
-  > **Constraint — the outbox watcher and `/get` assume the proxy and the slot's
-  > opencode share a filesystem** (same host, or a bind-mounted `workdir`): both
-  > read files by local path, so the proxy's `slot.workdir` must be the very
+  > **Constraint — the outbox watcher assumes the proxy and the slot's
+  > opencode share a filesystem** (same host, or a bind-mounted `workdir`): it
+  > reads files by local path, so the proxy's `slot.workdir` must be the very
   > directory opencode reads/writes. The prompt/stream path is HTTP and
   > host-independent, but these disk conventions are not. A future *file-server*
   > evolution (the proxy exposes HTTP upload/download — see the v0.1.0 backlog)
@@ -255,7 +255,7 @@ flight is queued. `/stop` maps to `POST /session/:id/abort` for explicit interru
   > **Superseded for outbound by §14 (#65):** the MCP `send_file_to_user` tool is
   > now the default outbound path — an HTTP tool call, not a shared-filesystem
   > watcher — so the constraint above no longer applies to outbound files. The
-  > outbox watcher + `/get` remain as the legacy path (still filesystem-coupled).
+  > outbox watcher remains as the legacy path (still filesystem-coupled).
   > Inbound is likewise HTTP-only now (a download URL, §14); the `FilePart` path
   > above survives only as the `filepart_fallback` config toggle.
 
@@ -351,7 +351,7 @@ filepart_fallback = false         # true = revert inbound to the #11 base64 File
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `true` | Start the MCP server task at all. `false` runs the proxy without file-transfer tools (#12's legacy disk-outbox + `/get` only). |
+| `enabled` | `true` | Start the MCP server task at all. `false` runs the proxy without file-transfer tools (#12's legacy disk-outbox only). |
 | `bind` | `127.0.0.1` | Listener address. No auth is implemented — the loopback bind **is** the trust boundary; do not widen without adding one. |
 | `port` | `4100` | Listener port. Same value for both `/mcp` and `/files/{id}` — one axum server hosts both. |
 | `max_file_bytes` | `20971520` (20 MiB) | Per-file cap for `send_file_to_user` and inbound storage, mirroring `telegram::files::MAX_INBOUND_BYTES`. |
@@ -479,7 +479,7 @@ conceptual categories.)*
 - **`typing`** — the ambient "bot is working" signal. Re-send every ~4s while
   `session.status: busy` (it auto-expires ~5s). This is **off** the message-edit
   budget, so "thinking" costs no edits and is not a message.
-- **`upload_document` / `upload_photo`** — fired right before an outbox / `/get`
+- **`upload_document` / `upload_photo`** — fired right before an outbox
   file send ("sending a file…").
 
 ### One live status line per turn (not a log, not a tree)
@@ -652,8 +652,6 @@ merges with any other `mcp`/`provider` config already in that workspace's
   → send) still runs and is unchanged — it is now the **legacy** outbound path,
   useful when the proxy and opencode share a filesystem — but
   `send_file_to_user` is the default a model actually reaches for.
-- **`/get` is unchanged** — still a proxy-side, filesystem-coupled command,
-  orthogonal to this feature.
 - **#11's base64 `FilePart` is kept as the inbound fallback**, gated by
   `[mcp].filepart_fallback` (or automatically when `[mcp].enabled = false`).
   The two inbound paths are mutually exclusive per message — both-on would
