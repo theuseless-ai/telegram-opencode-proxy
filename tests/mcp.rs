@@ -81,6 +81,7 @@ fn config_for(opencode_url: &str, slot: &str, chat: i64) -> Config {
         pairing: Pairing::default(),
         db_path: "proxy.db".into(),
         mcp: Mcp::default(),
+        admin: Default::default(),
     }
 }
 

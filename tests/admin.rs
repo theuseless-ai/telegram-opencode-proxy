@@ -83,6 +83,7 @@ fn cfg_with_model() -> Config {
         pairing: Pairing::default(),
         db_path: "unused.db".into(),
         mcp: Mcp::default(),
+        admin: Default::default(),
     }
 }
 

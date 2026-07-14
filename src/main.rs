@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -24,8 +24,13 @@ async fn main() -> Result<()> {
             let cfg = Config::load(&config_path)?;
             serve(cfg, config_path).await?;
         }
-        Command::Status { config, socket } => {
-            status(config, socket).await?;
+        Command::Status {
+            config,
+            socket,
+            admin_url,
+            token,
+        } => {
+            status(config, socket, admin_url, token).await?;
         }
         Command::Connect {
             name,
@@ -34,18 +39,37 @@ async fn main() -> Result<()> {
             telegram_id,
             config,
             socket,
+            admin_url,
+            token,
         } => {
-            connect(name, url, workdir, telegram_id, config, socket).await?;
+            connect(
+                name,
+                url,
+                workdir,
+                telegram_id,
+                config,
+                socket,
+                admin_url,
+                token,
+            )
+            .await?;
         }
-        Command::Slots { config, socket } => {
-            slots(config, socket).await?;
+        Command::Slots {
+            config,
+            socket,
+            admin_url,
+            token,
+        } => {
+            slots(config, socket, admin_url, token).await?;
         }
         Command::Pair {
             action,
             config,
             socket,
+            admin_url,
+            token,
         } => {
-            pair(action, config, socket).await?;
+            pair(action, config, socket, admin_url, token).await?;
         }
     }
     Ok(())
@@ -60,13 +84,44 @@ fn socket_path(config: PathBuf, socket: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
+/// Send one admin request over the right transport: the **HTTP API** when
+/// `--admin-url` is given (token from `--token` or the `TOPX_ADMIN_TOKEN` env
+/// var), otherwise the **local Unix socket** (`--socket` or the config's
+/// `admin_socket`). Shared by every client subcommand (#82).
+async fn send_admin(
+    config: PathBuf,
+    socket: Option<PathBuf>,
+    admin_url: Option<String>,
+    token: Option<String>,
+    req: AdminRequest,
+) -> Result<AdminResponse> {
+    match admin_url {
+        Some(url) => {
+            let token = token
+                .or_else(|| std::env::var("TOPX_ADMIN_TOKEN").ok())
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| {
+                    anyhow!("--admin-url needs a token: pass --token or set TOPX_ADMIN_TOKEN")
+                })?;
+            admin::send_request_http(&url, &token, &req).await
+        }
+        None => {
+            let socket_path = socket_path(config, socket)?;
+            admin::send_request(&socket_path, &req).await
+        }
+    }
+}
+
 /// `proxy status`: dial the running daemon's admin socket and print a slot
 /// table. The socket path comes from `--socket` if given, else from the config's
 /// `admin_socket`.
-async fn status(config: PathBuf, socket: Option<PathBuf>) -> Result<()> {
-    let socket_path = socket_path(config, socket)?;
-
-    match admin::send_request(&socket_path, &AdminRequest::Status).await? {
+async fn status(
+    config: PathBuf,
+    socket: Option<PathBuf>,
+    admin_url: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    match send_admin(config, socket, admin_url, token, AdminRequest::Status).await? {
         AdminResponse::Status { slots } => {
             println!("{:<16} {:<32} STATUS", "SLOT", "OPENCODE URL");
             for slot in slots {
@@ -82,6 +137,7 @@ async fn status(config: PathBuf, socket: Option<PathBuf>) -> Result<()> {
 
 /// `proxy connect <name>`: dial the running daemon and idempotently ensure the
 /// slot is connected. Prints the outcome; a daemon-side failure exits non-zero.
+#[allow(clippy::too_many_arguments)]
 async fn connect(
     name: String,
     url: Option<String>,
@@ -89,16 +145,16 @@ async fn connect(
     telegram_id: Option<i64>,
     config: PathBuf,
     socket: Option<PathBuf>,
+    admin_url: Option<String>,
+    token: Option<String>,
 ) -> Result<()> {
-    let socket_path = socket_path(config, socket)?;
-
     let req = AdminRequest::Connect {
         name,
         url,
         workdir,
         telegram_id,
     };
-    match admin::send_request(&socket_path, &req).await? {
+    match send_admin(config, socket, admin_url, token, req).await? {
         AdminResponse::Connect { name, outcome } => {
             let label = match outcome {
                 ConnectOutcome::Connected => "connected",
@@ -116,10 +172,13 @@ async fn connect(
 /// `proxy slots`: dial the running daemon and print the per-slot inventory —
 /// name, opencode URL, workdir, the Telegram ids bound to it, and reachability.
 /// This is how an admin picks a `--slot`. Since #45 every slot is config-sourced.
-async fn slots(config: PathBuf, socket: Option<PathBuf>) -> Result<()> {
-    let socket_path = socket_path(config, socket)?;
-
-    match admin::send_request(&socket_path, &AdminRequest::Slots).await? {
+async fn slots(
+    config: PathBuf,
+    socket: Option<PathBuf>,
+    admin_url: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    match send_admin(config, socket, admin_url, token, AdminRequest::Slots).await? {
         AdminResponse::Slots { slots } => {
             println!(
                 "{:<14} {:<6} {:<28} {:<20} TELEGRAM IDS",
@@ -150,39 +209,44 @@ async fn slots(config: PathBuf, socket: Option<PathBuf>) -> Result<()> {
 
 /// `proxy pair list|approve|deny`: the admin enrolment client (#4b). Dials the
 /// running daemon and prints the outcome; a daemon-side failure exits non-zero.
-async fn pair(action: PairAction, config: PathBuf, socket: Option<PathBuf>) -> Result<()> {
-    let socket_path = socket_path(config, socket)?;
-
+async fn pair(
+    action: PairAction,
+    config: PathBuf,
+    socket: Option<PathBuf>,
+    admin_url: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
     match action {
-        PairAction::List => match admin::send_request(&socket_path, &AdminRequest::PairList).await?
-        {
-            AdminResponse::PairList { pending } => {
-                if pending.is_empty() {
-                    println!("No pending pairing requests.");
-                    return Ok(());
+        PairAction::List => {
+            match send_admin(config, socket, admin_url, token, AdminRequest::PairList).await? {
+                AdminResponse::PairList { pending } => {
+                    if pending.is_empty() {
+                        println!("No pending pairing requests.");
+                        return Ok(());
+                    }
+                    println!("{:<8} {:<20} {:<12} AGE", "CODE", "USERNAME", "CHAT ID");
+                    for entry in pending {
+                        let username = entry
+                            .username
+                            .map(|u| format!("@{u}"))
+                            .unwrap_or_else(|| "-".to_string());
+                        println!(
+                            "{:<8} {:<20} {:<12} {}",
+                            entry.code,
+                            username,
+                            entry.chat_id,
+                            format_age(entry.age_secs)
+                        );
+                    }
+                    Ok(())
                 }
-                println!("{:<8} {:<20} {:<12} AGE", "CODE", "USERNAME", "CHAT ID");
-                for entry in pending {
-                    let username = entry
-                        .username
-                        .map(|u| format!("@{u}"))
-                        .unwrap_or_else(|| "-".to_string());
-                    println!(
-                        "{:<8} {:<20} {:<12} {}",
-                        entry.code,
-                        username,
-                        entry.chat_id,
-                        format_age(entry.age_secs)
-                    );
-                }
-                Ok(())
+                AdminResponse::Error { message } => bail!("daemon returned an error: {message}"),
+                other => bail!("unexpected response from daemon: {other:?}"),
             }
-            AdminResponse::Error { message } => bail!("daemon returned an error: {message}"),
-            other => bail!("unexpected response from daemon: {other:?}"),
-        },
+        }
         PairAction::Approve { code, slot } => {
             let req = AdminRequest::PairApprove { code, slot };
-            match admin::send_request(&socket_path, &req).await? {
+            match send_admin(config, socket, admin_url, token, req).await? {
                 AdminResponse::PairApprove {
                     code,
                     chat_id,
@@ -201,7 +265,7 @@ async fn pair(action: PairAction, config: PathBuf, socket: Option<PathBuf>) -> R
         }
         PairAction::Deny { code } => {
             let req = AdminRequest::PairDeny { code };
-            match admin::send_request(&socket_path, &req).await? {
+            match send_admin(config, socket, admin_url, token, req).await? {
                 AdminResponse::PairDeny { code, removed } => {
                     if removed {
                         println!("denied {code}: pending request dropped");

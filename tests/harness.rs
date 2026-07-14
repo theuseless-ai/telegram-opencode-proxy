@@ -65,6 +65,7 @@ fn config_for(opencode_url: &str) -> Config {
         pairing: Pairing::default(),
         db_path: "proxy.db".into(),
         mcp: Mcp::default(),
+        admin: Default::default(),
     }
 }
 
