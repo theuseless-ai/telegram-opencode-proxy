@@ -578,6 +578,39 @@ async fn nested_subagent_resolves_once_and_is_cached() {
     );
 }
 
+/// A chain deeper than the resolver's depth cap is **not** surfaced — and,
+/// critically, isn't cached as foreign either, so it doesn't poison a later,
+/// shallower gate that could otherwise resolve.
+///
+/// The relay's `MAX_PARENT_DEPTH` walk gives up after 8 hops. A session 9 hops
+/// from the turn's root is beyond that: if the resolver conflated "gave up"
+/// with "proven foreign", this gate would be permanently (and wrongly)
+/// silenced, and so would any shallower ancestor on the walked path.
+#[tokio::test]
+async fn deeply_nested_subagent_beyond_depth_cap_is_not_surfaced() {
+    let (_oc, tg, db) = permission_turn(vec![ask_frame("per_far", "ses_lvl9", "df")], |oc| {
+        // ses_lvl9 -> ses_lvl8 -> ... -> ses_lvl1 -> SESSION: 9 hops to root,
+        // one past the 8-hop cap.
+        oc.set_subagent_session("ses_lvl1", SESSION, Some("motoko"));
+        for lvl in 2..=9 {
+            let id = format!("ses_lvl{lvl}");
+            let parent = format!("ses_lvl{}", lvl - 1);
+            oc.set_subagent_session(&id, &parent, Some("motoko"));
+        }
+    })
+    .await;
+
+    assert!(
+        !tg.sent_messages().iter().any(|m| m.text.contains("🔐")),
+        "a gate beyond the depth cap must not prompt, got {:?}",
+        tg.sent_messages()
+    );
+    assert!(
+        db.list_approvals().unwrap().is_empty(),
+        "no approval row should be stored for a gate beyond the depth cap"
+    );
+}
+
 /// A gate from a session this turn doesn't own is left alone (#88).
 ///
 /// `/global/event` is instance-wide, so every concurrent turn sees this frame.

@@ -238,6 +238,19 @@ impl MockOpencode {
             .insert(id.to_string(), json!({ "id": id }));
     }
 
+    /// Serve `id` from `GET /session/:id` as `200` with a body that fails to
+    /// deserialize into `SessionResponse` (`id` isn't a string) — used to check
+    /// that `session_exists` treats a malformed-but-2xx response as "exists"
+    /// rather than propagating a decode error, unlike `get_session`, which
+    /// needs the decoded shape (#89).
+    #[allow(dead_code)]
+    pub fn set_undecodable_session(&self, id: &str) {
+        self.registered
+            .lock()
+            .expect("mock_opencode registered lock")
+            .insert(id.to_string(), json!({ "id": 12345 }));
+    }
+
     /// How many `GET /session/:id` requests `id` has received (#88 memoization).
     #[allow(dead_code)]
     pub fn session_lookups(&self, id: &str) -> u64 {

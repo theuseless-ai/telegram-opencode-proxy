@@ -184,8 +184,25 @@ impl OpencodeClient {
 
     /// Probe whether opencode still knows this session — `false` on a `404`, so
     /// callers can transparently recreate a session a wiped DB has forgotten.
+    ///
+    /// Deliberately checks only the status code rather than delegating to
+    /// [`get_session`](Self::get_session): that call decodes the body into
+    /// [`SessionResponse`], so a `2xx` with a body that fails to deserialize
+    /// would surface as an `Err` here — turning a session recreate (the
+    /// intended fallback below in [`get_or_create`](crate::session::get_or_create))
+    /// into a hard failure of the whole turn. A `2xx` status is all this needs.
     pub async fn session_exists(&self, session_id: &str) -> Result<bool> {
-        Ok(self.get_session(session_id).await?.is_some())
+        let resp = self
+            .http
+            .get(self.url(&format!("/session/{session_id}")))
+            .send()
+            .await
+            .context("GET /session/:id")?;
+        match resp.status() {
+            StatusCode::NOT_FOUND => Ok(false),
+            s if s.is_success() => Ok(true),
+            s => bail!("GET /session/{session_id} returned {s}"),
+        }
     }
 
     /// `POST /session/:id/abort` — interrupt the session's in-flight turn (the

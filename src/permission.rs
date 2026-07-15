@@ -92,12 +92,20 @@ impl TurnScope {
         let mut chain: Vec<(String, Option<String>)> = Vec::new();
         let mut cursor = session_id.to_string();
         let mut owned = false;
+        // Whether the walk reached a conclusive outcome (root match, a proven
+        // foreign root, or an already-cached ancestor) before the depth cap.
+        // Exhausting the cap without one means we don't actually know — that
+        // must NOT be conflated with a proven-foreign verdict below.
+        let mut concluded = false;
 
         for _ in 0..MAX_PARENT_DEPTH {
             let session = match client.get_session(&cursor).await {
                 Ok(Some(session)) => session,
                 // Unknown to this instance — nothing to attribute it to.
-                Ok(None) => break,
+                Ok(None) => {
+                    concluded = true;
+                    break;
+                }
                 Err(err) => {
                     // Leave the chain uncached so a later gate retries rather
                     // than inheriting a verdict we never actually established.
@@ -112,21 +120,42 @@ impl TurnScope {
             chain.push((cursor.clone(), session.agent.clone()));
             match session.parent_id {
                 // A root that isn't ours: another chat's turn, or another client.
-                None => break,
+                None => {
+                    concluded = true;
+                    break;
+                }
                 Some(parent) if parent == self.root => {
                     owned = true;
+                    concluded = true;
                     break;
                 }
                 Some(parent) => match self.seen.get(&parent) {
                     // Inherit a verdict already settled for an ancestor.
                     Some(Some(_)) => {
                         owned = true;
+                        concluded = true;
                         break;
                     }
-                    Some(None) => break,
+                    Some(None) => {
+                        concluded = true;
+                        break;
+                    }
                     None => cursor = parent,
                 },
             }
+        }
+
+        if !concluded {
+            // The chain is deeper than MAX_PARENT_DEPTH (or, in practice, opencode
+            // handed back a cycle). Caching these as foreign would be wrong — we
+            // never actually proved that — and would poison any shallower
+            // ancestor that a later, shorter walk could otherwise resolve.
+            tracing::warn!(
+                session_id,
+                depth = MAX_PARENT_DEPTH,
+                "permission session's parentID chain exceeded the depth cap — not surfacing this gate"
+            );
+            return None;
         }
 
         // Every session on the walked path shares the root's verdict, so one
