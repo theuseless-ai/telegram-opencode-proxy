@@ -210,7 +210,8 @@ impl ProvidersResponse {
 // Responses
 // ---------------------------------------------------------------------------
 
-/// Response from `POST /session` (subset of the `Session` schema we care about).
+/// Response from `POST /session` / `GET /session/:id` (subset of the `Session`
+/// schema we care about).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionResponse {
     pub id: String,
@@ -218,6 +219,15 @@ pub struct SessionResponse {
     pub title: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
+    /// The spawning session, set only on a Task-spawned subagent session. The
+    /// permission relay walks this to map a subagent's `permission.asked` back
+    /// to the turn (and so the chat) that ultimately owns it (#88).
+    #[serde(rename = "parentID", default)]
+    pub parent_id: Option<String>,
+    /// The agent driving this session (e.g. `"motoko"`), used to name the asking
+    /// subagent in the approval prompt (#88).
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 /// One `{ info, parts }` message envelope, as returned by

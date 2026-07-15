@@ -158,10 +158,13 @@ impl OpencodeClient {
             .context("decoding message list")
     }
 
-    /// `GET /session/:id` — probe whether opencode still knows this session.
-    /// A `404` (e.g. a wiped opencode DB) maps to `Ok(false)` so callers can
-    /// transparently recreate; other non-success statuses are errors.
-    pub async fn session_exists(&self, session_id: &str) -> Result<bool> {
+    /// `GET /session/:id` — fetch a session. A `404` (e.g. a wiped opencode DB,
+    /// or an id from another instance) maps to `Ok(None)` so callers can decide
+    /// what an unknown session means; other non-success statuses are errors.
+    ///
+    /// The response carries `parentID`, which the permission relay walks to
+    /// attribute a subagent's gate to the turn that spawned it (#88).
+    pub async fn get_session(&self, session_id: &str) -> Result<Option<SessionResponse>> {
         let resp = self
             .http
             .get(self.url(&format!("/session/{session_id}")))
@@ -169,10 +172,20 @@ impl OpencodeClient {
             .await
             .context("GET /session/:id")?;
         match resp.status() {
-            StatusCode::NOT_FOUND => Ok(false),
-            s if s.is_success() => Ok(true),
+            StatusCode::NOT_FOUND => Ok(None),
+            s if s.is_success() => resp
+                .json::<SessionResponse>()
+                .await
+                .context("decoding session response")
+                .map(Some),
             s => bail!("GET /session/{session_id} returned {s}"),
         }
+    }
+
+    /// Probe whether opencode still knows this session — `false` on a `404`, so
+    /// callers can transparently recreate a session a wiped DB has forgotten.
+    pub async fn session_exists(&self, session_id: &str) -> Result<bool> {
+        Ok(self.get_session(session_id).await?.is_some())
     }
 
     /// `POST /session/:id/abort` — interrupt the session's in-flight turn (the

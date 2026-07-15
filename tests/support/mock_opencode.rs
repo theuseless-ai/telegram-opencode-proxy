@@ -10,7 +10,8 @@
 //! | `GET  /config`                | `200 {}` — readiness probe.                        |
 //! | `GET  /config/providers`      | provider catalogue; two variants (see below).      |
 //! | `POST /session`               | mints `ses_mock_<n>`, records it, returns it.      |
-//! | `GET  /session/:id`           | `200` if the id was minted here, else `404`.       |
+//! | `GET  /session/:id`           | a test-registered body (`parentID`/`agent`, #88),  |
+//! |                               | else `200` if minted here, else `404`.             |
 //! | `PATCH /session/:id`          | `200 {}` — the deny-posture PATCH.                 |
 //! | `POST /session/:id/message`   | canned completed [`MessageEnvelope`]; echoes the   |
 //! |                               | prompt, or a fixed reply set via [`set_reply`].    |
@@ -27,7 +28,7 @@
 //! [`MessageEnvelope`]: telegram_opencode_proxy::opencode::types::MessageEnvelope
 //! [`set_reply`]: MockOpencode::set_reply
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -55,6 +56,13 @@ struct OcState {
     reply: Arc<Mutex<Option<String>>>,
     /// Session ids minted by `POST /session` (so `GET /session/:id` can 404).
     sessions: Arc<Mutex<HashSet<String>>>,
+    /// Sessions registered by a test, id → the `GET /session/:id` body. Checked
+    /// before the minted-id set, so a test can give a session a `parentID` /
+    /// `agent` and drive the subagent permission relay (#88).
+    registered: Arc<Mutex<HashMap<String, Value>>>,
+    /// Count of `GET /session/:id` requests per session id — lets a test assert
+    /// the relay memoizes a parentage lookup instead of re-walking it per gate.
+    session_lookups: Arc<Mutex<HashMap<String, u64>>>,
     /// Monotonic counter for minted session ids.
     next_id: Arc<AtomicU64>,
     /// Number of remaining `GET /config` requests that must answer `503`
@@ -94,6 +102,8 @@ struct OcState {
 pub struct MockOpencode {
     /// Base URL to point `OpencodeClient` / `Slot.opencode_url` at.
     pub url: String,
+    registered: Arc<Mutex<HashMap<String, Value>>>,
+    session_lookups: Arc<Mutex<HashMap<String, u64>>>,
     reply: Arc<Mutex<Option<String>>>,
     event_body: Arc<Mutex<Option<String>>>,
     event_connections: Arc<AtomicU64>,
@@ -202,6 +212,43 @@ impl MockOpencode {
             .clone()
     }
 
+    /// Serve `id` from `GET /session/:id` as a Task-spawned child of `parent`,
+    /// driven by `agent` — the shape the permission relay walks to attribute a
+    /// subagent's gate to the turn that spawned it (#88). Pass `agent: None` for
+    /// an opencode build that reports no agent on the session.
+    #[allow(dead_code)]
+    pub fn set_subagent_session(&self, id: &str, parent: &str, agent: Option<&str>) {
+        let mut body = json!({ "id": id, "parentID": parent });
+        if let Some(agent) = agent {
+            body["agent"] = json!(agent);
+        }
+        self.registered
+            .lock()
+            .expect("mock_opencode registered lock")
+            .insert(id.to_string(), body);
+    }
+
+    /// Serve `id` from `GET /session/:id` as a **root** session (no `parentID`)
+    /// — someone else's turn, whose gates this proxy must not answer (#88).
+    #[allow(dead_code)]
+    pub fn set_root_session(&self, id: &str) {
+        self.registered
+            .lock()
+            .expect("mock_opencode registered lock")
+            .insert(id.to_string(), json!({ "id": id }));
+    }
+
+    /// How many `GET /session/:id` requests `id` has received (#88 memoization).
+    #[allow(dead_code)]
+    pub fn session_lookups(&self, id: &str) -> u64 {
+        self.session_lookups
+            .lock()
+            .expect("mock_opencode lookups lock")
+            .get(id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// `(permission_id, reply)` pairs sent to `POST /permission/:id/reply` (#13).
     #[allow(dead_code)]
     pub fn permission_replies(&self) -> Vec<(String, String)> {
@@ -223,10 +270,15 @@ impl MockOpencode {
         let permission_replies: Arc<Mutex<Vec<(String, String)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let reply_tokens = Arc::new(AtomicU64::new(0));
+        let registered: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
+        let session_lookups: Arc<Mutex<HashMap<String, u64>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let state = OcState {
             include_model,
             reply: Arc::clone(&reply),
             reply_tokens: Arc::clone(&reply_tokens),
+            registered: Arc::clone(&registered),
+            session_lookups: Arc::clone(&session_lookups),
             sessions: Arc::new(Mutex::new(HashSet::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             config_fails: Arc::new(AtomicU64::new(config_fails)),
@@ -264,6 +316,8 @@ impl MockOpencode {
 
         Self {
             url: format!("http://{addr}"),
+            registered,
+            session_lookups,
             reply,
             event_body,
             event_connections,
@@ -345,8 +399,24 @@ async fn create_session(State(st): State<OcState>, _body: Bytes) -> impl IntoRes
     Json(json!({ "id": id, "title": null, "version": "1.17.18" }))
 }
 
-/// `GET /session/:id` — `200` for a known id, `404` otherwise (drives recreate).
+/// `GET /session/:id` — a test-registered body (with `parentID`/`agent`, #88)
+/// if there is one, else `200` for a minted id and `404` otherwise (which drives
+/// the recreate path).
 async fn get_session(State(st): State<OcState>, Path(id): Path<String>) -> Response {
+    *st.session_lookups
+        .lock()
+        .expect("mock_opencode lookups lock")
+        .entry(id.clone())
+        .or_insert(0) += 1;
+
+    if let Some(body) = st
+        .registered
+        .lock()
+        .expect("mock_opencode registered lock")
+        .get(&id)
+    {
+        return (StatusCode::OK, Json(body.clone())).into_response();
+    }
     if st
         .sessions
         .lock()
