@@ -84,6 +84,9 @@ pub async fn run_streaming_turn(
     let mut state = LiveState::new(verbosity).with_context_limit(context_limit);
     // Part ids known to be reasoning — their deltas drive `typing`, not the answer.
     let mut reasoning_parts: HashSet<String> = HashSet::new();
+    // Decides which of the instance-wide gates this turn owns, incl. those from
+    // subagent sessions it spawned (#88).
+    let mut scope = permission::TurnScope::new(session_id);
     let mut sink = LiveSink::new(bot, chat_id);
 
     let prompt = client.prompt(session_id, model, parts);
@@ -110,8 +113,13 @@ pub async fn run_streaming_turn(
                 // A permission gate for this turn (#13): post the approval buttons.
                 // opencode holds the prompt blocked until the user taps one, which
                 // the dispatcher answers via `reply_permission`.
-                Some(Event::Permission(p)) if p.session_id == session_id => {
-                    if let Err(err) = permission::prompt(bot, db, chat_id, &p).await {
+                Some(Event::Permission(p)) => {
+                    // `/global/event` carries every session's gates, so resolve
+                    // whose turn this one belongs to — ours directly, ours via a
+                    // Task-spawned subagent (#88), or another chat's to answer.
+                    if let Some(origin) = scope.resolve(client, &p.session_id).await
+                        && let Err(err) = permission::prompt(bot, db, chat_id, &p, &origin).await
+                    {
                         tracing::warn!(error = %err, "posting permission prompt failed");
                     }
                 }

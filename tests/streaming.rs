@@ -427,3 +427,273 @@ async fn permission_asked_posts_approval_buttons() {
         "an approval row should be stored"
     );
 }
+
+/// Drive one turn against a canned set of `permission.asked` frames and return
+/// `(mock telegram, db)` for assertions. `setup` registers whatever session
+/// parentage the case needs before the turn runs.
+async fn permission_turn(
+    frames: Vec<serde_json::Value>,
+    setup: impl FnOnce(&MockOpencode),
+) -> (
+    MockOpencode,
+    MockTelegram,
+    telegram_opencode_proxy::persistence::Db,
+) {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    setup(&oc);
+    oc.set_reply("done");
+    // Hold the blocking POST open so every gate streams before the turn ends.
+    oc.set_message_delay(Duration::from_millis(400));
+    let mut sse = vec![frame(serde_json::json!({
+        "type": "server.connected", "properties": {}
+    }))];
+    sse.extend(frames.into_iter().map(frame));
+    oc.set_event_frames(sse, Duration::from_millis(20));
+
+    let bot = Bot::new("test-token").set_api_url(tg.url.parse().expect("mock url"));
+    let http = reqwest::Client::new();
+    let client = OpencodeClient::new(&oc.url).expect("client");
+    let db = telegram_opencode_proxy::persistence::Db::open_in_memory().expect("db");
+    let model = PromptModel {
+        provider_id: "llm-lan".into(),
+        model_id: "Qwen3.6-35B-A3B-bf16".into(),
+    };
+
+    run_streaming_turn(
+        &bot,
+        &http,
+        &client,
+        &db,
+        &oc.url,
+        CHAT_ID,
+        SESSION,
+        model,
+        text_parts("delegate please"),
+        Verbosity::Normal,
+        None,
+        StreamTiming {
+            flush_interval: Duration::from_millis(10),
+            typing_interval: Duration::from_millis(20),
+            retry: Duration::from_secs(5),
+        },
+    )
+    .await
+    .expect("streaming turn");
+
+    (oc, tg, db)
+}
+
+/// A `permission.asked` frame for `session`, gating `command`.
+fn ask_frame(id: &str, session: &str, command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "permission.asked",
+        "properties": {
+            "id": id,
+            "sessionID": session,
+            "permission": "bash",
+            "patterns": [command],
+            "metadata": { "command": command },
+            "tool": { "messageID": "msg_a", "callID": "call_1" }
+        }
+    })
+}
+
+/// A gate raised by a **Task-spawned subagent** surfaces the same approval
+/// buttons the main session gets, named for the asking agent (#88).
+///
+/// This is the issue's repro: the gate names only the *child* session, so the
+/// relay has to walk `parentID` back to the turn. Matching the turn's session id
+/// directly dropped it, and the subagent blocked until the delegation failed.
+#[tokio::test]
+async fn subagent_permission_asked_posts_approval_buttons() {
+    let (_oc, tg, db) = permission_turn(vec![ask_frame("per_sub", "ses_child", "df")], |oc| {
+        oc.set_subagent_session("ses_child", SESSION, Some("motoko"));
+    })
+    .await;
+
+    let prompts: Vec<String> = tg
+        .sent_messages()
+        .iter()
+        .filter(|m| m.text.contains("🔐"))
+        .map(|m| m.text.clone())
+        .collect();
+    assert_eq!(
+        prompts.len(),
+        1,
+        "the subagent's gate should post exactly one prompt, got {:?}",
+        tg.sent_messages()
+    );
+    // The asking subagent is named — approving a delegated command shouldn't be
+    // indistinguishable from approving the primary agent's own.
+    assert!(
+        prompts[0].contains("motoko") && prompts[0].contains("df"),
+        "the prompt should name the agent and the command, got {:?}",
+        prompts[0]
+    );
+    assert!(
+        tg.markup_messages() >= 1,
+        "the prompt should carry an inline keyboard"
+    );
+    // Recorded against the child session, so the callback replies to that gate.
+    assert!(
+        db.list_approvals()
+            .unwrap()
+            .iter()
+            .any(|a| a.session_id == "ses_child" && a.token == "per_sub"),
+        "an approval row should be stored for the subagent's gate"
+    );
+}
+
+/// A subagent nested under another subagent still resolves to the turn, and the
+/// walk is memoized rather than re-run per gate (#88).
+#[tokio::test]
+async fn nested_subagent_resolves_once_and_is_cached() {
+    let (oc, tg, _db) = permission_turn(
+        vec![
+            ask_frame("per_deep_1", "ses_grandchild", "df"),
+            ask_frame("per_deep_2", "ses_grandchild", "du"),
+        ],
+        |oc| {
+            oc.set_subagent_session("ses_child", SESSION, Some("motoko"));
+            oc.set_subagent_session("ses_grandchild", "ses_child", Some("batou"));
+        },
+    )
+    .await;
+
+    assert_eq!(
+        tg.sent_messages()
+            .iter()
+            .filter(|m| m.text.contains("🔐"))
+            .count(),
+        2,
+        "both of the grandchild's gates should prompt, got {:?}",
+        tg.sent_messages()
+    );
+    // Parentage is immutable, so the second gate must reuse the first's verdict.
+    assert_eq!(
+        oc.session_lookups("ses_grandchild"),
+        1,
+        "the second gate should hit the memoized verdict, not re-walk the chain"
+    );
+}
+
+/// A chain deeper than the resolver's depth cap is **not** surfaced — and,
+/// critically, isn't cached as foreign either, so it doesn't poison a later,
+/// shallower gate that could otherwise resolve.
+///
+/// The relay's `MAX_PARENT_DEPTH` walk gives up after 8 hops. A session 9 hops
+/// from the turn's root is beyond that: if the resolver conflated "gave up"
+/// with "proven foreign", this gate would be permanently (and wrongly)
+/// silenced, and so would any shallower ancestor on the walked path.
+#[tokio::test]
+async fn deeply_nested_subagent_beyond_depth_cap_is_not_surfaced() {
+    let (_oc, tg, db) = permission_turn(vec![ask_frame("per_far", "ses_lvl9", "df")], |oc| {
+        // ses_lvl9 -> ses_lvl8 -> ... -> ses_lvl1 -> SESSION: 9 hops to root,
+        // one past the 8-hop cap.
+        oc.set_subagent_session("ses_lvl1", SESSION, Some("motoko"));
+        for lvl in 2..=9 {
+            let id = format!("ses_lvl{lvl}");
+            let parent = format!("ses_lvl{}", lvl - 1);
+            oc.set_subagent_session(&id, &parent, Some("motoko"));
+        }
+    })
+    .await;
+
+    assert!(
+        !tg.sent_messages().iter().any(|m| m.text.contains("🔐")),
+        "a gate beyond the depth cap must not prompt, got {:?}",
+        tg.sent_messages()
+    );
+    assert!(
+        db.list_approvals().unwrap().is_empty(),
+        "no approval row should be stored for a gate beyond the depth cap"
+    );
+}
+
+/// A gate from a session this turn doesn't own is left alone (#88).
+///
+/// `/global/event` is instance-wide, so every concurrent turn sees this frame.
+/// Prompting on it would make another chat's gate answerable here — and have two
+/// chats race to reply to one gate.
+#[tokio::test]
+async fn foreign_session_permission_is_not_surfaced() {
+    let (_oc, tg, db) = permission_turn(
+        vec![
+            ask_frame("per_other", "ses_other_chat", "rm -rf /"),
+            ask_frame("per_other_sub", "ses_other_child", "rm -rf /"),
+        ],
+        |oc| {
+            // Another chat's turn, and a subagent of it.
+            oc.set_root_session("ses_other_chat");
+            oc.set_subagent_session("ses_other_child", "ses_other_chat", Some("motoko"));
+        },
+    )
+    .await;
+
+    assert!(
+        !tg.sent_messages().iter().any(|m| m.text.contains("🔐")),
+        "another turn's gates must not prompt here, got {:?}",
+        tg.sent_messages()
+    );
+    assert!(
+        db.list_approvals().unwrap().is_empty(),
+        "no approval row should be stored for a foreign gate"
+    );
+}
+
+/// An unknown session (404 — e.g. an id from another opencode instance) is not
+/// surfaced, and doesn't take the turn down with it (#88).
+#[tokio::test]
+async fn unresolvable_session_permission_is_not_surfaced() {
+    let (_oc, tg, _db) =
+        permission_turn(vec![ask_frame("per_ghost", "ses_ghost", "df")], |_| {}).await;
+
+    assert!(
+        !tg.sent_messages().iter().any(|m| m.text.contains("🔐")),
+        "an unresolvable gate must not prompt, got {:?}",
+        tg.sent_messages()
+    );
+}
+
+/// The depth-cap walk must not POISON the cache: a chain deeper than the cap is
+/// inconclusive, not proven-foreign. If the too-deep walk caches every session it
+/// touched as foreign, a later gate from a shallow session on that same chain --
+/// which IS a legitimate descendant of this turn -- gets silently swallowed.
+///
+/// ses_lvl9 -> ... -> ses_lvl1 -> SESSION. A gate from ses_lvl9 is 9 hops (past the
+/// 8-hop cap) and must stay silent. A gate from ses_lvl2 is only 2 hops and MUST
+/// prompt -- but the too-deep walk passed straight through ses_lvl2 on its way up.
+#[tokio::test]
+async fn deep_walk_does_not_poison_a_shallow_sibling_on_the_same_chain() {
+    let (_oc, tg, _db) = permission_turn(
+        vec![
+            ask_frame("per_far", "ses_lvl9", "df"),
+            ask_frame("per_near", "ses_lvl2", "ls"),
+        ],
+        |oc| {
+            oc.set_subagent_session("ses_lvl1", SESSION, Some("motoko"));
+            for lvl in 2..=9 {
+                let id = format!("ses_lvl{lvl}");
+                let parent = format!("ses_lvl{}", lvl - 1);
+                oc.set_subagent_session(&id, &parent, Some("motoko"));
+            }
+        },
+    )
+    .await;
+
+    let prompts: Vec<_> = tg
+        .sent_messages()
+        .into_iter()
+        .filter(|m| m.text.contains("🔐"))
+        .collect();
+    assert_eq!(
+        prompts.len(),
+        1,
+        "the 2-hop gate must still prompt after the 9-hop walk passed through it; got {prompts:?}"
+    );
+    assert!(
+        prompts[0].text.contains("ls"),
+        "the surfaced gate should be the shallow one (`ls`), got {prompts:?}"
+    );
+}
