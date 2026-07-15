@@ -655,3 +655,45 @@ async fn unresolvable_session_permission_is_not_surfaced() {
         tg.sent_messages()
     );
 }
+
+/// The depth-cap walk must not POISON the cache: a chain deeper than the cap is
+/// inconclusive, not proven-foreign. If the too-deep walk caches every session it
+/// touched as foreign, a later gate from a shallow session on that same chain --
+/// which IS a legitimate descendant of this turn -- gets silently swallowed.
+///
+/// ses_lvl9 -> ... -> ses_lvl1 -> SESSION. A gate from ses_lvl9 is 9 hops (past the
+/// 8-hop cap) and must stay silent. A gate from ses_lvl2 is only 2 hops and MUST
+/// prompt -- but the too-deep walk passed straight through ses_lvl2 on its way up.
+#[tokio::test]
+async fn deep_walk_does_not_poison_a_shallow_sibling_on_the_same_chain() {
+    let (_oc, tg, _db) = permission_turn(
+        vec![
+            ask_frame("per_far", "ses_lvl9", "df"),
+            ask_frame("per_near", "ses_lvl2", "ls"),
+        ],
+        |oc| {
+            oc.set_subagent_session("ses_lvl1", SESSION, Some("motoko"));
+            for lvl in 2..=9 {
+                let id = format!("ses_lvl{lvl}");
+                let parent = format!("ses_lvl{}", lvl - 1);
+                oc.set_subagent_session(&id, &parent, Some("motoko"));
+            }
+        },
+    )
+    .await;
+
+    let prompts: Vec<_> = tg
+        .sent_messages()
+        .into_iter()
+        .filter(|m| m.text.contains("🔐"))
+        .collect();
+    assert_eq!(
+        prompts.len(),
+        1,
+        "the 2-hop gate must still prompt after the 9-hop walk passed through it; got {prompts:?}"
+    );
+    assert!(
+        prompts[0].text.contains("ls"),
+        "the surfaced gate should be the shallow one (`ls`), got {prompts:?}"
+    );
+}
