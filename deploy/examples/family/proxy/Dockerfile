@@ -11,7 +11,10 @@ RUN apk add --no-cache build-base musl-dev openssl-dev openssl-libs-static pkgco
 ENV OPENSSL_STATIC=1
 WORKDIR /src
 COPY . .
-RUN cargo build --release --bin telegram-opencode-proxy
+# --locked: build EXACTLY the committed Cargo.lock. Without it a rebuild can
+# silently resolve newer deps, so the image you ship is not the image you
+# tested — and an upstream default can change under you between builds.
+RUN cargo build --release --locked --bin telegram-opencode-proxy
 
 # ---- runtime: Alpine (ca-certificates for outbound TLS to Telegram / the LLM) ----
 FROM alpine:3.20
