@@ -57,6 +57,8 @@ use axum::http::{StatusCode, header};
 use axum::response::Response;
 use axum::routing::get;
 use base64::Engine;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
 use base64::engine::general_purpose::STANDARD;
 use rmcp::{
     ErrorData, ServerHandler,
@@ -309,6 +311,41 @@ fn plain(status: StatusCode, body: &'static str) -> Response {
 ///
 /// `ct` is the caller's cancellation token, wired for graceful shutdown by
 /// `serve()` (#65 T7). axum 0.8 path params use the `{id}` brace syntax.
+/// Host values the MCP listener will answer to, for rmcp's DNS-rebinding guard.
+///
+/// rmcp validates the request's `Host` header against `allowed_hosts` and answers
+/// `403 Forbidden: Host header is not allowed` otherwise. Its default list is only
+/// `localhost` / `127.0.0.1` / `::1` — which is wrong for us the moment `[mcp].bind`
+/// is anything else, and `[mcp].bind` exists *precisely* so opencode containers on
+/// another host can route to this listener (the family deploy pins it to
+/// `172.28.0.10`, matching each slot's `opencode.json`). Those clients send
+/// `Host: 172.28.0.10:4100`, which the default list rejects — and because the
+/// rejection happens at the transport, opencode simply never completes the MCP
+/// handshake and every file-transfer tool silently disappears from the model. The
+/// only symptom is the absence of a tool.
+///
+/// So: allow whatever we actually bound, with and without the port, plus the
+/// loopback names so a default (`127.0.0.1`) deploy keeps working. `SocketAddr`'s
+/// `Display` handles IPv6 bracketing (`[::1]:4100`).
+fn allowed_hosts(bind: IpAddr, port: u16) -> Vec<String> {
+    let mut hosts = vec![
+        bind.to_string(),
+        SocketAddr::new(bind, port).to_string(),
+        "localhost".to_string(),
+        format!("localhost:{port}"),
+    ];
+    for loopback in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        hosts.push(loopback.to_string());
+        hosts.push(SocketAddr::new(loopback, port).to_string());
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
 pub fn build_router(app: Arc<AppState>, ct: CancellationToken) -> axum::Router {
     let mcp_app = app.clone();
     let svc = StreamableHttpService::new(
@@ -317,7 +354,8 @@ pub fn build_router(app: Arc<AppState>, ct: CancellationToken) -> axum::Router {
         StreamableHttpServerConfig::default()
             .with_stateful_mode(false)
             .with_json_response(true)
-            .with_cancellation_token(ct),
+            .with_cancellation_token(ct)
+            .with_allowed_hosts(allowed_hosts(app.cfg.mcp.bind, app.cfg.mcp.port)),
     );
     axum::Router::new()
         .nest_service("/mcp", svc)

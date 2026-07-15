@@ -140,6 +140,35 @@ impl Drop for Served {
     }
 }
 
+/// Like [`serve_mcp`] but keeps the caller's `cfg.mcp.bind` instead of forcing
+/// loopback — the listener still binds 127.0.0.1 so the test can reach it, but the
+/// SERVER is configured as if it were bound to a routable address, which is what the
+/// family deploy does (`[mcp].bind = 172.28.0.10`, matching each slot's
+/// `opencode.json`). That distinction is the whole point of #90: every existing test
+/// here binds loopback, which rmcp's `allowed_hosts` default happens to permit, so
+/// the 403 only ever appeared in production.
+async fn serve_mcp_with_bind(mut cfg: Config, bot: Bot) -> Served {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral MCP listener");
+    let port = listener.local_addr().expect("local_addr").port();
+    cfg.mcp.port = port;
+
+    let state = state_for(cfg, bot).await;
+    let ct = CancellationToken::new();
+    let router = mcp::build_router(state.clone(), ct.clone());
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    Served {
+        state,
+        port,
+        ct,
+        handle,
+    }
+}
+
 /// Bind an ephemeral 127.0.0.1 port, stamp it into `cfg.mcp.port` (so the inbound
 /// announce URL matches the live port), build the real [`AppState`], and serve
 /// [`mcp::build_router`] on it in a spawned task.
@@ -529,4 +558,71 @@ async fn inbound_image_announce_and_download_error_surface() {
         .await
         .expect("unknown-id request sends");
     assert_eq!(unknown.status(), 404, "an unknown uuid is a 404");
+}
+
+/// rmcp validates `Host` against `allowed_hosts` (DNS-rebinding guard) and its
+/// default is loopback-only. `[mcp].bind` exists so opencode containers on another
+/// host can reach this listener — the family deploy pins `172.28.0.10` — and those
+/// clients send `Host: 172.28.0.10:<port>`, which the default rejected with
+/// `403 Forbidden: Host header is not allowed`. opencode then never completed the
+/// MCP handshake and every file-transfer tool silently vanished from the model; the
+/// only symptom was a missing tool. The configured bind must be allowed.
+#[tokio::test]
+async fn configured_bind_is_an_allowed_host() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let mut cfg = config_for(&oc.url, "frank", CHAT_A);
+    cfg.mcp.bind = "172.28.0.10".parse().expect("routable IP parses");
+    let served = serve_mcp_with_bind(cfg, bot_pointed_at(&tg)).await;
+
+    // Reach the loopback listener but present the Host an opencode container sends.
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/mcp", served.port))
+        .header("host", format!("172.28.0.10:{}", served.port))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("x-slot", "frank")
+        .body(
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2024-11-05","capabilities":{},
+            "clientInfo":{"name":"probe","version":"1"}}})
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("request reaches the listener");
+
+    assert!(
+        resp.status().is_success(),
+        "the configured [mcp].bind must be an allowed Host; got {} — opencode would \
+         silently lose every file-transfer tool",
+        resp.status()
+    );
+}
+
+/// ...and the guard must still guard: allowing our own bind must not degenerate into
+/// allowing anything, or the DNS-rebinding protection is gone.
+#[tokio::test]
+async fn unrelated_host_is_still_rejected() {
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    let mut cfg = config_for(&oc.url, "frank", CHAT_A);
+    cfg.mcp.bind = "172.28.0.10".parse().expect("routable IP parses");
+    let served = serve_mcp_with_bind(cfg, bot_pointed_at(&tg)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/mcp", served.port))
+        .header("host", "evil.example.com")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string())
+        .send()
+        .await
+        .expect("request reaches the listener");
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "an unrelated Host must still be refused"
+    );
 }
