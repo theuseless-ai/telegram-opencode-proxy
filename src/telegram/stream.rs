@@ -11,16 +11,20 @@
 //! - a `typing` chat action is (re-)sent every ~4s for ambient liveness, off the
 //!   edit budget;
 //! - reasoning deltas are **not** streamed into the answer (they only keep the
-//!   `typing` action alive, §13);
+//!   `typing` action alive, §13) — classified order-independently by
+//!   [`TextRouter`], since a delta can arrive before the part's kind is known;
+//! - tool lifecycle updates feed the turn's activity log (#6), expanded in the
+//!   live view and folded into a collapsed expandable blockquote on finalize
+//!   at Verbose;
 //! - when the blocking prompt returns, the message is finalized to the
 //!   authoritative assistant text, rendered to Telegram MarkdownV2 and chunked
 //!   with [`markdown::to_chunks`] if it exceeds [`TELEGRAM_LIMIT`] (#70), with
-//!   tool failures always appended.
+//!   tool failures always appended and the summary footer (#14) last.
 //!
 //! The message is created lazily on the first flush that has something to show,
 //! so a fast turn with no intermediate output just posts the final answer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -82,8 +86,8 @@ pub async fn run_streaming_turn(
         .context("subscribing to /global/event for the streaming turn")?;
 
     let mut state = LiveState::new(verbosity).with_context_limit(context_limit);
-    // Part ids known to be reasoning — their deltas drive `typing`, not the answer.
-    let mut reasoning_parts: HashSet<String> = HashSet::new();
+    // Order-independent reasoning-vs-answer classification of text deltas (#6).
+    let mut router = TextRouter::default();
     // Decides which of the instance-wide gates this turn owns, incl. those from
     // subagent sessions it spawned (#88).
     let mut scope = permission::TurnScope::new(session_id);
@@ -123,7 +127,7 @@ pub async fn run_streaming_turn(
                         tracing::warn!(error = %err, "posting permission prompt failed");
                     }
                 }
-                Some(ev) => apply_event(&mut state, &mut reasoning_parts, session_id, ev),
+                Some(ev) => apply_event(&mut state, &mut router, session_id, ev),
             },
         }
     };
@@ -137,28 +141,87 @@ pub async fn run_streaming_turn(
     sink.finalize(&state, &reply.text()).await
 }
 
+/// Order-independent routing of `text`-field deltas into answer vs reasoning
+/// (#6).
+///
+/// A `message.part.delta` carries only its `part_id` — never the part's type
+/// (confirmed against the A0 wire captures in `fixtures/opencode/events/`) —
+/// so whether a delta is visible answer text or reasoning is only knowable
+/// from the part's `message.part.updated` frame, and nothing guarantees that
+/// frame precedes the deltas. Deltas for a still-unclassified part are
+/// buffered here and released (in arrival order) once a
+/// `PartUpdated(kind = Text)` proves the part visible; a `Reasoning` marker
+/// discards the buffer instead — so reasoning text can never leak into the
+/// answer whichever frame lands first. A part that never gets classified stays
+/// buffered, which is harmless: the finalize path re-renders from the
+/// authoritative reply anyway.
+#[derive(Debug, Default)]
+struct TextRouter {
+    /// Parts proven visible answer text (`PartUpdated(kind = Text)`).
+    answer: HashSet<String>,
+    /// Parts proven reasoning — their deltas are liveness-only (§13).
+    reasoning: HashSet<String>,
+    /// Buffered delta text for parts whose kind is not yet known.
+    pending: HashMap<String, String>,
+}
+
+impl TextRouter {
+    /// Route one `text`-field delta: `Some` text to append to the answer right
+    /// now, or `None` while the delta is suppressed (reasoning) or buffered
+    /// (part kind still unknown).
+    fn route_delta(&mut self, part_id: &str, delta: &str) -> Option<String> {
+        if self.answer.contains(part_id) {
+            Some(delta.to_string())
+        } else if self.reasoning.contains(part_id) {
+            None
+        } else {
+            self.pending
+                .entry(part_id.to_string())
+                .or_default()
+                .push_str(delta);
+            None
+        }
+    }
+
+    /// Record a part's kind from its `PartUpdated`. Returns buffered delta text
+    /// to flush into the answer when the part turns out to be visible text.
+    fn classify(&mut self, part_id: &str, kind: &PartKind) -> Option<String> {
+        match kind {
+            PartKind::Reasoning => {
+                self.reasoning.insert(part_id.to_string());
+                self.pending.remove(part_id);
+                None
+            }
+            PartKind::Text => {
+                self.answer.insert(part_id.to_string());
+                self.pending.remove(part_id).filter(|s| !s.is_empty())
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Route one event into the turn state, filtered to this turn's `session_id`.
-fn apply_event(
-    state: &mut LiveState,
-    reasoning_parts: &mut HashSet<String>,
-    session_id: &str,
-    event: Event,
-) {
+fn apply_event(state: &mut LiveState, router: &mut TextRouter, session_id: &str, event: Event) {
     match event {
         Event::Delta(d) if d.session_id == session_id && d.field == "text" => {
-            // Reasoning text is liveness-only (§13); only answer text streams.
-            if !reasoning_parts.contains(&d.part_id) {
-                state.push_text(&d.delta);
+            // Reasoning text is liveness-only (§13); only answer text streams —
+            // via the router, so an early delta can't outrun its part's kind (#6).
+            if let Some(text) = router.route_delta(&d.part_id, &d.delta) {
+                state.push_text(&text);
             }
         }
         Event::PartUpdated(p) if p.session_id == session_id => {
-            if matches!(p.kind, PartKind::Reasoning) {
-                reasoning_parts.insert(p.part_id.clone());
+            if let Some(buffered) = router.classify(&p.part_id, &p.kind) {
+                state.push_text(&buffered);
             }
             state.apply_part(&p.kind);
         }
+        // Recognised-but-unhandled frames: logged so a wire-shape drift (e.g. a
+        // renamed part type no longer reaching `PartKind::Tool`) is diagnosable.
+        Event::Other { kind } => tracing::trace!(kind = %kind, "unhandled opencode event"),
         // session.status → covered by the unconditional typing keep-alive;
-        // permission.asked → #13; everything else is not surfaced in B2.
+        // permission.asked → #13; other sessions' frames are not ours to render.
         _ => {}
     }
 }
@@ -325,18 +388,40 @@ impl<'a> LiveSink<'a> {
         }
     }
 
-    /// Finalize the turn to the authoritative assistant text (failures appended),
-    /// chunked across Telegram's limit: the live message becomes the first chunk
-    /// (edited if it exists, else sent), and any overflow is sent as new messages.
+    /// Finalize the turn to the authoritative assistant text (failures appended,
+    /// footer last), chunked across Telegram's limit: the live message becomes
+    /// the first chunk (edited if it exists, else sent), and any overflow is sent
+    /// as new messages. At Verbose the collapsed activity log (#6) — already
+    /// valid MarkdownV2, so it bypasses the body's Markdown conversion — is
+    /// prepended to the first chunk.
     async fn finalize(&mut self, state: &LiveState, authoritative: &str) -> Result<()> {
-        let final_text = state.finalize(authoritative);
+        let message = state.finalize(authoritative);
         // A whitespace-only (or empty) reply has nothing Telegram will accept —
         // route it to the empty-reply note rather than a rejected send.
-        let chunks = if final_text.trim().is_empty() {
+        let mut chunks = if message.body.trim().is_empty() {
             Vec::new()
         } else {
-            markdown::to_chunks(&final_text, TELEGRAM_LIMIT)
+            // The collapsed log rides in the first chunk, so shrink the chunk
+            // budget by its rendered size (+2 for the separating blank line) to
+            // stay within Telegram's limit. The log is small by construction —
+            // a windowed set of clipped lines (`render::LOG_WINDOW`).
+            let limit = match &message.log {
+                Some(log) => TELEGRAM_LIMIT
+                    .saturating_sub(log.formatted.chars().count() + 2)
+                    .max(1),
+                None => TELEGRAM_LIMIT,
+            };
+            markdown::to_chunks(&message.body, limit)
         };
+        if let Some(log) = &message.log
+            && let Some(first) = chunks.first_mut()
+        {
+            // The blank line matters: it ends the expandable blockquote, so an
+            // answer that itself starts with a `>` quote line is not swallowed
+            // into the collapsed log.
+            first.formatted = format!("{}\n\n{}", log.formatted, first.formatted);
+            first.plain = format!("{}\n\n{}", log.plain, first.plain);
+        }
 
         let Some((first, rest)) = chunks.split_first() else {
             // Nothing to say — the model finished without a text answer (e.g. it
@@ -389,8 +474,122 @@ fn is_parse_error(err: &RequestError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_parse_error;
+    use super::{TextRouter, apply_event, is_parse_error};
+    use crate::opencode::events::{Delta, Event, PartKind, PartUpdate};
+    use crate::telegram::render::{LiveState, Verbosity};
     use teloxide::{ApiError, RequestError};
+
+    const SESSION: &str = "ses_1";
+
+    fn delta(part_id: &str, text: &str) -> Event {
+        Event::Delta(Delta {
+            session_id: SESSION.to_string(),
+            message_id: "msg_1".to_string(),
+            part_id: part_id.to_string(),
+            field: "text".to_string(),
+            delta: text.to_string(),
+        })
+    }
+
+    fn part(part_id: &str, kind: PartKind) -> Event {
+        Event::PartUpdated(PartUpdate {
+            session_id: SESSION.to_string(),
+            message_id: "msg_1".to_string(),
+            part_id: part_id.to_string(),
+            kind,
+        })
+    }
+
+    // --- reasoning/text delta race (#6) ----------------------------------------
+
+    #[test]
+    fn reasoning_marker_before_deltas_suppresses_them() {
+        // The common ordering (per the A0 fixtures): marker first, then deltas.
+        let mut state = LiveState::new(Verbosity::Normal);
+        let mut router = TextRouter::default();
+        apply_event(
+            &mut state,
+            &mut router,
+            SESSION,
+            part("p1", PartKind::Reasoning),
+        );
+        apply_event(&mut state, &mut router, SESSION, delta("p1", "thinking…"));
+        assert_eq!(state.render(), "");
+    }
+
+    #[test]
+    fn reasoning_deltas_arriving_before_their_marker_do_not_leak() {
+        // The race (#6): a `text`-field delta lands before the frame that says
+        // its part is reasoning. It must be buffered, then discarded — never
+        // shown as answer text.
+        let mut state = LiveState::new(Verbosity::Normal);
+        let mut router = TextRouter::default();
+        apply_event(&mut state, &mut router, SESSION, delta("p1", "secret "));
+        apply_event(&mut state, &mut router, SESSION, delta("p1", "thoughts"));
+        assert_eq!(state.render(), "", "unclassified deltas stay buffered");
+        apply_event(
+            &mut state,
+            &mut router,
+            SESSION,
+            part("p1", PartKind::Reasoning),
+        );
+        apply_event(&mut state, &mut router, SESSION, delta("p1", " more"));
+        assert_eq!(state.render(), "", "reasoning never reaches the answer");
+    }
+
+    #[test]
+    fn text_deltas_arriving_before_their_marker_flush_in_order() {
+        let mut state = LiveState::new(Verbosity::Normal);
+        let mut router = TextRouter::default();
+        apply_event(&mut state, &mut router, SESSION, delta("p1", "Hello"));
+        apply_event(&mut state, &mut router, SESSION, delta("p1", ", world"));
+        assert_eq!(state.render(), "", "not shown until the part is classified");
+        apply_event(&mut state, &mut router, SESSION, part("p1", PartKind::Text));
+        assert_eq!(state.render(), "Hello, world");
+        // Later deltas for the now-classified part append directly.
+        apply_event(&mut state, &mut router, SESSION, delta("p1", "!"));
+        assert_eq!(state.render(), "Hello, world!");
+    }
+
+    #[test]
+    fn interleaved_reasoning_and_text_parts_route_independently() {
+        let mut state = LiveState::new(Verbosity::Normal);
+        let mut router = TextRouter::default();
+        apply_event(&mut state, &mut router, SESSION, delta("think", "hmm"));
+        apply_event(&mut state, &mut router, SESSION, delta("say", "Answer"));
+        apply_event(
+            &mut state,
+            &mut router,
+            SESSION,
+            part("say", PartKind::Text),
+        );
+        apply_event(
+            &mut state,
+            &mut router,
+            SESSION,
+            part("think", PartKind::Reasoning),
+        );
+        assert_eq!(state.render(), "Answer");
+    }
+
+    #[test]
+    fn other_sessions_events_are_ignored() {
+        let mut state = LiveState::new(Verbosity::Normal);
+        let mut router = TextRouter::default();
+        apply_event(
+            &mut state,
+            &mut router,
+            "ses_other",
+            part("p1", PartKind::Text),
+        );
+        apply_event(
+            &mut state,
+            &mut router,
+            "ses_other",
+            delta("p1", "not ours"),
+        );
+        assert_eq!(state.render(), "");
+    }
 
     #[test]
     fn parse_error_matches_the_typed_variant() {

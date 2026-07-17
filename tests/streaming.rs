@@ -230,14 +230,106 @@ async fn finalize_footer_shows_context_usage_percent() {
     .await
     .expect("streaming turn");
 
-    // The finalized message leads with the context-usage footer.
+    // The finalized message ends with the context-usage footer (footer last, #6).
     let final_text = tg
         .edits()
         .last()
         .map(|e| e.text.clone())
         .or_else(|| tg.sent_messages().last().map(|m| m.text.clone()))
         .expect("some message was written");
-    assert_eq!(final_text, "🧠 50%\nHello", "footer shows context %, no ✓");
+    assert_eq!(final_text, "Hello\n🧠 50%", "footer shows context %, no ✓");
+}
+
+/// A `message.part.updated` tool frame in its wire shape (state.status/title).
+fn tool_part_updated(
+    session: &str,
+    part_id: &str,
+    call_id: &str,
+    status: &str,
+    title: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "message.part.updated",
+        "properties": {
+            "sessionID": session,
+            "part": {
+                "id": part_id, "messageID": "msg_a", "sessionID": session,
+                "type": "tool", "tool": "bash", "callID": call_id,
+                "state": { "status": status, "title": title }
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn verbose_finalize_folds_the_activity_log_into_an_expandable_blockquote() {
+    // At Verbose the tool activity of the turn is folded into a collapsed
+    // MarkdownV2 expandable blockquote above the answer, footer last (#6).
+    let oc = MockOpencode::start().await;
+    let tg = MockTelegram::start().await;
+    oc.set_reply("Done");
+    oc.set_message_delay(Duration::from_millis(150));
+    oc.set_event_frames(
+        vec![
+            frame(serde_json::json!({"type":"server.connected","properties":{}})),
+            frame(tool_part_updated(
+                SESSION,
+                "prt_tool",
+                "call_1",
+                "running",
+                "git status",
+            )),
+            frame(tool_part_updated(
+                SESSION,
+                "prt_tool",
+                "call_1",
+                "completed",
+                "git status",
+            )),
+        ],
+        Duration::from_millis(20),
+    );
+
+    let bot = Bot::new("test-token").set_api_url(tg.url.parse().expect("mock url"));
+    let http = reqwest::Client::new();
+    let client = OpencodeClient::new(&oc.url).expect("client");
+    let db = telegram_opencode_proxy::persistence::Db::open_in_memory().expect("db");
+    let model = PromptModel {
+        provider_id: "llm-lan".into(),
+        model_id: "Qwen3.6-35B-A3B-bf16".into(),
+    };
+
+    run_streaming_turn(
+        &bot,
+        &http,
+        &client,
+        &db,
+        &oc.url,
+        CHAT_ID,
+        SESSION,
+        model,
+        text_parts("hi"),
+        Verbosity::Verbose,
+        None,
+        StreamTiming {
+            flush_interval: Duration::from_millis(10),
+            typing_interval: Duration::from_millis(20),
+            retry: Duration::from_secs(5),
+        },
+    )
+    .await
+    .expect("streaming turn");
+
+    let final_text = tg
+        .edits()
+        .last()
+        .map(|e| e.text.clone())
+        .or_else(|| tg.sent_messages().last().map(|m| m.text.clone()))
+        .expect("some message was written");
+    assert_eq!(
+        final_text, "**>🔧 1 tool\n>✓ bash · git status||\n\nDone\n✓ 1 tool",
+        "collapsed log rides above the answer, footer last"
+    );
 }
 
 #[tokio::test]

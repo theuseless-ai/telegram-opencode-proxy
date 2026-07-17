@@ -146,6 +146,37 @@ fn escape_text(out: &mut String, s: &str) {
     }
 }
 
+/// [`escape_text`] as a returning function — for callers assembling small
+/// MarkdownV2 fragments by hand (the activity-log lines, #6) rather than
+/// converting a whole Markdown document through [`to_telegram`].
+pub fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    escape_text(&mut out, s);
+    out
+}
+
+/// Build a Telegram **expandable blockquote** (Bot API 7.0) from pre-escaped
+/// MarkdownV2 lines: the first line is prefixed `**>`, every subsequent line
+/// `>`, and the very last line is suffixed `||` — Telegram renders the block
+/// collapsed with a tap-to-expand chevron. Used to fold a turn's activity log
+/// under the answer on finalize (#6). Lines must already be MarkdownV2-safe
+/// ([`escape`]); an empty slice yields an empty string.
+pub fn expandable_quote(lines: &[String]) -> String {
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i == 0 {
+            out.push_str("**>");
+        } else {
+            out.push_str("\n>");
+        }
+        out.push_str(line);
+    }
+    if !out.is_empty() {
+        out.push_str("||");
+    }
+    out
+}
+
 /// Escape a run destined for a `code`/`pre` entity: only `` ` `` and `\` are
 /// special there.
 fn escape_code(out: &mut String, s: &str) {
@@ -592,5 +623,33 @@ mod tests {
     fn table_renders_as_monospace_block() {
         let out = md("| a | b |\n|---|---|\n| 1 | 22 |");
         assert_eq!(out, "```\na | b\n1 | 22\n```");
+    }
+
+    // --- expandable blockquote + escape helper (#6) -----------------------------
+
+    #[test]
+    fn escape_covers_every_reserved_char() {
+        assert_eq!(escape("a.b-c"), "a\\.b\\-c");
+        // The full reserved set round-trips with a backslash before each.
+        for c in super::RESERVED {
+            assert_eq!(escape(&c.to_string()), format!("\\{c}"));
+        }
+        assert_eq!(escape("plain"), "plain");
+    }
+
+    #[test]
+    fn expandable_quote_uses_the_bot_api_markers() {
+        // First line `**>`, subsequent `>`, last line suffixed `||`.
+        let lines = vec!["🔧 2 tools".into(), "✓ bash".into(), "✓ read".into()];
+        assert_eq!(
+            expandable_quote(&lines),
+            "**>🔧 2 tools\n>✓ bash\n>✓ read||"
+        );
+    }
+
+    #[test]
+    fn expandable_quote_single_line_and_empty() {
+        assert_eq!(expandable_quote(&["only".to_string()]), "**>only||");
+        assert_eq!(expandable_quote(&[]), "");
     }
 }
